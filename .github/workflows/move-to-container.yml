@@ -20,12 +20,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: deploy-container
+  group: sub2api-production
   cancel-in-progress: false
 
 jobs:
   move:
     runs-on: ubuntu-latest
+    env:
+      CHECKED_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,9 +36,36 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
+      - name: Check the intended main revision
+        id: revision
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/check-main-revision.mjs
+      - name: Install the pinned Rust and Wasm tools
+        if: steps.revision.outputs.current == 'true'
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --target wasm32-unknown-unknown
+          tool_dir="$RUNNER_TEMP/wasm-bindgen"
+          mkdir -p "$tool_dir"
+          curl --fail --location --retry 3 --output "$tool_dir/tool.tar.gz" https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl.tar.gz
+          printf '%s  %s\n' 9687f3bb551b9f66f37ed32a40d7913a00f7962db653054e56857bc306c3227f "$tool_dir/tool.tar.gz" | sha256sum --check
+          tar -xzf "$tool_dir/tool.tar.gz" --strip-components=1 -C "$tool_dir"
+          echo "$tool_dir" >> "$GITHUB_PATH"
+      - if: steps.revision.outputs.current == 'true'
+        run: npm ci
+      # This remains an explicitly requested, destructive legacy migration, separate from normal CD.
+      - if: steps.revision.outputs.current == 'true'
+        run: npm run verify
+      - if: steps.revision.outputs.current == 'true'
+        run: node --test scripts/deployment.test.mjs
+      - name: Recheck the main revision before the explicit migration
+        id: final_revision
+        if: steps.revision.outputs.current == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/check-main-revision.mjs
       - name: Export${{ inputs.step == 'replace' && ' and replace' || '' }}
-        if: inputs.step != 'check'
+        if: steps.final_revision.outputs.current == 'true' && inputs.step != 'check'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -44,7 +73,7 @@ jobs:
         run: |
           if [ "$STEP" = replace ]; then sh scripts/move-to-container.sh --replace; else sh scripts/move-to-container.sh; fi
       - name: Check the gateway
-        if: inputs.step == 'check'
+        if: steps.final_revision.outputs.current == 'true' && inputs.step == 'check'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

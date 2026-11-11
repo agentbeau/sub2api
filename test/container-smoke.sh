@@ -5,6 +5,13 @@
 # a first start that takes a config and logins moved from the Workers-only install.
 set -eu
 
+build=true
+case "${1:-}" in
+  "") ;;
+  --prebuilt) build=false; [ -n "${IMAGE:-}" ] || { echo "--prebuilt requires IMAGE" >&2; exit 64; } ;;
+  *) echo "usage: sh test/container-smoke.sh [--prebuilt]" >&2; exit 64 ;;
+esac
+
 IMAGE=${IMAGE:-sub2api-cpa:test}
 NODE_IMAGE=node:24-alpine
 NET=sub2api-smoke
@@ -46,6 +53,7 @@ start_cpa() {
     -e OBJECTSTORE_ACCESS_KEY=smoke-access \
     -e OBJECTSTORE_SECRET_KEY=smoke-secret-0123456789 \
     -e CPA_MANAGEMENT_KEY="$MANAGEMENT_KEY" \
+    -e SUB2API_ACTIVITY_ENDPOINT=http://smoke-s3:9000/__sub2api/activity \
     "$@" "$IMAGE" >/dev/null
   for _ in $(seq 1 60); do
     [ "$(status "http://127.0.0.1:$PORT/healthz")" = 200 ] && return 0
@@ -65,7 +73,11 @@ start_s3() {
   fail "S3 shim did not start"
 }
 
-docker build -q -t "$IMAGE" container >/dev/null
+if [ "$build" = true ]; then
+  docker build -q -t "$IMAGE" container >/dev/null
+else
+  docker image inspect "$IMAGE" >/dev/null
+fi
 docker network create "$NET" >/dev/null
 start_s3
 
@@ -80,12 +92,35 @@ wait_for() {
   fail "timed out waiting for: $1"
 }
 
+activity_status() {
+  curl --fail --silent http://127.0.0.1:19000/__activity
+}
+
+activity_pending() {
+  activity_status | node -e 'const x=JSON.parse(require("node:fs").readFileSync(0,"utf8")); process.exit(x.delayed.pending ? 0 : 1)'
+}
+
+activity_finished() {
+  activity_status | node -e 'const x=JSON.parse(require("node:fs").readFileSync(0,"utf8")); process.exit(x.delayed.completed===1 && x.active===0 ? 0 : 1)'
+}
+
 start_cpa
 expect 200 "$base/healthz"
+expect 200 "$base/__sub2api/lifecycle"
+curl --fail --silent "$base/__sub2api/lifecycle" | node -e 'const x=JSON.parse(require("node:fs").readFileSync(0,"utf8")); if(x.activity_protocol!==1) process.exit(1)' || fail "provider does not advertise activity protocol 1"
 expect 401 "$base/v8/management/config"
 expect 200 -H "$mgmt" "$base/v8/management/config"
 expect 200 "$base/management.html"
+expect 204 -X POST http://127.0.0.1:19000/__delay-config-put
 expect 200 -X PUT -H "$mgmt" -H "content-type: application/json" -d "[\"$CLIENT_KEY\"]" "$base/v8/management/config/access/api-keys"
+wait_for activity_pending
+# Hold the actual object-store write beyond the production one-second idle setting.
+sleep 2
+activity_status | node -e 'const x=JSON.parse(require("node:fs").readFileSync(0,"utf8")); if(!x.delayed.pending || !x.delayed.protected || x.active<1 || x.remainingMs<=0) process.exit(1)' || fail "config persistence lost its activity lease while the S3 write was pending"
+expect 204 -X POST http://127.0.0.1:19000/__release-config-put
+wait_for activity_finished
+activity_status | node -e 'const x=JSON.parse(require("node:fs").readFileSync(0,"utf8")); if(!x.delayed.protected || x.delayed.timedOut || x.delayed.elapsedMs<1000 || x.begin<1 || x.end!==x.begin || x.rejected!==0) process.exit(1)' || fail "activity handoff or release did not cover the completed config write"
+echo "ok background reload and persistence stay protected until the delayed bucket write completes"
 wait_for '[ "$(status -H "x-api-key: $CLIENT_KEY" "$base/v1/models")" = 200 ]'
 echo "ok a key saved the way the dashboard saves it works"
 expect 401 "$base/v1/models"

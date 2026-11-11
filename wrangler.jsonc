@@ -4,7 +4,9 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-10-01",
   "workers_dev": true,
-  "observability": { "enabled": true },
+  "observability": { "enabled": true, "traces": { "enabled": true, "head_sampling_rate": 0.01 } },
+  "build": { "command": "npm run build" },
+  "vars": { "CONTAINER_IDLE_TIMEOUT_MS": "1000" },
   "containers": [
     {
       "name": "sub2api",

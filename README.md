@@ -1,126 +1,136 @@
-# sub2api: a Cloudflare-based LLM gateway and proxy server
+# sub2api: Rust gateway on Cloudflare
 
-[![ci](https://github.com/PlaygrndLabs/sub2api/actions/workflows/ci.yml/badge.svg)](https://github.com/PlaygrndLabs/sub2api/actions/workflows/ci.yml)
+[![ci](https://github.com/agentbeau/sub2api/actions/workflows/ci.yml/badge.svg)](https://github.com/agentbeau/sub2api/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Literally the [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (CPA) project, deployed as a Cloudflare Worker in one click.** Turn your Claude, ChatGPT Codex, Gemini and Kimi subscriptions into your own private API. Point Claude Code, the Anthropic or OpenAI SDKs, or any app at your gateway URL and use your subscription from anywhere, with no server or home machine left running.
+A **Rust/WebAssembly gateway on Cloudflare Workers**, with the upstream [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) (CPA) provider engine in a Go container. Use your supported subscriptions through Anthropic, OpenAI-compatible and Gemini APIs while keeping provider logins and configuration in your own R2 bucket.
 
-Free and open source; sub2api never charges you anything.
+The gateway uses Cloudflare's native Container API. Its normal idle timeout is **one second after the Durable Object becomes inactive**, replacing the previous 30-minute helper timeout. Active responses and WebSockets are forwarded as platform streams. Pending provider sign-ins and background persistence receive bounded activity holds. No polling alarm or permanent monitor keeps an unused container awake.
 
-| Install | Your Cloudflare plan | What runs | Deploy |
-|---|---|---|---|
-| **Container** | Workers Paid ($5/month, for Containers) | The latest CPA release in a container | <a href="https://deploy.workers.cloudflare.com/?url=https://github.com/PlaygrndLabs/sub2api"><img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare" width="170"></a> |
+## Architecture
 
-## Why
+| Component | Runtime | Responsibility |
+|---|---|---|
+| Public gateway | Rust compiled to Wasm in Workers | Route policy, dashboard login, HMAC sessions and access decisions |
+| Cloudflare adapter | Small TypeScript platform layer | Bindings, streaming I/O and native container lifecycle |
+| Provider engine | Upstream Go CPA in a Linux container | Provider logins, token refresh, model protocols, translation, usage and quotas; a small lifecycle patch reports active background work |
+| Durable state | Existing R2 bucket | Configuration and OAuth credentials across sleep and deployment |
 
-- **One click, no server.** Cloudflare builds and runs everything. Nothing to keep online.
-- **The real CPA.** Built from the latest upstream release with its official dashboard, rebuilt weekly, so every provider and API CPA supports just works: Anthropic Messages, OpenAI-compatible and Gemini.
-- **Private by default.** The dashboard sits behind a password, and every API call needs a key you create. Until then, all calls are refused.
-- **Logins that stick.** Config and OAuth logins live in your own R2 bucket and survive restarts and redeploys.
-- **Costs little when idle.** The container sleeps after 30 minutes and wakes on the next request.
+The public Worker answers liveness, login, logout and unknown routes without contacting the container's Durable Object. Requests requiring CPA keep the original singleton identity. Native container startup is coordinated, readiness is checked before forwarding, and inference requests are never replayed on startup errors.
 
-## Quick start
+This rewrite preserves the existing Worker name `sub2api`, `Cpa` class, `CPA` binding, `cf-singleton-container` object, `v1` migration and `STATE` bucket binding. It needs **no provider-data migration**. The existing Durable Object also stores temporary activity deadlines so an object restart cannot shorten an ongoing sign-in. It retains the existing container scheduling policy because switching that policy requires a separate application and namespace migration.
 
-You need a Cloudflare account on the [Workers Paid plan](https://developers.cloudflare.com/workers/platform/pricing/) ($5/month; Containers require it).
+Provider execution remains in CPA. Bypassing it merely because a model has an API key can change subscription priority, usage accounting or TLS behavior. The separate Workers-only alternative remains available below with its existing limitations.
 
-On Workers Free? See the [Workers-only install (beta)](#workers-only-install-beta).
+See [architecture and migration decisions](docs/architecture.md) and [performance measurements](docs/performance.md).
 
-1. Press the **Deploy to Cloudflare** button above.
-2. Set the two secrets it asks for. Each needs at least 32 characters of `A-Z a-z 0-9 _ -`; `openssl rand -hex 32` makes one:
-   - `DASHBOARD_PASSWORD`: your dashboard sign-in password.
-   - `MANAGEMENT_KEY`: CPA's management key, asked for after sign-in.
-3. Open `https://sub2api.<your-subdomain>.workers.dev`, sign in, and create an API key under **API Keys**.
+## Build and verify
+
+Requirements: Node.js 22 or newer, the Rust toolchain declared in `rust-toolchain.toml`, `wasm32-unknown-unknown`, and **wasm-bindgen-cli 0.2.130**. Docker is needed for the provider image smoke test and image deployment.
+
+```bash
+npm ci
+rustup toolchain install 1.99.1 --profile minimal --target wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.130 --locked
+npm run verify
+npm run test:runtime
+sh test/container-smoke.sh
+```
+
+`npm run verify` builds the locked Rust crate, runs Rust unit tests, typechecks the platform adapters and existing Workers-only alternative, lints, and runs the JavaScript/TypeScript tests against the actual compiled Wasm. `test:runtime` additionally runs the gateway in workerd and checks login, idle-safe liveness, uploads, streaming and WebSocket upgrades with a controlled provider.
+
+The workerd smoke test does not prove Cloudflare has stopped a production container or that a real provider account can connect. Those checks require the Docker image test and a configured live installation.
+
+## Continuous deployment
+
+The main install requires a Cloudflare account with Containers enabled and the appropriate Workers plan. See [Containers availability and limits](https://developers.cloudflare.com/containers/platform-details/limits/) and [pricing](https://developers.cloudflare.com/containers/pricing/) for current requirements.
+
+1. Enable GitHub Actions in this fork.
+2. Add repository secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` for the intended account. The token needs the permissions required to deploy Workers, Containers/registry images and the R2 bucket.
+3. For a **new installation**, also add `SUB2API_DASHBOARD_PASSWORD` and `SUB2API_MANAGEMENT_KEY`. Use different random strings, each at least 32 characters of `A-Z a-z 0-9 _ -`; `openssl rand -hex 32` generates a suitable value. These runtime secrets are supplied only to deployment, never to builds or uploaded artifacts.
+4. Run **deploy container** manually once. It runs the verification pipeline, then installs the Rust gateway and tested provider image.
+5. Open your `sub2api.<account-subdomain>.workers.dev` URL, sign in and add an API key in the dashboard.
+
+After installation, each successful `ci` run for the current `main` revision deploys that same tested revision. A weekly run checks and rebuilds the upstream provider image through the same pipeline. Both install variants share a production deployment lock and refuse to overwrite the other variant. A new install is manual; normal pushes do not choose a different architecture for you.
+
+CI builds and smoke-tests the provider image **once**, saves it with checksums, and deploys its immutable Cloudflare registry digest. It also packages the verified Worker/Wasm modules once. Deployment rejects altered artifacts, dirty source provenance and obsolete commits instead of silently rebuilding something different. No Cloudflare credentials are passed to package installation or the upstream image build. The small provider lifecycle patch checks the expected upstream source structure; an incompatible upstream update fails the build and leaves the existing deployment in place.
+
+Set optional `SUB2API_CONTAINER_TEST_KEY` (or `SUB2API_TEST_KEY`) to an existing gateway API key for an authenticated post-deployment model-list check. Without it, authentication testing is explicitly reported as skipped; public liveness and provider readiness still have to pass.
+
+Existing installations keep their Cloudflare secrets when the optional runtime secrets above are absent. CPA reads `MANAGEMENT_KEY` only when first creating its config; change an existing CPA management key through its dashboard. Do not use the legacy **move to container** workflow for this in-place Rust update.
+
+### Manual deployment
+
+```bash
+npm ci
+npm run verify
+npx wrangler login
+npx wrangler r2 bucket create sub2api # only for a new bucket
+npx wrangler deploy
+sh scripts/set-secrets.sh
+```
+
+Install the pinned Rust/Wasm tools first. Wrangler's custom build runs `npm run build`. The secret helper prints newly generated secrets once; keep them privately. For an existing install, retain its current secrets and R2 state. Manual Wrangler deployment builds an image locally; GitHub Actions is the path that carries the exact smoke-tested image to production.
+
+## Idle behavior and health checks
+
+`CONTAINER_IDLE_TIMEOUT_MS` is set to `"1000"` in `wrangler.jsonc`. Valid values are whole milliseconds from `1` to `21600000`. One millisecond is the smallest accepted setting; one second is the practical default to avoid immediate teardown between closely spaced requests. A shorter timeout reduces idle running time and increases the chance that the next request needs a cold start. It cannot make cold starts disappear.
+
+CPA has work that continues after an HTTP reply, so the effective timeout also accounts for that work:
+
+| Situation | Temporary protection |
+|---|---|
+| Normal idle period after a model request | Configured timeout, one second by default |
+| Pending provider sign-in | Provider expiry plus a 60-second completion buffer; six minutes for a known callback flow without an expiry, up to 31 minutes for device, plugin or unidentified flows |
+| Successful settings or credential mutation | A 35-second grace period while asynchronous persistence starts and finishes |
+| Actual background refresh, reload or R2 persistence | An internal 90-second lease, renewed only while the task exists and released when it ends; a task cannot renew past its fixed 15-minute ceiling |
+
+OAuth status polling does not extend the original sign-in deadline. Completion or an accepted cancellation removes that flow's hold and reserves the persistence grace period. Separate concurrent flows remain protected. Background jobs obtain their hold before starting provider work; a failed grant prevents the work from starting. Native inactivity settings are recalculated from absolute deadlines, and stale background jobs are cleared when a stopped container starts fresh.
+
+The 35-second grace is an allowance for deferred writes, not an assertion that every remote operation finishes within that time. Actual background work has its own activity reporting. Platform failure, a forced stop or an operation exceeding its bounded lifetime can still interrupt it.
+
+During an in-place rollout, Cloudflare may activate the new Worker before replacing the old provider image. An image without the activity protocol keeps the previous 30-minute timeout until the patched image is detected. The one-second setting is enabled only after that capability check; detection happens on real requests, with no idle polling loop.
+
+| Endpoint | Meaning | Wakes the provider container? |
+|---|---|---|
+| `GET /healthz` | Public gateway is responsive | No |
+| `GET /readyz` | CPA is ready to accept requests | Yes, if asleep |
+
+Use `/healthz` for frequent availability checks. Polling `/readyz` keeps exercising CPA and undermines idle savings. The timeout begins when the Durable Object becomes inactive, not at a fixed interval after the last HTTP request. Deployment and platform failures can still interrupt active connections.
 
 ## Connect a subscription
 
-1. In the dashboard, open **OAuth login** and pick a provider (for Claude: Anthropic).
-2. Sign in with the provider. You land on a `localhost` page that doesn't load; that's expected.
-3. Copy that address into the dashboard's **Callback URL** field. Or replace `http://localhost:<port>` with your gateway URL and open it in the same browser.
+1. Open **OAuth login** in the dashboard and choose the provider.
+2. Complete the provider's sign-in.
+3. If the provider redirects to an unavailable localhost page, paste that URL into the dashboard's **Callback URL** field, or replace its localhost origin with your gateway origin and open it in the same signed-in browser.
 
-CPA stores the login and refreshes its tokens on its own.
+CPA persists the login in R2 and handles refreshes. Use only subscriptions and provider access you are authorized to use.
 
-## Use it
+## Use the gateway
 
-Claude Code, the Claude Agent SDK and the Anthropic SDKs:
+Anthropic-compatible clients:
 
 ```bash
 export ANTHROPIC_BASE_URL=https://sub2api.<your-subdomain>.workers.dev
-export ANTHROPIC_API_KEY=<your gateway API key>
+export ANTHROPIC_API_KEY=<your-gateway-api-key>
 ```
 
-OpenAI-compatible clients (Codex CLI, OpenAI SDKs, Cursor, and others):
+OpenAI-compatible clients:
 
 ```bash
 export OPENAI_BASE_URL=https://sub2api.<your-subdomain>.workers.dev/v1
-export OPENAI_API_KEY=<your gateway API key>
+export OPENAI_API_KEY=<your-gateway-api-key>
 ```
 
-Gemini clients use `<gateway>/v1beta` with the same key.
-
-```bash
-curl https://sub2api.<your-subdomain>.workers.dev/v1/messages \
-  -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \
-  -d '{"model":"claude-sonnet-5-5","max_tokens":64,"messages":[{"role":"user","content":"Say hi"}]}'
-```
-
-`GET /v1/models` lists what your subscriptions offer. Give each app its own key, so you can revoke one without touching the rest.
-
-## How it works
-
-```
-app ──► Worker ──► Durable Object ──► Container: CPA ──► Claude / Codex / Gemini
-                   · API key check        │
-                   · dashboard sign-in    └─► http://r2.internal ──► R2 bucket
-```
-
-The Worker hands every request to one Durable Object in front of the CPA container. The Durable Object refuses API calls until a key exists and keeps the dashboard behind a password. CPA's S3 storage is served from an R2 binding, so you never create storage keys. See [SECURITY.md](SECURITY.md) for the full model.
-
-## Update
-
-A Deploy-button copy redeploys whenever its `main` branch changes. To get the latest release:
-
-```bash
-git pull https://github.com/PlaygrndLabs/sub2api main
-git push
-```
-
-If git refuses because the histories are unrelated, add `--allow-unrelated-histories` to the pull once. Logins and config live in R2, so updates keep them.
-
-<details>
-<summary><b>Deploy with wrangler or GitHub Actions</b></summary>
-
-```bash
-npm ci
-npx wrangler login
-npx wrangler r2 bucket create sub2api
-npx wrangler deploy        # needs Docker to build the image
-sh scripts/set-secrets.sh  # generates both secrets, stores them, prints them once
-```
-
-To deploy from GitHub Actions, add the repository secrets `CLOUDFLARE_API_TOKEN` (Workers Scripts, Containers, Workers R2 Storage: Edit) and `CLOUDFLARE_ACCOUNT_ID`, then run the **deploy container** workflow once by hand. After that, every green `ci` run on `main` deploys, and a weekly run picks up the newest CPA release. Each deploy updates only the install your Worker `sub2api` already runs, so neither workflow overwrites the other install.
-
-`MANAGEMENT_KEY` seeds CPA's config on first start only; after that, change it in the dashboard. `DASHBOARD_PASSWORD` can be changed any time with `wrangler secret put DASHBOARD_PASSWORD`.
-</details>
-
-<details>
-<summary><b>Develop</b></summary>
-
-```bash
-npm ci
-npm run verify              # typecheck, lint, unit tests
-sh test/container-smoke.sh  # needs Docker: runs CPA against the R2 shim
-```
-
-The container builds the newest CPA release and dashboard by default. To freeze them, set `CPA_VERSION`, `PANEL_VERSION` and `PANEL_SHA256` in `container/Dockerfile`.
-</details>
+Gemini clients use `<gateway>/v1beta` with the same gateway key. `GET /v1/models` lists the models available to the configured providers. Give each client its own gateway key so it can be revoked independently.
 
 ## Workers-only install (beta)
 
-**Beta.** The Container install is the main install. This one is still in progress and may change between releases.
+**Beta.** The Rust gateway with its CPA container is the main install. This one is still in progress and may change between releases.
 
 For Workers Free. No container: the Worker runs our TypeScript port of CPA, with the same dashboard. API keys work with every app and provider. Logins are limited: Claude login works only with Claude Code, and ChatGPT login only for voice over WebSocket.
 
-<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/PlaygrndLabs/sub2api/tree/main/worker"><img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare" width="170"></a>
+<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/agentbeau/sub2api/tree/main/worker"><img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare" width="170"></a>
 
 See [worker/README.md](worker/README.md) for setup.
 
@@ -160,15 +170,6 @@ Workers Free also caps every account ([Workers](https://developers.cloudflare.co
 
 Moving to Workers Paid? `sh scripts/move-to-container.sh`, or the **move to container** workflow, copies your logins, API keys and config into the Container install's R2 bucket and keeps a backup there. Add `--replace` (the workflow's `replace` step) to then swap the Worker for the Container install.
 
-## Good to know
+## Upstream and license
 
-- Requests reach providers from Cloudflare's network. **Check that your provider's terms allow how you use your subscription.**
-- The first request after the container sleeps takes a few seconds while it starts.
-- Cost is the $5 Workers Paid plan plus container time while awake. See [Containers pricing](https://developers.cloudflare.com/containers/pricing/).
-- Lost the management key? Set a new `MANAGEMENT_KEY` secret, delete `config/config.yaml` from the `sub2api` R2 bucket, and redeploy. CPA starts with a fresh config. Provider logins stay, but you recreate your app API keys.
-
-Built on [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). Not affiliated with Anthropic, OpenAI, Google or Cloudflare.
-
-## License
-
-[MIT](LICENSE)
+This fork builds on [PlaygrndLabs/sub2api](https://github.com/PlaygrndLabs/sub2api) and [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). It is not affiliated with the model providers or Cloudflare. [MIT](LICENSE).
