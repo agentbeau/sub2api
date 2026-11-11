@@ -1,14 +1,14 @@
 {
   "name": "sub2api",
-  "description": "A Cloudflare-based LLM gateway and proxy server: the CLIProxyAPI (CPA) project deployed as a Cloudflare Worker in one click.",
+  "description": "A Rust/WebAssembly gateway on Cloudflare Workers with the CLIProxyAPI provider engine in a sleeping native container.",
   "license": "MIT",
-  "homepage": "https://github.com/PlaygrndLabs/sub2api#readme",
+  "homepage": "https://github.com/agentbeau/sub2api#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/PlaygrndLabs/sub2api.git"
+    "url": "git+https://github.com/agentbeau/sub2api.git"
   },
   "bugs": {
-    "url": "https://github.com/PlaygrndLabs/sub2api/issues"
+    "url": "https://github.com/agentbeau/sub2api/issues"
   },
   "keywords": [
     "cliproxyapi",
@@ -28,21 +28,26 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "types": "wrangler types --include-env=false",
+    "types": "wrangler types worker-configuration.d.ts --include-env=false && wrangler types worker-env.d.ts --include-runtime=false",
     "typecheck": "tsc && tsc -p tsconfig.node.json",
     "lint": "eslint .",
     "test": "vitest run",
-    "verify": "npm run typecheck && npm run lint && npm test",
-    "deploy": "wrangler deploy"
+    "verify": "npm run build && npm run test:rust && npm run typecheck && npm run lint && npm test",
+    "deploy": "wrangler deploy",
+    "build": "node scripts/build-rust.mjs",
+    "test:rust": "cargo test --manifest-path gateway-rs/Cargo.toml --locked",
+    "test:runtime": "node scripts/check-runtime.mjs",
+    "benchmark": "node scripts/benchmark-gateway.mjs"
   },
   "dependencies": {
-    "@cloudflare/containers": "0.3.7",
     "yaml": "2.8.1"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@types/node": "22.20.5",
+    "esbuild": "0.28.2",
     "eslint": "10.12.0",
+    "miniflare": "5.20261006.1-alpha",
     "typescript": "6.0.3",
     "typescript-eslint": "8.71.1",
     "vitest": "5.0.4",

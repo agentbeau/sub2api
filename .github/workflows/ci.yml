@@ -3,6 +3,7 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -12,22 +13,75 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+      - name: Install the pinned Rust and Wasm tools
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --target wasm32-unknown-unknown
+          tool_dir="$RUNNER_TEMP/wasm-bindgen"
+          mkdir -p "$tool_dir"
+          curl --fail --location --retry 3 --output "$tool_dir/tool.tar.gz" https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl.tar.gz
+          printf '%s  %s\n' 9687f3bb551b9f66f37ed32a40d7913a00f7962db653054e56857bc306c3227f "$tool_dir/tool.tar.gz" | sha256sum --check
+          tar -xzf "$tool_dir/tool.tar.gz" --strip-components=1 -C "$tool_dir"
+          echo "$tool_dir" >> "$GITHUB_PATH"
+          "$tool_dir/wasm-bindgen" --version
       - run: npm ci
-      - run: npm run typecheck
-      - run: npm run lint
-      - run: npm test
+      - run: npm run verify
+      - name: Verify deployment safeguards
+        run: node --test scripts/deployment.test.mjs
+      - name: Package the compiled container gateway
+        run: node scripts/prepare-deployment.mjs container .wrangler/artifacts/container-worker
+      - name: Exercise the packaged gateway in workerd
+        run: npm run test:runtime -- .wrangler/artifacts/container-worker/worker/index.js
+      - name: Fetch the Workers-only dashboard
+        env:
+          PANEL_VERSION: ${{ vars.PANEL_VERSION }}
+          PANEL_SHA256: ${{ vars.PANEL_SHA256 }}
+        run: node worker/scripts/fetch-panel.mjs
+      - name: Package the Workers-only alternative
+        run: node scripts/prepare-deployment.mjs worker .wrangler/artifacts/worker-only
+      - uses: actions/upload-artifact@v4
+        with:
+          name: container-worker
+          path: .wrangler/artifacts/container-worker
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worker-only
+          path: .wrangler/artifacts/worker-only
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
 
   container:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: sh test/container-smoke.sh
+      # No Cloudflare/GitHub credentials reach npm lifecycle scripts or the upstream CPA build.
+      - name: Build and smoke-test the exact provider image
+        env:
+          CPA_VERSION: ${{ vars.CPA_VERSION }}
+          PANEL_VERSION: ${{ vars.PANEL_VERSION }}
+          PANEL_SHA256: ${{ vars.PANEL_SHA256 }}
+        run: node scripts/build-container-image.mjs .wrangler/artifacts/container-image
+      - uses: actions/upload-artifact@v4
+        with:
+          name: container-image
+          path: .wrangler/artifacts/container-image
+          include-hidden-files: true
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

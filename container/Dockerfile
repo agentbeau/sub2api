@@ -1,5 +1,5 @@
 FROM golang:1.26-bookworm AS builder
-# "latest" builds the newest CPA release tag at build time; set a tag such as v8.0.45 to pin one.
+# "latest" builds the newest CPA release tag at build time; set a tag such as v8.0.67 to pin one.
 ARG CPA_VERSION=latest
 ENV GOTOOLCHAIN=auto
 WORKDIR /src
@@ -11,6 +11,13 @@ RUN set -eu; repo=https://github.com/router-for-me/CLIProxyAPI.git; tag="${CPA_V
   git init -q . && git remote add origin "$repo" \
   && git fetch -q --depth 1 origin tag "$tag" && git checkout -q "$tag" \
   && printf '%s' "$tag" > /tmp/cpa-version
+COPY activity /src/internal/sub2apiactivity
+COPY patch-cpa /build/patch-cpa
+# Source drift fails the image build before any hook can be omitted. Tests exercise
+# the real internal HTTP protocol, parent/child handoff, and synchronous-save ordering.
+RUN go test /build/patch-cpa/main.go /build/patch-cpa/main_test.go \
+  && go run /build/patch-cpa/main.go /src \
+  && go test -race ./internal/sub2apiactivity
 RUN CGO_ENABLED=1 GOOS=linux go build -buildvcs=false \
   -ldflags="-s -w -X 'main.Version=$(cat /tmp/cpa-version)' -X 'main.Commit=$(git rev-parse HEAD)'" \
   -o /out/CLIProxyAPI ./cmd/server/
@@ -31,5 +38,8 @@ WORKDIR /CLIProxyAPI
 COPY --from=builder /out/CLIProxyAPI ./CLIProxyAPI
 COPY entrypoint.sh /entrypoint.sh
 ENV MANAGEMENT_STATIC_PATH=/panel/management.html
+# Defaults also cover a new image replacing an old container whose stored startup
+# environment predates the activity protocol. The native lifecycle passes this too.
+ENV SUB2API_ACTIVITY_ENDPOINT=http://r2.internal/__sub2api/activity
 EXPOSE 8317
 ENTRYPOINT ["/entrypoint.sh"]

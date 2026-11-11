@@ -1,92 +1,111 @@
-# Deploys the Workers-only install in worker/ when it changes on main. The build downloads the latest
-# CPA dashboard. Set its DASHBOARD_PASSWORD once with
-# `npx wrangler secret put DASHBOARD_PASSWORD` from worker/.
 name: deploy worker
 
 on:
-  push:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
     branches: [main]
-    paths: ["worker/**", ".github/workflows/deploy-worker.yml"]
   workflow_dispatch:
 
 permissions:
   contents: read
-
-concurrency:
-  group: deploy-worker
-  cancel-in-progress: false
+  actions: read
 
 jobs:
-  deploy:
+  checks:
+    if: github.event_name != 'workflow_run'
+    uses: ./.github/workflows/ci.yml
+
+  target:
+    needs: [checks]
+    if: >-
+      always() &&
+      ((github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && needs.checks.result == 'success'))
     runs-on: ubuntu-latest
-    # The Cloudflare token goes only to the steps that call Cloudflare, never to npm install
-    # scripts or the Claude Code check.
+    outputs:
+      ready: ${{ steps.installation.outputs.ready }}
+    env:
+      CHECKED_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           persist-credentials: false
-      - name: Check Cloudflare credentials
-        id: creds
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check the intended main revision
+        id: revision
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/check-main-revision.mjs
+      # Keep the other installation out of the shared queue: GitHub retains only one pending job.
+      - name: Select the existing installation
+        id: installation
+        if: steps.revision.outputs.current == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        # Both installs deploy as the Worker sub2api, so this only ever updates the install that is
-        # already live (scripts/live-install.mjs).
-        # With no Worker yet, it deploys the Workers-only install, as before.
-        run: |
-          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "::notice::Skipping deploy: add CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as repository secrets to deploy from GitHub Actions."
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          live=$(node scripts/live-install.mjs)
-          if [ "$live" = worker ] || [ "$live" = none ]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::Skipping deploy: the Worker sub2api is the Container install."
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-          fi
-      - if: steps.creds.outputs.ready == 'true'
-        uses: actions/setup-node@v4
+          TARGET_INSTALL: worker
+          EVENT_NAME: ${{ github.event_name }}
+        run: node scripts/check-installation.mjs
+
+  deploy:
+    needs: [target]
+    if: needs.target.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: sub2api-production
+      cancel-in-progress: false
+    env:
+      CHECKED_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: worker/package-lock.json
-      # Installed and deployed from worker/, as the Deploy button does, so the build step finds its script.
-      - if: steps.creds.outputs.ready == 'true'
-        working-directory: worker
-        run: npm ci
-      - name: Deploy
-        id: deploy
-        if: steps.creds.outputs.ready == 'true'
-        working-directory: worker
+      - name: Recheck the installation inside the production lock
+        id: installation
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # Optional repository variables that freeze the dashboard; the build fails if the
-          # download doesn't match PANEL_SHA256.
-          PANEL_VERSION: ${{ vars.PANEL_VERSION }}
-          PANEL_SHA256: ${{ vars.PANEL_SHA256 }}
-        run: |
-          npx wrangler deploy | tee deploy.log
-          echo "url=$(grep -oE 'https://[a-z0-9.-]+\.workers\.dev' deploy.log | head -1)" >> "$GITHUB_OUTPUT"
-      # Live check through the deployed gateway, using a gateway key stored as a repository
-      # secret. Skipped until that secret exists. Nothing secret is printed. Claude Code is pinned
-      # so a new npm release never runs here unreviewed.
-      - name: Try Claude Code through the gateway
-        if: steps.creds.outputs.ready == 'true'
+          TARGET_INSTALL: worker
+          EVENT_NAME: ${{ github.event_name }}
+        run: node scripts/check-installation.mjs
+      - if: steps.installation.outputs.ready == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-only
+          path: .wrangler/artifacts/worker-only
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id || github.run_id }}
+      - if: steps.installation.outputs.ready == 'true'
+        run: npm ci
+      - name: Reject a revision superseded during preparation
+        id: final_revision
+        if: steps.installation.outputs.ready == 'true'
         env:
-          ANTHROPIC_BASE_URL: ${{ steps.deploy.outputs.url }}
-          ANTHROPIC_API_KEY: ${{ secrets.SUB2API_WORKER_TEST_KEY || secrets.SUB2API_FREE_TEST_KEY }}
-        run: |
-          if [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$ANTHROPIC_BASE_URL" ]; then
-            echo "::notice::Skipping the live check: add a gateway API key as the SUB2API_WORKER_TEST_KEY repository secret."
-            exit 0
-          fi
-          echo "== GET /v1/models"
-          curl -sS -o models.json -w "HTTP %{http_code}\n" "$ANTHROPIC_BASE_URL/v1/models" -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01"
-          head -c 400 models.json; echo
-          echo "== Claude Code, one prompt"
-          npx -y @anthropic-ai/claude-code@2.1.296 -p "Reply with exactly: gateway works" --output-format text 2>&1 | tail -20
-          echo "== Claude Code, a longer streamed answer"
-          npx -y @anthropic-ai/claude-code@2.1.296 -p "Count from 1 to 200, comma separated." --output-format text 2>&1 | tail -c 600
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/check-main-revision.mjs
+      - name: Deploy the prepared Workers-only alternative
+        id: deploy
+        if: steps.final_revision.outputs.current == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SUB2API_DASHBOARD_PASSWORD: ${{ secrets.SUB2API_DASHBOARD_PASSWORD }}
+          SUB2API_MANAGEMENT_KEY: ${{ secrets.SUB2API_MANAGEMENT_KEY }}
+        run: node scripts/deploy-prepared.mjs worker .wrangler/artifacts/worker-only
+      - name: Check runtime readiness and configured authentication
+        if: steps.deploy.outcome == 'success'
+        timeout-minutes: 8
+        env:
+          SUB2API_URL: ${{ steps.deploy.outputs.url }}
+          SUB2API_INSTALL: worker
+          SUB2API_KEY: ${{ secrets.SUB2API_WORKER_TEST_KEY || secrets.SUB2API_FREE_TEST_KEY || secrets.SUB2API_TEST_KEY }}
+        run: node scripts/check-deployed.mjs

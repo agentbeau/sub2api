@@ -1,0 +1,102 @@
+{
+  "measuredAt": "2026-11-11T12:24:11.740Z",
+  "node": "v24.22.1",
+  "platform": "linux",
+  "arch": "x64",
+  "cpu": "AMD EPYC 9V74 80-Core Processor",
+  "baselineCommit": "d7da1f8794830b5e42d921b6e526e5f5ab3a1136",
+  "iterationsPerRound": 2000,
+  "rounds": 5,
+  "wasmBytes": 198471,
+  "oneSampleModuleImportMs": {
+    "original": 0.6235610000000094,
+    "rust": 3.299272000000002
+  },
+  "scope": "Local Node/V8 warm gateway CPU overhead including Request/Response construction; mocked external provider and warm key guard. Not production network, cold container, end-to-end model latency, or Cloudflare billed CPU.",
+  "results": {
+    "blocked_path": {
+      "originalMedianUs": 6.827110500000003,
+      "rustMedianUs": 9.95385250000001,
+      "ratioOriginalOverRust": 0.6858761971809404,
+      "samplesUs": {
+        "original": [
+          9.033050499999995,
+          6.827110500000003,
+          8.115497999999988,
+          4.628814500000004,
+          4.700870999999992
+        ],
+        "rust": [
+          12.6596275,
+          9.95385250000001,
+          10.413996499999996,
+          7.0598044999999985,
+          7.1949889999999925
+        ]
+      }
+    },
+    "authenticated_dashboard": {
+      "originalMedianUs": 152.6030405,
+      "rustMedianUs": 14.323629999999978,
+      "ratioOriginalOverRust": 10.653936222870893,
+      "samplesUs": {
+        "original": [
+          152.6030405,
+          162.15156950000005,
+          149.76510299999995,
+          129.49806249999995,
+          203.17162800000006
+        ],
+        "rust": [
+          17.122401999999965,
+          13.66388999999998,
+          14.328135999999974,
+          14.323629999999978,
+          13.721475499999997
+        ]
+      }
+    },
+    "api_forward_cached_guard": {
+      "originalMedianUs": 23.62470800000006,
+      "rustMedianUs": 28.29804349999995,
+      "ratioOriginalOverRust": 0.8348530526500922,
+      "samplesUs": {
+        "original": [
+          23.62470800000006,
+          26.008477500000026,
+          35.85503700000004,
+          20.486124000000018,
+          18.803904500000044
+        ],
+        "rust": [
+          29.431716999999935,
+          46.44219900000007,
+          28.29804349999995,
+          19.433634999999867,
+          26.805144500000097
+        ]
+      }
+    },
+    "successful_login": {
+      "originalMedianUs": 189.09119150000015,
+      "rustMedianUs": 36.225876999999855,
+      "ratioOriginalOverRust": 5.219782298162192,
+      "samplesUs": {
+        "original": [
+          186.86285350000003,
+          189.09119150000015,
+          242.85653150000007,
+          191.6541870000001,
+          165.9988725000003
+        ],
+        "rust": [
+          46.43787499999985,
+          33.93514600000003,
+          36.39269349999995,
+          36.225876999999855,
+          27.266394999999648
+        ]
+      }
+    }
+  }
+}

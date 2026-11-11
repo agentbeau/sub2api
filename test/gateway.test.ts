@@ -63,6 +63,7 @@ describe("classify", () => {
     ["/v1/chat/completions", "api"],
     ["/v1beta/models", "api"],
     ["/healthz", "health"],
+    ["/readyz", "ready"],
     ["/management.html", "dashboard"],
     ["/v0/management/config", "dashboard"],
     ["/v8/management/oauth/auth-url", "dashboard"],
@@ -210,10 +211,20 @@ describe("handle", () => {
     expect((await handle(at("/v1/models"), freshConfig(), thrown)).status).toBe(503);
   });
 
-  it("forwards the health check without a key", async () => {
+  it("answers liveness without waking CPA", async () => {
     const { forward, seen } = recorder();
-    expect((await handle(at("/healthz"), config, forward)).status).toBe(200);
+    const response = await handle(at("/healthz"), config, forward);
+    expect(response.status).toBe(200);
+    expect(seen).toHaveLength(0);
+    expect(await response.json()).toEqual({ status: "ok" });
+  });
+
+  it("probes provider readiness explicitly without forwarding dashboard cookies", async () => {
+    const { forward, seen } = recorder();
+    expect((await handle(at("/readyz", { headers: { cookie: await sessionCookie() } }), config, forward)).status).toBe(200);
     expect(seen).toHaveLength(1);
+    expect(seen[0]?.url).toBe("https://gateway.example/healthz");
+    expect(seen[0]?.headers.get("cookie")).toBeNull();
   });
 
   it("hands a provider's callback to CPA for a signed-in user", async () => {
@@ -298,6 +309,86 @@ describe("handle", () => {
     expect(response.status).toBe(401);
     expect(response.headers.get("set-cookie")).toBeNull();
     expect(await response.text()).toContain("Wrong password.");
+  });
+
+  it("starts the session lifetime after asynchronous sign-in checks finish", async () => {
+    let now = NOW;
+    const delayed = {
+      ...freshConfig(() => now),
+      loginLimiter: { limit: async () => {
+        now += 60;
+        return { success: true };
+      } },
+    };
+    const response = await handle(
+      at("/login", { method: "POST", body: new URLSearchParams({ password: PASSWORD }) }), delayed, recorder().forward,
+    );
+    const token = readCookie(response.headers.get("set-cookie"), SESSION_COOKIE) ?? "";
+    expect(response.status).toBe(303);
+    expect(await sessionIsValid(PASSWORD, token, NOW + 12 * 60 * 60 + 30)).toBe(true);
+    expect(await sessionIsValid(PASSWORD, token, NOW + 12 * 60 * 60 + 60)).toBe(false);
+  });
+
+  it("stops a chunked login upload when it exceeds the body limit", async () => {
+    let chunksRead = 0;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        chunksRead += 1;
+        controller.enqueue(new TextEncoder().encode(chunksRead === 1 ? `password=${PASSWORD}&unused=` : "x".repeat(4096)));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }, { highWaterMark: 0 });
+    const response = await handle(at("/login", { method: "POST", body, duplex: "half" } as RequestInit), freshConfig(), recorder().forward);
+    expect(response.status).toBe(401);
+    expect(response.headers.get("set-cookie")).toBeNull();
+    expect(cancelled).toBe(true);
+    expect(chunksRead).toBe(2);
+  });
+
+  it("does not consume inference uploads or response streams inside the gateway", async () => {
+    let responsePulls = 0;
+    let finishUpload = () => {};
+    let sentUploadChunk = false;
+    const upload = new ReadableStream<Uint8Array>({
+      start(controller) {
+        finishUpload = () => { controller.close(); };
+      },
+      pull(controller) {
+        if (!sentUploadChunk) {
+          controller.enqueue(new TextEncoder().encode('{"model":"configured-by-cpa"}'));
+          sentUploadChunk = true;
+        }
+      },
+    }, { highWaterMark: 0 });
+    const events = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        responsePulls += 1;
+        controller.enqueue(new TextEncoder().encode("data: first\n\n"));
+        controller.close();
+      },
+    }, { highWaterMark: 0 });
+    const upstream = new Response(events, { headers: { "content-type": "text/event-stream" } });
+    const received: Request[] = [];
+    const forward: Forward = async (request) => {
+      if (presentedKey(request)?.startsWith("probe-")) return new Response(null, { status: 401 });
+      received.push(request);
+      return upstream;
+    };
+    const response = await handle(at("/v1/chat/completions", {
+      method: "POST", body: upload, duplex: "half", headers: { "x-api-key": CLIENT_KEY, cookie: await sessionCookie() },
+    } as RequestInit), freshConfig(), forward);
+    expect(response).toBe(upstream);
+    expect(responsePulls).toBe(0);
+    expect(received).toHaveLength(1);
+    expect(received[0]?.bodyUsed).toBe(false);
+    expect(received[0]?.headers.get("x-api-key")).toBe(CLIENT_KEY);
+    expect(received[0]?.headers.get("cookie")).toBeNull();
+    finishUpload();
+    expect(await received[0]?.text()).toBe('{"model":"configured-by-cpa"}');
+    expect(await response.text()).toBe("data: first\n\n");
   });
 
   it("limits sign-in attempts per client address", async () => {

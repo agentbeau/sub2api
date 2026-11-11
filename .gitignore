@@ -1,3 +1,7 @@
 node_modules/
 .wrangler/
 .dev.vars
+gateway-rs/target/
+gateway-rs/pkg/
+dist/
+.bench/
