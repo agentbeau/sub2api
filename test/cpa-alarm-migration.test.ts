@@ -3,6 +3,16 @@ import type { Env } from "../src/env.ts";
 import { OAuthLease } from "../src/oauth-lease.ts";
 import { BackgroundActivity, type BackgroundAction } from "../src/background-activity.ts";
 import { LeaseStorage } from "./lease-storage.ts";
+import { ManagementWindow } from "../src/management-window.ts";
+import { RealtimeLease } from "../src/realtime-lease.ts";
+import { issueSession, SESSION_COOKIE } from "../worker/src/session.ts";
+
+const DASHBOARD_PASSWORD = "native-wake-dashboard-0123456789abcdef";
+const CLIENT_KEY = "native-wake-client-0123456789abcdef";
+
+async function signedHeaders(origin = "https://gateway.example"): Promise<HeadersInit> {
+  return { cookie: `${SESSION_COOKIE}=${await issueSession(DASHBOARD_PASSWORD, Math.floor(Date.now() / 1000))}`, origin };
+}
 
 // Node does not provide Cloudflare's platform base classes. Keep the Cpa class, native
 // lifecycle controller and gateway real; replace only the external platform boundary.
@@ -14,8 +24,9 @@ vi.mock("cloudflare:workers", () => {
 });
 import { Cpa, R2Bridge } from "../src/cpa.ts";
 
-function platform(running: boolean | undefined, deletion: Promise<void> = Promise.resolve(), leaseStorage = new LeaseStorage(), allowRequests = false) {
+function platform(running: boolean | undefined, deletion: Promise<void> = Promise.resolve(), leaseStorage = new LeaseStorage(), allowRequests = false, configuration: string | null = null, provider?: (request: Request) => Promise<Response>, capability?: () => Response | Promise<Response>) {
   const events: string[] = [];
+  const requests: Request[] = [];
   const starts: ContainerStartupOptions[] = [];
   let isRunning = running ?? false;
   let persistedAlarm: number | null = Date.now() + 60_000;
@@ -34,7 +45,11 @@ function platform(running: boolean | undefined, deletion: Promise<void> = Promis
         fetch: async (input, init) => {
           events.push("port_fetch");
           const request = input instanceof Request && init === undefined ? input : new Request(input, init);
-          return new URL(request.url).pathname === "/__sub2api/lifecycle" ? Response.json({ activity_protocol: 1 }) : new Response("ok");
+          requests.push(request);
+          const path = new URL(request.url).pathname;
+          if (path === "/__sub2api/lifecycle") return capability?.() ?? Response.json({ activity_protocol: 1, frontend_auth_protocol: 1 });
+          if (path === "/healthz") return new Response("ok");
+          return provider?.(request) ?? new Response("ok");
         },
         connect: () => { throw new Error("HTTP readiness must not open raw TCP"); },
       };
@@ -64,12 +79,19 @@ function platform(running: boolean | undefined, deletion: Promise<void> = Promis
   };
   // The external context exposes only the APIs this production constructor can use. Any
   // unexpected storage, network or alarm scheduling operation fails instead of being faked.
-  const objectStore: Pick<R2Bucket, "head" | "get"> = { head: async () => null, get: async () => null };
-  const cpa = new Cpa(context as DurableObjectState, { CONTAINER_IDLE_TIMEOUT_MS: "1000", STATE: objectStore } as Env);
+  const objectStore = {
+    head: async (key: string) => key === "config/config.yaml" && configuration !== null ? {} : null,
+    get: async (key: string) => key === "config/config.yaml" && configuration !== null ? { text: async () => configuration } : null,
+  };
+  const cpa = new Cpa(context as DurableObjectState, {
+    CONTAINER_IDLE_TIMEOUT_MS: "1000", STATE: objectStore, DASHBOARD_PASSWORD,
+    LOGIN_LIMIT: { limit: async () => ({ success: true }) },
+  } as unknown as Env);
   return {
     cpa,
     events,
     starts,
+    requests,
     initialized: () => initialization,
     getAlarm: () => persistedAlarm,
     queueLegacyAlarm: () => { persistedAlarm = Date.now() + 1; },
@@ -121,6 +143,143 @@ describe("legacy Container helper alarm migration", () => {
     await state.cpa.alarm();
     expect(state.getAlarm()).toBeNull();
     expect(state.events).toEqual(["delete_alarm", "alarm_deleted"]);
+  });
+});
+
+describe("dashboard and API wake admission", () => {
+  const configuration = `config-version: 8\naccess:\n  api-keys: [${CLIENT_KEY}]\n`;
+
+  it.each(["/v1/models", "/v8/management/config"])("brands forwarded %s headers without changing provider content", async (path) => {
+    const upstream = new Response('{"client_version":"cpa"}', { headers: {
+      "X-CPA-VERSION": "v8.0.67", "access-control-expose-headers": "X-CPA-VERSION, ETag",
+    } });
+    const state = platform(true, Promise.resolve(), new LeaseStorage(), true, configuration, async () => upstream);
+    await state.initialized();
+    const headers = new Headers(await signedHeaders());
+    headers.set("x-api-key", CLIENT_KEY);
+    const response = await state.cpa.fetch(new Request(`https://gateway.example${path}`, { headers }));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-cpa-version")).toBeNull();
+    expect(response.headers.get("x-sub2api-engine-version")).toBe("v8.0.67");
+    expect(response.headers.get("access-control-expose-headers")).toBe("x-sub2api-engine-version, ETag");
+    expect(response.body).toBe(upstream.body);
+    expect(response.bodyUsed).toBe(false);
+    expect(await response.text()).toBe('{"client_version":"cpa"}');
+    expect(state.starts).toHaveLength(0);
+    expect(state.requests.filter((request) => new URL(request.url).pathname === path)).toHaveLength(1);
+  });
+
+  it.each(["/runtime/status", "/v8/management/config", "/callback?state=expired&code=invalid"])("authenticated %s never starts a stopped provider", async (path) => {
+    const state = platform(false, Promise.resolve(), new LeaseStorage(), true, configuration);
+    await state.initialized();
+    const response = await state.cpa.fetch(new Request(`https://gateway.example${path}`, { headers: await signedHeaders() }));
+    expect(response.status).toBe(path === "/runtime/status" ? 200 : 503);
+    expect(state.starts).toHaveLength(0);
+    expect(state.requests).toHaveLength(0);
+  });
+
+  it.each([
+    ["/v1/models", undefined, 401], ["/v1/models", "wrong-key", 401], ["/v1/not-an-api", CLIENT_KEY, 404],
+  ] as const)("rejects %s (%s) before any provider operation", async (path, key, status) => {
+    const state = platform(false, Promise.resolve(), new LeaseStorage(), true, configuration);
+    await state.initialized();
+    const response = await state.cpa.fetch(new Request(`https://gateway.example${path}`, { headers: key ? { authorization: `Bearer ${key}` } : {} }));
+    expect(response.status).toBe(status);
+    expect(state.starts).toHaveLength(0);
+    expect(state.requests).toHaveLength(0);
+  });
+
+  it("still wakes natively for a valid client key and forwards its request once", async () => {
+    const state = platform(false, Promise.resolve(), new LeaseStorage(), true, configuration);
+    await state.initialized();
+    const response = await state.cpa.fetch(new Request("https://gateway.example/v1/messages", {
+      method: "POST", headers: { authorization: `Bearer ${CLIENT_KEY}` }, body: '{"model":"provider-model"}',
+    }));
+    expect(response.status).toBe(200);
+    expect(state.starts).toHaveLength(1);
+    const model = state.requests.filter((request) => new URL(request.url).pathname === "/v1/messages");
+    expect(model).toHaveLength(1);
+    expect(await model[0]?.text()).toBe('{"model":"provider-model"}');
+    expect(state.events.at(-1)).toBe("port_fetch");
+  });
+
+  it("preserves native wake when an enabled plugin must decide authentication", async () => {
+    const state = platform(false, Promise.resolve(), new LeaseStorage(), true,
+      "config-version: 8\nplugins:\n  enabled: true\n  configs:\n    frontend-auth:\n      enabled: true\n");
+    await state.initialized();
+    expect((await state.cpa.fetch(new Request("https://gateway.example/v1/models", { headers: { authorization: "plugin-credential" } }))).status).toBe(200);
+    expect(state.starts).toHaveLength(1);
+  });
+
+  it("requires a signed-in, same-origin POST before an explicit start", async () => {
+    const state = platform(false, Promise.resolve(), new LeaseStorage(), true);
+    await state.initialized();
+    const request = (method: string, headers?: HeadersInit) => new Request("https://gateway.example/runtime/start", { method, ...(headers ? { headers } : {}) });
+    expect((await state.cpa.fetch(request("POST"))).status).toBe(401);
+    expect((await state.cpa.fetch(request("GET", await signedHeaders()))).status).toBe(405);
+    expect((await state.cpa.fetch(request("POST", await signedHeaders("https://untrusted.example")))).status).toBe(403);
+    expect(state.starts).toHaveLength(0);
+    expect(state.requests).toHaveLength(0);
+    const started = await state.cpa.fetch(request("POST", await signedHeaders()));
+    expect(started.status).toBe(200);
+    expect(await started.json()).toMatchObject({ running: true, controls_remaining_ms: expect.any(Number) });
+    expect(state.starts).toHaveLength(1);
+  });
+
+  it("does not slide the editing deadline on status polls and closing leaves actual work protected", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const storage = new LeaseStorage();
+    const state = platform(false, Promise.resolve(), storage, true);
+    await state.initialized();
+    const headers = await signedHeaders();
+    await state.cpa.fetch(new Request("https://gateway.example/runtime/start", { method: "POST", headers }));
+    expect(state.events.at(-1)).toBe("restore_timeout:120000");
+    vi.setSystemTime(1_020_000);
+    const status = await state.cpa.fetch(new Request("https://gateway.example/runtime/status", { headers }));
+    expect(await status.json()).toMatchObject({ running: true, controls_remaining_ms: 100_000 });
+    expect(state.events.at(-1)).toBe("restore_timeout:100000");
+    expect(await state.cpa.backgroundActivity("begin", "a".repeat(32))).toBe(true);
+    const closed = await state.cpa.fetch(new Request("https://gateway.example/runtime/stop", { method: "POST", headers }));
+    expect(await closed.json()).toMatchObject({ running: true, controls_remaining_ms: 0 });
+    expect(state.events.at(-1)).toBe("restore_timeout:90000");
+    expect(state.starts).toHaveLength(1);
+    const window = new ManagementWindow(storage);
+    await window.restore();
+    expect(window.remainingMs()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("mixed provider image authentication", () => {
+  const configuration = `config-version: 8\naccess:\n  api-keys: [${CLIENT_KEY}]\n`;
+
+  it.each([
+    { label: "a stale saved key", path: "/v1/messages", method: "POST", key: CLIENT_KEY, running: true, configuration },
+    { label: "a warm temporary credential", path: "/v1/realtime", method: "GET", key: "ek_existing-secret", running: true, configuration },
+    { label: "a native plugin credential", path: "/v1/messages", method: "POST", key: "plugin-credential", running: false,
+      configuration: "config-version: 8\nplugins:\n  enabled: true\n  configs:\n    frontend-auth:\n      enabled: true\n" },
+  ])("does not forward $label to an activity-only image", async (testCase) => {
+    const state = platform(testCase.running, Promise.resolve(), new LeaseStorage(), true, testCase.configuration,
+      async () => new Response("old engine would accept any credential"), () => Response.json({ activity_protocol: 1 }));
+    await state.initialized();
+    const response = await state.cpa.fetch(new Request(`https://gateway.example${testCase.path}`, {
+      method: testCase.method, headers: { authorization: `Bearer ${testCase.key}` },
+    }));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "runtime_upgrade_required" } });
+    expect(state.requests.some((request) => new URL(request.url).pathname === testCase.path)).toBe(false);
+    expect(state.starts).toHaveLength(testCase.running ? 0 : 1);
+  });
+
+  it("retains native readiness, management and explicit controls while an old image is being replaced", async () => {
+    const state = platform(true, Promise.resolve(), new LeaseStorage(), true, configuration, undefined,
+      () => Response.json({ activity_protocol: 1 }));
+    await state.initialized();
+    expect((await state.cpa.fetch(new Request("https://gateway.example/readyz"))).status).toBe(200);
+    expect((await state.cpa.fetch(new Request("https://gateway.example/v8/management/config", { headers: await signedHeaders() }))).status).toBe(200);
+    expect((await state.cpa.fetch(new Request("https://gateway.example/runtime/start", { method: "POST", headers: await signedHeaders() }))).status).toBe(200);
+    expect(state.starts).toHaveLength(0);
   });
 });
 
@@ -242,5 +401,96 @@ describe("actual background work and native inactivity", () => {
     }));
     expect(response.status).toBe(204);
     expect(calls).toEqual([{ name: "cf-singleton-container", action: "begin", id: firstId }]);
+  });
+});
+
+describe("native realtime credential lifetime", () => {
+  const configuration = `config-version: 8\naccess:\n  api-keys: [${CLIENT_KEY}]\n`;
+  const authorization = { authorization: `Bearer ${CLIENT_KEY}` };
+  const lastTimeout = (events: string[]) => events.filter((event) => event.startsWith("restore_timeout:")).at(-1);
+
+  it("holds successful issuance through idle gaps and reusable native access until absolute expiry", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const minted = Response.json({ value: "ek_live-native-credential", expires_at: 1600, session: { type: "realtime" } });
+    const state = platform(false, Promise.resolve(), new LeaseStorage(), true, configuration, async (request) =>
+      new URL(request.url).pathname === "/v1/realtime/client_secrets" ? minted : new Response("connected"));
+    await state.initialized();
+    const response = await state.cpa.fetch(new Request("https://gateway.example/v1/realtime/client_secrets", { method: "POST", headers: authorization }));
+    expect(response).toBe(minted);
+    expect(response.bodyUsed).toBe(false);
+    expect(lastTimeout(state.events)).toBe("restore_timeout:601000");
+    expect(state.starts).toHaveLength(1);
+
+    vi.setSystemTime(1_005_000);
+    const ephemeral = { authorization: "Bearer ek_live-native-credential" };
+    expect((await state.cpa.fetch(new Request("https://gateway.example/v1/realtime", { headers: ephemeral }))).status).toBe(200);
+    expect(lastTimeout(state.events)).toBe("restore_timeout:596000");
+    vi.setSystemTime(1_010_000);
+    expect((await state.cpa.fetch(new Request("https://gateway.example/v1/realtime/calls/call-one/hangup", { method: "POST", headers: authorization }))).status).toBe(200);
+    expect(lastTimeout(state.events)).toBe("restore_timeout:591000");
+    vi.setSystemTime(1_015_000);
+    expect((await state.cpa.fetch(new Request("https://gateway.example/v1/realtime", { headers: ephemeral }))).status).toBe(200);
+    expect(lastTimeout(state.events)).toBe("restore_timeout:586000");
+    vi.setSystemTime(1_601_000);
+    expect((await state.cpa.fetch(new Request("https://gateway.example/v1/models", { headers: authorization }))).status).toBe(200);
+    expect(lastTimeout(state.events)).toBe("restore_timeout:1000");
+    expect(state.starts).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("restores the remaining credential lifetime before reattaching a running process", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const storage = new LeaseStorage();
+    const lease = new RealtimeLease(storage);
+    await lease.observe(new Request("https://gateway.example/v1/realtime/client_secrets", { method: "POST", headers: authorization }),
+      Response.json({ value: "ek_restored-credential", expires_at: 8200 }));
+    vi.setSystemTime(1_020_000);
+    const state = platform(true, Promise.resolve(), storage, true, configuration);
+    await state.initialized();
+    expect(lastTimeout(state.events)).toBe("restore_timeout:7181000");
+    expect(state.requests).toHaveLength(0);
+    expect((await state.cpa.fetch(new Request("https://gateway.example/v1/models", { headers: authorization }))).status).toBe(200);
+    expect(lastTimeout(state.events)).toBe("restore_timeout:7181000");
+    expect(state.starts).toHaveLength(0);
+  });
+
+  it("clears the old process's credential hold only when an admitted request starts its replacement", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const storage = new LeaseStorage();
+    await new RealtimeLease(storage).observe(new Request("https://gateway.example/v1/realtime/client_secrets", { method: "POST", headers: authorization }),
+      Response.json({ value: "ek_lost-process", expires_at: 1600 }));
+    const state = platform(false, Promise.resolve(), storage, true, configuration);
+    await state.initialized();
+    const before = new RealtimeLease(storage);
+    await before.restore();
+    expect(before.remainingMs()).toBe(601_000);
+    expect(state.starts).toHaveLength(0);
+    expect((await state.cpa.fetch(new Request("https://gateway.example/v1/messages", { method: "POST", headers: authorization, body: "admitted model request" }))).status).toBe(200);
+    const after = new RealtimeLease(storage);
+    await after.restore();
+    expect(after.remainingMs()).toBe(0);
+    expect(lastTimeout(state.events)).toBe("restore_timeout:1000");
+    expect(state.starts).toHaveLength(1);
+  });
+
+  it("keeps ordinary inference streaming unchanged while the additional hold is installed", async () => {
+    let pulls = 0;
+    const upstream = new Response(new ReadableStream<Uint8Array>({ pull(controller) {
+      pulls += 1;
+      controller.enqueue(new TextEncoder().encode("data: model output\n\n"));
+      controller.close();
+    } }, { highWaterMark: 0 }), { headers: { "content-type": "text/event-stream" } });
+    const clone = vi.spyOn(upstream, "clone");
+    const state = platform(false, Promise.resolve(), new LeaseStorage(), true, configuration, async () => upstream);
+    await state.initialized();
+    const response = await state.cpa.fetch(new Request("https://gateway.example/v1/messages", { method: "POST", headers: authorization, body: "stream inference" }));
+    expect(response).toBe(upstream);
+    expect(clone).not.toHaveBeenCalled();
+    expect(pulls).toBe(0);
+    expect(lastTimeout(state.events)).toBe("restore_timeout:1000");
+    expect(await response.text()).toBe("data: model output\n\n");
   });
 });

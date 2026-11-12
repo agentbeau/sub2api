@@ -4,7 +4,7 @@ import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { artifactConfig, deploymentSecrets, imageDigest, verifyArtifact } from "./deployment-artifact.mjs";
+import { artifactConfig, DASHBOARD_OBJECT_KEY, DASHBOARD_PANEL_FILE, deploymentSecrets, imageDigest, verifyArtifact, verifyContainerImageArtifact } from "./deployment-artifact.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const [install, artifactPath, imagePath] = process.argv.slice(2);
@@ -29,8 +29,7 @@ const secrets = deploymentSecrets(install, live === "none", process.env.SUB2API_
 if (install === "container") {
   if (!imagePath) throw new Error("A tested image artifact is required");
   const images = resolve(imagePath);
-  const manifest = await verifyArtifact(images, revision, "container-image");
-  if (!/^sub2api-cpa:[a-f0-9]{12}-\d+-\d+$/.test(manifest.image ?? "") || !/^sha256:[a-f0-9]{64}$/.test(manifest.imageId ?? "")) throw new Error("Invalid tested image identity");
+  const manifest = await verifyContainerImageArtifact(images, revision);
   execFileSync("docker", ["image", "load", "--input", join(images, "image.tar.gz")], { stdio: "inherit", env: childEnv });
   const loadedId = execFileSync("docker", ["image", "inspect", "--format", "{{.Id}}", manifest.image], { encoding: "utf8", env: childEnv }).trim();
   if (loadedId !== manifest.imageId) throw new Error("Loaded container image differs from the smoke-tested image");
@@ -48,6 +47,10 @@ if (install === "container") {
   const digests = JSON.parse(execFileSync("docker", ["image", "inspect", "--format", "{{json .RepoDigests}}", remoteTag], { encoding: "utf8", env: childEnv }));
   const pinned = imageDigest(digests, account, manifest.image);
   config = artifactConfig(source, install, pinned);
+  // Publish the image's checksummed panel before the Worker switches to serving
+  // it from R2. Dashboard viewing then needs no provider/container request.
+  execFileSync(wrangler, ["r2", "object", "put", `${bucket}/${DASHBOARD_OBJECT_KEY}`, "--file", join(images, DASHBOARD_PANEL_FILE), "--content-type", "text/html; charset=utf-8", "--cache-control", "no-cache", "--remote"], { cwd: root, stdio: "inherit", env: childEnv });
+  console.log(`Published ${DASHBOARD_OBJECT_KEY} from the tested image (${manifest.files[DASHBOARD_PANEL_FILE]})`);
   console.log(`Deploying the smoke-tested image by digest: ${pinned}`);
 }
 

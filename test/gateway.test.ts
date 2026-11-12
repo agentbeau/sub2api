@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { handle, type Forward, type GatewayConfig, type LoginLimiter } from "../src/gateway.ts";
-import { KeyGuard } from "../src/key-guard.ts";
+import { handle, type ApiAccessDecision, type Forward, type GatewayConfig, type LoginLimiter } from "../src/gateway.ts";
 import { classify } from "../src/routes.ts";
 import { SESSION_COOKIE, issueSession, passwordMatches, readCookie, sessionIsValid } from "../worker/src/session.ts";
 
@@ -11,31 +10,10 @@ const CLIENT_KEY = "client-key-0123456789abcdef0123456789abcdef";
 const unlimited: LoginLimiter = { limit: async () => ({ success: true }) };
 
 function freshConfig(nowSeconds: () => number = () => NOW): GatewayConfig {
-  return { dashboardPassword: PASSWORD, nowSeconds, keyGuard: new KeyGuard(nowSeconds), loginLimiter: unlimited };
+  return { dashboardPassword: PASSWORD, nowSeconds, apiAccess: { authorize: async () => "allowed", invalidate() {} }, loginLimiter: unlimited };
 }
 
 const config = freshConfig();
-
-function presentedKey(request: Request): string | null {
-  const authorization = request.headers.get("authorization");
-  return authorization?.replace(/^bearer\s+/i, "").trim() || request.headers.get("x-api-key") || new URL(request.url).searchParams.get("key");
-}
-
-function fakeCpa(keys: string[]): { forward: Forward; seen: Request[]; probes: Request[] } {
-  const seen: Request[] = [];
-  const probes: Request[] = [];
-  return {
-    seen,
-    probes,
-    forward: async (request) => {
-      const key = presentedKey(request);
-      if (key?.startsWith("probe-")) probes.push(request);
-      else seen.push(request);
-      if (keys.length > 0 && (key === null || !keys.includes(key))) return Response.json({ error: "Invalid API key" }, { status: 401 });
-      return new Response("from cpa", { status: 200 });
-    },
-  };
-}
 
 function recorder(): { forward: Forward; seen: Request[] } {
   const seen: Request[] = [];
@@ -65,6 +43,10 @@ describe("classify", () => {
     ["/healthz", "health"],
     ["/readyz", "ready"],
     ["/management.html", "dashboard"],
+    ["/provider-panel.html", "dashboard"],
+    ["/runtime/status", "dashboard"],
+    ["/runtime/start", "dashboard"],
+    ["/runtime/stop", "dashboard"],
     ["/v0/management/config", "dashboard"],
     ["/v8/management/oauth/auth-url", "dashboard"],
     ["/", "home"],
@@ -119,96 +101,109 @@ describe("session", () => {
 });
 
 describe("handle", () => {
-  it("forwards API calls to CPA without the browser's cookies once CPA requires a key", async () => {
-    const { forward, seen, probes } = fakeCpa([CLIENT_KEY]);
-    const response = await handle(
-      at("/v1/messages", { method: "POST", headers: { "x-api-key": CLIENT_KEY, cookie: await sessionCookie() }, body: "{}" }),
-      freshConfig(),
-      forward,
-    );
-    expect(response.status).toBe(200);
-    expect(probes).toHaveLength(1);
-    expect(probes[0]?.url).toBe("https://gateway.example/v1/models");
+  it.each([
+    ["denied", 401],
+    ["unconfigured", 401],
+    ["unavailable", 503],
+    ["not-found", 404],
+  ] as const)("rejects %s API admission without probing or forwarding", async (decision, status) => {
+    const { forward, seen } = recorder();
+    const admitted = { ...freshConfig(), apiAccess: { authorize: async () => decision, invalidate() {} } };
+    const request = at("/v1/messages", { method: "POST", headers: { "x-api-key": "invalid" }, body: "{}" });
+    const response = await handle(request, admitted, forward);
+    expect(response.status).toBe(status);
+    expect(seen).toHaveLength(0);
+    expect(request.bodyUsed).toBe(false);
+    if (decision === "unconfigured") expect(await response.text()).toContain("API Keys in the dashboard");
+  });
+
+  it.each(["missing", "empty", "invalid"])("does not wake the provider for %s API credentials rejected by admission", async (kind) => {
+    const { forward, seen } = recorder();
+    const headers = new Headers();
+    if (kind !== "missing") headers.set("x-api-key", kind === "empty" ? "" : "wrong");
+    const admitted = { ...freshConfig(), apiAccess: { authorize: async () => "denied" as const, invalidate() {} } };
+    const response = await handle(at("/v1/models", { headers }), admitted, forward);
+    expect(response.status).toBe(401);
+    expect(seen).toHaveLength(0);
+  });
+
+  it.each(["throw", "reject", "unknown"])("fails closed without forwarding when API admission returns %s", async (failure) => {
+    const { forward, seen } = recorder();
+    const authorize = () => {
+      if (failure === "throw") throw new Error("admission unavailable");
+      if (failure === "reject") return Promise.reject(new Error("R2 unavailable"));
+      // JavaScript callbacks can violate their declared type at the Wasm boundary.
+      return Promise.resolve("unexpected-decision" as ApiAccessDecision);
+    };
+    const response = await handle(at("/v1/models"), { ...freshConfig(), apiAccess: { authorize, invalidate() {} } }, forward);
+    expect(response.status).toBe(503);
+    expect(seen).toHaveLength(0);
+  });
+
+  it("forwards an admitted request once after passing its unread metadata to admission", async () => {
+    const { forward, seen } = recorder();
+    const request = at("/v1/messages", { method: "POST", headers: { "x-api-key": CLIENT_KEY, cookie: await sessionCookie() }, body: "{}" });
+    const admissions: Request[] = [];
+    const admitted = { ...freshConfig(), apiAccess: {
+      authorize: async (candidate: Request) => {
+        admissions.push(candidate);
+        expect(candidate).toBe(request);
+        expect(candidate.bodyUsed).toBe(false);
+        return "allowed" as const;
+      },
+      invalidate() {},
+    } };
+    expect((await handle(request, admitted, forward)).status).toBe(200);
+    expect(admissions).toHaveLength(1);
     expect(seen).toHaveLength(1);
+    expect(seen[0]?.url).toBe("https://gateway.example/v1/messages");
     expect(seen[0]?.headers.get("x-api-key")).toBe(CLIENT_KEY);
     expect(seen[0]?.headers.get("cookie")).toBeNull();
     expect(await seen[0]?.text()).toBe("{}");
   });
 
-  it("leaves checking the key to CPA", async () => {
-    const { forward, seen } = fakeCpa([CLIENT_KEY]);
-    const guarded = freshConfig();
-    expect((await handle(at("/v1/models", { headers: { "x-api-key": "guess" } }), guarded, forward)).status).toBe(401);
-    expect((await handle(at("/v1/models"), guarded, forward)).status).toBe(401);
-    expect((await handle(at(`/v1beta/models?key=${CLIENT_KEY}`), guarded, forward)).status).toBe(200);
-    expect(seen).toHaveLength(3);
-  });
-
-  it("refuses every API call while CPA has no keys, which CPA alone would let through", async () => {
-    const { forward, seen, probes } = fakeCpa([]);
-    const response = await handle(at("/v1/models", { headers: { "x-api-key": "anything" } }), freshConfig(), forward);
-    expect(response.status).toBe(401);
-    expect(JSON.stringify(await response.json())).toContain("API Keys in the dashboard");
-    expect(probes).toHaveLength(1);
+  it.each([
+    ["/provider-panel.html", "GET"],
+    ["/runtime/status", "GET"],
+    ["/runtime/start", "POST"],
+    ["/runtime/stop", "POST"],
+  ])("requires the existing dashboard session for %s", async (path, method) => {
+    const { forward, seen } = recorder();
+    expect((await handle(at(path, { method }), config, forward)).status).toBe(401);
     expect(seen).toHaveLength(0);
+    const signed = await handle(at(path, { method, headers: { cookie: await sessionCookie() } }), config, forward);
+    expect(signed.status).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.headers.get("cookie")).toBeNull();
   });
 
-  it("asks CPA again for every call while it has no keys, so the first key works at once", async () => {
-    const keys: string[] = [];
-    const { forward, seen } = fakeCpa(keys);
-    const guarded = freshConfig();
-    expect((await handle(at("/v1/models", { headers: { "x-api-key": CLIENT_KEY } }), guarded, forward)).status).toBe(401);
-    keys.push(CLIENT_KEY);
-    expect((await handle(at("/v1/models", { headers: { "x-api-key": CLIENT_KEY } }), guarded, forward)).status).toBe(200);
+  it("asks admission again immediately after a key is added or revoked", async () => {
+    const { forward, seen } = recorder();
+    let decision: "allowed" | "denied" | "unconfigured" = "unconfigured";
+    const admitted = { ...freshConfig(), apiAccess: { authorize: async () => decision, invalidate() {} } };
+    const call = () => handle(at("/v1/models", { headers: { "x-api-key": CLIENT_KEY } }), admitted, forward);
+    expect((await call()).status).toBe(401);
+    expect(seen).toHaveLength(0);
+    decision = "allowed";
+    expect((await call()).status).toBe(200);
+    expect(seen).toHaveLength(1);
+    decision = "denied";
+    expect((await call()).status).toBe(401);
     expect(seen).toHaveLength(1);
   });
 
-  it("rechecks CPA after a short while and after any dashboard change", async () => {
-    const keys = [CLIENT_KEY];
-    const { forward, probes } = fakeCpa(keys);
-    let now = NOW;
-    const guarded = freshConfig(() => now);
-    const call = () => handle(at("/v1/models", { headers: { "x-api-key": CLIENT_KEY } }), guarded, forward);
-    await call();
-    await call();
-    expect(probes).toHaveLength(1);
-    now += 15;
-    await call();
-    expect(probes).toHaveLength(2);
-    keys.length = 0;
-    const save = at("/v8/management/config/access/api-keys", { method: "PUT", headers: { cookie: await sessionCookie() }, body: "[]" });
-    expect((await handle(save, guarded, forward)).status).toBe(200);
-    expect((await call()).status).toBe(401);
-    expect(probes).toHaveLength(3);
-  });
-
-  it("trusts no cached answer for a while after a dashboard change, in case CPA applies it late", async () => {
-    const keys = [CLIENT_KEY];
-    const { forward, probes } = fakeCpa(keys);
-    let now = NOW;
-    const guarded = freshConfig(() => now);
-    const call = () => handle(at("/v1/models", { headers: { "x-api-key": CLIENT_KEY } }), guarded, forward);
-    const save = at("/v8/management/config/access/api-keys", { method: "PUT", headers: { cookie: await sessionCookie() }, body: "[]" });
-    await handle(save, guarded, forward);
-    expect((await call()).status).toBe(200);
-    keys.length = 0;
-    expect((await call()).status).toBe(401);
-    expect(probes).toHaveLength(2);
-    keys.push(CLIENT_KEY);
-    now += 15;
-    await call();
-    await call();
-    expect(probes).toHaveLength(3);
-  });
-
-  it("fails closed when CPA cannot be asked", async () => {
-    const down: Forward = async () => new Response("starting", { status: 502 });
-    const response = await handle(at("/v1/models", { headers: { "x-api-key": CLIENT_KEY } }), freshConfig(), down);
-    expect(response.status).toBe(503);
-    const thrown: Forward = async () => {
-      throw new Error("container not running");
-    };
-    expect((await handle(at("/v1/models"), freshConfig(), thrown)).status).toBe(503);
+  it("invalidates admission state before and after an authenticated dashboard write", async () => {
+    const events: string[] = [];
+    const admitted = { ...freshConfig(), apiAccess: {
+      authorize: async () => "allowed" as const,
+      invalidate: () => { events.push("invalidate"); },
+    } };
+    const forward: Forward = async () => { events.push("forward"); return new Response("saved"); };
+    const response = await handle(at("/v8/management/config/access/api-keys", {
+      method: "PUT", headers: { cookie: await sessionCookie() }, body: "[]",
+    }), admitted, forward);
+    expect(response.status).toBe(200);
+    expect(events).toEqual(["invalidate", "forward", "invalidate"]);
   });
 
   it("answers liveness without waking CPA", async () => {
@@ -227,7 +222,7 @@ describe("handle", () => {
     expect(seen[0]?.headers.get("cookie")).toBeNull();
   });
 
-  it("hands a provider's callback to CPA for a signed-in user", async () => {
+  it("shows the sub2api login receipt after forwarding the provider callback for a signed-in user", async () => {
     const { forward, seen } = recorder();
     const response = await handle(
       at("/callback?code=abc&state=f1d66a216e61aab0375b6857db64a6a5", { headers: { cookie: await sessionCookie() } }),
@@ -235,7 +230,9 @@ describe("handle", () => {
       forward,
     );
     expect(response.status).toBe(200);
-    expect(await response.text()).toContain("Login received");
+    const page = await response.text();
+    expect(page).toContain("Login received");
+    expect(page).toContain("sub2api is saving this login");
     expect(seen).toHaveLength(1);
     expect(seen[0]?.url).toBe("https://gateway.example/v0/management/oauth-callback?code=abc&state=f1d66a216e61aab0375b6857db64a6a5");
     expect(seen[0]?.headers.get("cookie")).toBeNull();
@@ -249,13 +246,28 @@ describe("handle", () => {
     expect(seen).toHaveLength(0);
   });
 
-  it("explains a callback CPA refuses", async () => {
+  it("explains a callback the provider refuses", async () => {
     const refused: Forward = async () => Response.json({ status: "error", error: "unknown or expired state" }, { status: 404 });
     const response = await handle(at("/oauth-callback?code=abc&state=xyz", { headers: { cookie: await sessionCookie() } }), config, refused);
     expect(response.status).toBe(404);
     const text = await response.text();
     expect(text).toContain("unknown or expired state");
     expect(text).toContain("Start the login again");
+  });
+
+  it("uses a provider label when a refused callback contains no explanatory JSON", async () => {
+    const refused: Forward = async () => new Response("upstream unavailable", { status: 503 });
+    const response = await handle(at("/oauth-callback?code=abc&state=xyz", { headers: { cookie: await sessionCookie() } }), config, refused);
+    expect(response.status).toBe(503);
+    expect(await response.text()).toContain("Provider answered 503");
+  });
+
+  it("identifies the signed-out dashboard as sub2api", async () => {
+    const { forward, seen } = recorder();
+    const response = await handle(at("/login"), config, forward);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("Sign in to open the sub2api dashboard.");
+    expect(seen).toHaveLength(0);
   });
 
   it("never forwards blocked paths", async () => {
@@ -373,7 +385,6 @@ describe("handle", () => {
     const upstream = new Response(events, { headers: { "content-type": "text/event-stream" } });
     const received: Request[] = [];
     const forward: Forward = async (request) => {
-      if (presentedKey(request)?.startsWith("probe-")) return new Response(null, { status: 401 });
       received.push(request);
       return upstream;
     };

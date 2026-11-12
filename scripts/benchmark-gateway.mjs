@@ -36,6 +36,8 @@ const config = {
   keyGuard: { state: async () => "required", forget() {} },
   loginLimiter: { limit: async () => ({ success: true }) },
 };
+const currentConfig = { dashboardPassword: password, nowSeconds: () => now,
+  apiAccess: { authorize: async () => "allowed", invalidate() {} }, loginLimiter: config.loginLimiter };
 const forward = async () => new Response(null, { status: 204 });
 const cases = {
   blocked_path: () => new Request("https://gateway.example/not-a-route"),
@@ -50,13 +52,13 @@ const results = {};
 for (const [name, request] of Object.entries(cases)) {
   const timings = { original: [], rust: [] };
   for (const implementation of [old, current]) {
-    for (let i = 0; i < 300; i++) await implementation.module.handle(request(), config, forward);
+    for (let i = 0; i < 300; i++) await implementation.module.handle(request(), implementation === old ? config : currentConfig, forward);
   }
   for (let round = 0; round < rounds; round++) {
     // Alternate order to reduce warmup and thermal bias.
     for (const [label, implementation] of round % 2 ? [["rust", current], ["original", old]] : [["original", old], ["rust", current]]) {
       const start = performance.now();
-      for (let i = 0; i < iterations; i++) await implementation.module.handle(request(), config, forward);
+      for (let i = 0; i < iterations; i++) await implementation.module.handle(request(), implementation === old ? config : currentConfig, forward);
       timings[label].push((performance.now() - start) * 1000 / iterations);
     }
   }
@@ -70,7 +72,7 @@ const report = {
   cpu: cpus()[0]?.model, baselineCommit: "d7da1f8794830b5e42d921b6e526e5f5ab3a1136",
   iterationsPerRound: iterations, rounds, wasmBytes,
   oneSampleModuleImportMs: { original: old.importMs, rust: current.importMs },
-  scope: "Local Node/V8 warm gateway CPU overhead including Request/Response construction; mocked external provider and warm key guard. Not production network, cold container, end-to-end model latency, or Cloudflare billed CPU.",
+  scope: "Local Node/V8 warm gateway CPU overhead including Request/Response construction; mocked external provider and admission. Excludes R2 configuration reads, production network, cold container, end-to-end model latency, and Cloudflare billed CPU.",
   results,
 };
 const text = JSON.stringify(report, null, 2) + "\n";

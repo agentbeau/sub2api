@@ -17,7 +17,8 @@ const MAX_LOGIN_BODY: usize = 4096;
 const PASSWORD_NOT_SET: &str =
     "Sign-in is off: set the DASHBOARD_PASSWORD secret to at least 16 characters.";
 const NO_CLIENT_KEYS: &str = "No API key is set up yet: add one under API Keys in the dashboard.";
-const CPA_UNAVAILABLE: &str = "The gateway is starting or unavailable. Try again shortly.";
+const INVALID_API_KEY: &str = "Invalid API key.";
+const PROVIDER_UNAVAILABLE: &str = "The gateway is starting or unavailable. Try again shortly.";
 const TOO_MANY_ATTEMPTS: &str = "Too many sign-in attempts. Wait a minute and try again.";
 
 #[wasm_bindgen]
@@ -36,16 +37,16 @@ pub fn handle_gateway(
     password: String,
     now_seconds: Function,
     forward: Function,
-    key_state: Function,
-    forget_keys: Function,
+    authorize_api: Function,
+    invalidate_api_access: Function,
     limit_login: Function,
 ) -> Promise {
     let gateway = Gateway {
         password,
         now_seconds,
         forward,
-        key_state,
-        forget_keys,
+        authorize_api,
+        invalidate_api_access,
         limit_login,
     };
     match dispatch(request, gateway) {
@@ -57,7 +58,7 @@ pub fn handle_gateway(
 fn dispatch(request: Request, gateway: Gateway) -> Result<Promise, JsValue> {
     let url = Url::new(&request.url())?;
     match classify_path(&url.pathname()) {
-        "api" => gateway.api(request, &url),
+        "api" => gateway.api(request),
         "health" => resolved(response(
             Some(r#"{"status":"ok"}"#),
             200,
@@ -135,8 +136,8 @@ struct Gateway {
     password: String,
     now_seconds: Function,
     forward: Function,
-    key_state: Function,
-    forget_keys: Function,
+    authorize_api: Function,
+    invalidate_api_access: Function,
     limit_login: Function,
 }
 
@@ -177,18 +178,28 @@ impl Gateway {
             .unchecked_into())
     }
 
-    fn api(self, request: Request, url: &Url) -> Result<Promise, JsValue> {
-        let value = self
-            .key_state
-            .call1(&JsValue::UNDEFINED, &JsValue::from_str(&url.origin()))?;
-        // Resolve the native forwarding promise directly after the key guard.
-        // No Rust future remains attached to the provider's response stream.
+    fn api(self, request: Request) -> Result<Promise, JsValue> {
+        let admission = self
+            .authorize_api
+            .call1(&JsValue::UNDEFINED, request.as_ref());
+        // Admission uses request metadata and saved configuration, never a CPA
+        // probe. Only its explicit allowance can reach the forwarding callback.
         Ok(future_to_promise(async move {
-            let state = JsFuture::from(Promise::resolve(&value)).await?;
-            match state.as_string().as_deref() {
-                Some("required") => self.forward_native(&without_cookies(&request)?),
-                Some("open") => resolved(api_error(401, "authentication_error", NO_CLIENT_KEYS)),
-                _ => resolved(api_error(503, "api_error", CPA_UNAVAILABLE)),
+            let decision = match admission {
+                Ok(value) => JsFuture::from(Promise::resolve(&value))
+                    .await
+                    .ok()
+                    .and_then(|value| value.as_string()),
+                Err(_) => None,
+            };
+            match decision.as_deref() {
+                Some("allowed") => self.forward_native(&without_cookies(&request)?),
+                Some("denied") => resolved(api_error(401, "authentication_error", INVALID_API_KEY)),
+                Some("unconfigured") => {
+                    resolved(api_error(401, "authentication_error", NO_CLIENT_KEYS))
+                }
+                Some("not-found") => resolved(not_found()),
+                _ => resolved(api_error(503, "api_error", PROVIDER_UNAVAILABLE)),
             }
             .map(JsValue::from)
         }))
@@ -197,11 +208,11 @@ impl Gateway {
     async fn dashboard(&self, request: &Request) -> Result<Response, JsValue> {
         let writes = !matches!(request.method().as_str(), "GET" | "HEAD");
         if writes {
-            self.forget_keys.call0(&JsValue::UNDEFINED)?;
+            self.invalidate_api_access.call0(&JsValue::UNDEFINED)?;
         }
         let response = self.forward(&without_cookies(request)?).await;
         if writes {
-            self.forget_keys.call0(&JsValue::UNDEFINED)?;
+            self.invalidate_api_access.call0(&JsValue::UNDEFINED)?;
         }
         response
     }
@@ -231,7 +242,7 @@ impl Gateway {
             return html(
                 &message_page(
                     "Login received",
-                    "CPA is saving this login. Go back to the dashboard to see it.",
+                    "sub2api is saving this login. Go back to the dashboard to see it.",
                     false,
                 ),
                 200,
@@ -246,7 +257,7 @@ impl Gateway {
                 .and_then(|value| value.as_string()),
             Err(_) => None,
         }
-        .unwrap_or_else(|| format!("CPA answered {}", response.status()));
+        .unwrap_or_else(|| format!("Provider answered {}", response.status()));
         html(
             &message_page(
                 "Login not saved",

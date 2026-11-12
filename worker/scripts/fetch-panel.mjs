@@ -4,6 +4,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
+import { brandPanel } from "../../container/brand-panel/brand.mjs";
 
 const version = process.env.PANEL_VERSION || "latest";
 const expected = (process.env.PANEL_SHA256 ?? "").trim().toLowerCase();
@@ -19,5 +20,6 @@ const sha256 = createHash("sha256").update(bytes).digest("hex");
 if (expected !== "" && sha256 !== expected) throw new Error(`The dashboard's SHA-256 is ${sha256}, not the pinned ${expected}`);
 const target = new URL("../public/", import.meta.url);
 await mkdir(target, { recursive: true });
-await writeFile(new URL("management.html", target), bytes);
-console.log(`Dashboard ${version} saved (${html.length} bytes, sha256 ${sha256})`);
+const branded = Buffer.from(brandPanel(html).html, "utf8");
+await writeFile(new URL("management.html", target), branded);
+console.log(`sub2api dashboard ${version} saved (${branded.length} bytes; upstream sha256 ${sha256}; branded sha256 ${createHash("sha256").update(branded).digest("hex")})`);

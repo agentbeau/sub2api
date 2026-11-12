@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { artifactConfig, deploymentSecrets, imageDigest, sourceIdentity, verifyArtifact, writeManifest } from "./deployment-artifact.mjs";
+import { artifactConfig, DASHBOARD_PANEL_FILE, deploymentSecrets, imageDigest, sourceIdentity, verifyArtifact, verifyContainerImageArtifact, writeManifest } from "./deployment-artifact.mjs";
 import { execFileSync } from "node:child_process";
 import { checkDeployed } from "./check-deployed.mjs";
 import { installationAllowed } from "./check-installation.mjs";
@@ -86,6 +87,44 @@ test("artifact verification does not follow symbolic links or manifest paths out
     await assert.rejects(verifyArtifact(directory, REVISION, "worker"), /path/);
     await symlink("module.js", join(directory, "linked.js"));
     await assert.rejects(writeManifest(directory, { revision: REVISION, dirty: false, install: "worker" }), /symbolic link/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("container deployment requires the checksummed dashboard from its tested image artifact", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sub2api-image-panel-"));
+  const metadata = { revision: REVISION, dirty: false, install: "container-image", image: `sub2api-cpa:${REVISION.slice(0, 12)}-123-1`, imageId: `sha256:${"c".repeat(64)}` };
+  const panel = Buffer.from("<!doctype html><html><body>Provider dashboard ✓</body></html>\n", "utf8");
+  try {
+    await writeFile(join(directory, "image.tar.gz"), "tested image archive");
+    await writeManifest(directory, metadata);
+    await assert.rejects(verifyContainerImageArtifact(directory, REVISION), /dashboard/);
+    await writeFile(join(directory, DASHBOARD_PANEL_FILE), panel);
+    await writeManifest(directory, metadata);
+    const manifest = await verifyContainerImageArtifact(directory, REVISION);
+    assert.equal(manifest.imageId, metadata.imageId);
+    assert.match(manifest.files[DASHBOARD_PANEL_FILE], /^[a-f0-9]{64}$/);
+    assert.deepEqual(await readFile(join(directory, DASHBOARD_PANEL_FILE)), panel);
+    await writeFile(join(directory, DASHBOARD_PANEL_FILE), "different dashboard bytes");
+    await assert.rejects(verifyContainerImageArtifact(directory, REVISION), /checksum/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("dashboard provisioning cannot accept a panel without its tested image or image identity", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sub2api-panel-only-"));
+  const metadata = { revision: REVISION, dirty: false, install: "container-image", image: `sub2api-cpa:${REVISION.slice(0, 12)}-123-1`, imageId: `sha256:${"c".repeat(64)}` };
+  try {
+    await writeFile(join(directory, DASHBOARD_PANEL_FILE), "<!doctype html><html></html>");
+    await writeManifest(directory, metadata);
+    await assert.rejects(verifyContainerImageArtifact(directory, REVISION), /image archive/);
+    await writeFile(join(directory, "image.tar.gz"), "tested image archive");
+    await writeManifest(directory, { ...metadata, imageId: "latest" });
+    await assert.rejects(verifyContainerImageArtifact(directory, REVISION), /image identity/);
+    await writeManifest(directory, { ...metadata, image: "another-image:latest" });
+    await assert.rejects(verifyContainerImageArtifact(directory, REVISION), /image identity/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

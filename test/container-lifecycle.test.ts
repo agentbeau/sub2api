@@ -19,7 +19,7 @@ class PlatformContainer implements ContainerBackend {
   readonly ports: number[] = [];
   startError: Error | undefined;
   health: (request: Request) => Promise<Response> = async () => new Response("ok");
-  capability: (request: Request) => Promise<Response> = async () => Response.json({ activity_protocol: 1 });
+  capability: (request: Request) => Promise<Response> = async () => Response.json({ activity_protocol: 1, frontend_auth_protocol: 1 });
   upstream: (request: Request) => Promise<Response> = async () => new Response("provider reply");
 
   start(options?: ContainerStartupOptions): void {
@@ -183,6 +183,134 @@ describe("container image rollout compatibility", () => {
   });
 });
 
+describe("provider frontend authentication rollout", () => {
+  const requireFrontendAuth = { requireFrontendAuth: true };
+  const inference = () => new Request("https://gateway.example/v1/messages", { method: "POST", body: "admitted inference" });
+
+  it.each([
+    ["activity-only image", { activity_protocol: 1 }],
+    ["unsupported frontend protocol", { activity_protocol: 1, frontend_auth_protocol: 2 }],
+    ["string protocol", { activity_protocol: 1, frontend_auth_protocol: "1" }],
+    ["boolean protocol", { activity_protocol: 1, frontend_auth_protocol: true }],
+  ])("refuses API forwarding to an %s even after successful readiness", async (_name, marker) => {
+    const platform = new PlatformContainer();
+    platform.running = true;
+    platform.capability = async () => Response.json(marker);
+    const state = lifecycle(platform);
+    const request = inference();
+    const response = await state.controller.forwardExisting(request, requireFrontendAuth);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "runtime_upgrade_required" } });
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(platform.starts).toHaveLength(0);
+    expect(platform.requests.map((candidate) => new URL(candidate.url).pathname)).toEqual(["/healthz", "/__sub2api/lifecycle"]);
+    expect(platform.timeouts.at(-1)).toBe(1000);
+    expect(request.bodyUsed).toBe(false);
+  });
+
+  it("preserves native cold wake and forwards the original stream once only after the new marker arrives", async () => {
+    const marker = deferred<Response>();
+    const state = lifecycle();
+    state.container.capability = () => marker.promise;
+    let pulls = 0;
+    const upstream = new Response(new ReadableStream<Uint8Array>({ pull(controller) {
+      pulls += 1;
+      controller.enqueue(new TextEncoder().encode("data: one event\n\n"));
+      controller.close();
+    } }, { highWaterMark: 0 }), { headers: { "content-type": "text/event-stream" } });
+    state.container.upstream = async () => upstream;
+    const pending = state.controller.forward(inference(), requireFrontendAuth);
+    await vi.waitFor(() => { expect(state.container.requests.some((request) => new URL(request.url).pathname === "/__sub2api/lifecycle")).toBe(true); });
+    expect(state.container.starts).toHaveLength(1);
+    expect(state.container.requests.some((request) => request.method === "POST")).toBe(false);
+    marker.resolve(Response.json({ activity_protocol: 1, frontend_auth_protocol: 1 }));
+    expect(await pending).toBe(upstream);
+    expect(state.container.requests.filter((request) => request.method === "POST")).toHaveLength(1);
+    expect(state.environmentReads()).toBe(1);
+    expect(pulls).toBe(0);
+    expect(await upstream.text()).toBe("data: one event\n\n");
+  });
+
+  it("treats frontend authentication and background activity as independent protocols", async () => {
+    const state = lifecycle();
+    state.container.capability = async () => Response.json({ frontend_auth_protocol: 1 });
+    expect((await state.controller.forward(inference(), requireFrontendAuth)).status).toBe(200);
+    expect(state.container.timeouts.at(-1)).toBe(1_800_000);
+  });
+
+  it("keeps readiness and management usable on an old image while requiring an upgrade for APIs", async () => {
+    const state = lifecycle();
+    state.container.capability = async () => Response.json({ activity_protocol: 1 });
+    expect((await state.controller.forward(new Request("https://gateway.example/healthz"))).status).toBe(200);
+    expect((await state.controller.forwardExisting(management("config"))).status).toBe(200);
+    const response = await state.controller.forward(inference(), requireFrontendAuth);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "runtime_upgrade_required" } });
+    expect(state.container.requests.some((request) => new URL(request.url).pathname === "/v1/messages")).toBe(false);
+    expect(state.container.starts).toHaveLength(1);
+  });
+
+  it("recognizes an upgraded image on a later API request without adding a polling timer", async () => {
+    vi.useFakeTimers();
+    const state = lifecycle();
+    state.container.capability = async () => Response.json({ activity_protocol: 1 });
+    expect((await state.controller.forward(inference(), requireFrontendAuth)).status).toBe(503);
+    const requests = state.container.requests.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(state.container.requests).toHaveLength(requests);
+    state.container.capability = async () => Response.json({ activity_protocol: 1, frontend_auth_protocol: 1 });
+    expect((await state.controller.forward(inference(), requireFrontendAuth)).status).toBe(200);
+    expect(state.container.starts).toHaveLength(1);
+    expect(state.container.requests.filter((request) => request.method === "POST")).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("forgets confirmed support when a cold start launches a different image", async () => {
+    const state = lifecycle();
+    expect((await state.controller.forward(inference(), requireFrontendAuth)).status).toBe(200);
+    state.container.running = false;
+    state.container.capability = async () => Response.json({ activity_protocol: 1 });
+    const response = await state.controller.forward(inference(), requireFrontendAuth);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "runtime_upgrade_required" } });
+    expect(state.container.starts).toHaveLength(2);
+    expect(state.container.requests.filter((request) => request.method === "POST")).toHaveLength(1);
+  });
+
+  it("cannot apply a delayed capability reply from the old process to its replacement", async () => {
+    const oldMarker = deferred<Response>();
+    const platform = new PlatformContainer();
+    platform.running = true;
+    platform.capability = () => oldMarker.promise;
+    const state = lifecycle(platform);
+    const existing = state.controller.forwardExisting(inference(), requireFrontendAuth);
+    await vi.waitFor(() => { expect(platform.requests.some((request) => new URL(request.url).pathname === "/__sub2api/lifecycle")).toBe(true); });
+    platform.running = false;
+    platform.capability = async () => Response.json({ activity_protocol: 1 });
+    const replacement = await state.controller.forward(inference(), requireFrontendAuth);
+    oldMarker.resolve(Response.json({ activity_protocol: 1, frontend_auth_protocol: 1 }));
+    const earlier = await existing;
+    expect(replacement.status).toBe(503);
+    expect(earlier.status).toBe(503);
+    expect(await earlier.json()).toMatchObject({ error: { code: "runtime_upgrade_required" } });
+    expect(platform.starts).toHaveLength(1);
+    expect(platform.requests.some((request) => request.method === "POST")).toBe(false);
+  });
+
+  it("fails closed when the capability request times out after healthy readiness", async () => {
+    vi.useFakeTimers();
+    const state = lifecycle();
+    state.container.capability = async () => new Promise<Response>(() => {});
+    const pending = state.controller.forward(inference(), requireFrontendAuth);
+    await vi.advanceTimersByTimeAsync(1000);
+    const response = await pending;
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "runtime_upgrade_required" } });
+    expect(state.container.requests.some((request) => request.method === "POST")).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
 describe("native container lifecycle", () => {
   it("does not start or read saved imports when constructed or restoring a stopped container", async () => {
     const state = lifecycle();
@@ -342,6 +470,188 @@ describe("native container lifecycle", () => {
     await state.controller.forward(new Request("https://gateway.example/v1/messages", { method: "POST", body: "cancelled", signal: abort.signal }));
     expect(state.container.starts).toHaveLength(0);
     expect(state.environmentReads()).toBe(0);
+  });
+});
+
+describe("forwarding without starting a container", () => {
+  it("rejects a stopped runtime without reading configuration, attaching or probing", async () => {
+    const state = lifecycle();
+    const response = await state.controller.forwardExisting(management("config"));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "runtime_asleep" } });
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(state.container.starts).toHaveLength(0);
+    expect(state.environmentReads()).toBe(0);
+    expect(state.attached).toEqual([]);
+    expect(state.container.requests).toHaveLength(0);
+    expect(state.container.timeouts).toHaveLength(0);
+  });
+
+  it("uses a running container and returns its original stream without a start", async () => {
+    const platform = new PlatformContainer();
+    platform.running = true;
+    let pulls = 0;
+    const upstream = new Response(new ReadableStream<Uint8Array>({ pull(controller) {
+      pulls += 1;
+      controller.enqueue(new TextEncoder().encode("provider output"));
+      controller.close();
+    } }, { highWaterMark: 0 }));
+    platform.upstream = async () => upstream;
+    const state = lifecycle(platform);
+    const response = await state.controller.forwardExisting(management("config"));
+    expect(response).toBe(upstream);
+    expect(pulls).toBe(0);
+    expect(platform.starts).toHaveLength(0);
+    expect(state.environmentReads()).toBe(0);
+    expect(platform.requests.filter((request) => new URL(request.url).pathname === "/v8/management/config")).toHaveLength(1);
+    expect(await response.text()).toBe("provider output");
+  });
+
+  it("does not wake a container that stops during attachment", async () => {
+    const platform = new PlatformContainer();
+    platform.running = true;
+    let environmentReads = 0;
+    const controller = new ContainerLifecycle(platform, {
+      idleTimeout: undefined,
+      environment: async () => { environmentReads += 1; return {}; },
+      attach: async () => { platform.running = false; },
+    });
+    const response = await controller.forwardExisting(management("config"));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "runtime_asleep" } });
+    expect(platform.starts).toHaveLength(0);
+    expect(platform.requests).toHaveLength(0);
+    expect(environmentReads).toBe(0);
+  });
+
+  it("does not trust a readiness reply from a container that has stopped", async () => {
+    const platform = new PlatformContainer();
+    platform.running = true;
+    platform.health = async () => { platform.running = false; return new Response("stale ready"); };
+    const state = lifecycle(platform);
+    const response = await state.controller.forwardExisting(management("config"));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "runtime_asleep" } });
+    expect(platform.starts).toHaveLength(0);
+    expect(platform.requests.map((request) => new URL(request.url).pathname)).toEqual(["/healthz"]);
+  });
+
+  it("refuses the request if the container stops while protocol readiness settles", async () => {
+    const marker = deferred<Response>();
+    const platform = new PlatformContainer();
+    platform.running = true;
+    platform.capability = () => marker.promise;
+    const state = lifecycle(platform);
+    const pending = state.controller.forwardExisting(management("config"));
+    await vi.waitFor(() => { expect(platform.requests.some((request) => new URL(request.url).pathname === "/__sub2api/lifecycle")).toBe(true); });
+    platform.running = false;
+    marker.resolve(Response.json({ activity_protocol: 1 }));
+    const response = await pending;
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "runtime_asleep" } });
+    expect(platform.starts).toHaveLength(0);
+    expect(platform.requests.some((request) => new URL(request.url).pathname === "/v8/management/config")).toBe(false);
+  });
+
+  it("rechecks running after the timeout write even when readiness was cached", async () => {
+    const platform = new PlatformContainer();
+    platform.running = true;
+    let leaseMs = 0;
+    const controller = new ContainerLifecycle(platform, {
+      idleTimeout: undefined, environment: async () => ({}), attach: async () => {},
+      lease: { remainingMs: () => leaseMs, observe: async () => false },
+    });
+    await controller.forwardExisting(management("config"));
+    const requests = platform.requests.length;
+    leaseMs = 5000;
+    platform.setInactivityTimeout = async () => { platform.running = false; };
+    const response = await controller.forwardExisting(management("config"));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "runtime_asleep" } });
+    expect(platform.requests).toHaveLength(requests);
+    expect(platform.starts).toHaveLength(0);
+  });
+
+  it("can share readiness after an independently admitted request has already started the container", async () => {
+    const probe = deferred<Response>();
+    const state = lifecycle();
+    state.container.health = () => probe.promise;
+    const ordinary = state.controller.forward(new Request("https://gateway.example/v1/messages", { method: "POST", body: "one inference" }));
+    await vi.waitFor(() => { expect(state.container.starts).toHaveLength(1); });
+    const existing = state.controller.forwardExisting(management("config"));
+    expect(state.container.requests).toHaveLength(1);
+    probe.resolve(new Response("ready"));
+    expect((await ordinary).status).toBe(200);
+    expect((await existing).status).toBe(200);
+    expect(state.container.starts).toHaveLength(1);
+    expect(state.environmentReads()).toBe(1);
+    expect(state.container.requests.filter((request) => new URL(request.url).pathname === "/healthz")).toHaveLength(1);
+    expect(state.container.requests.filter((request) => request.method === "POST")).toHaveLength(1);
+  });
+
+  it("does not wait for or cause a pending admitted startup while the container is still stopped", async () => {
+    const environment = deferred<Record<string, string>>();
+    const platform = new PlatformContainer();
+    let environmentReads = 0;
+    const controller = new ContainerLifecycle(platform, {
+      idleTimeout: undefined,
+      environment: () => { environmentReads += 1; return environment.promise; },
+      attach: async () => {},
+    });
+    const ordinary = controller.forward(new Request("https://gateway.example/v1/messages", { method: "POST", body: "one inference" }));
+    await vi.waitFor(() => { expect(environmentReads).toBe(1); });
+    let refused: Response | undefined;
+    const existing = controller.forwardExisting(management("config")).then((response) => { refused = response; });
+    try {
+      await vi.waitFor(() => { expect(refused?.status).toBe(503); }, { timeout: 200 });
+      expect(await refused?.json()).toMatchObject({ error: { code: "runtime_asleep" } });
+      expect(platform.starts).toHaveLength(0);
+    } finally {
+      environment.resolve({});
+      await existing;
+      expect((await ordinary).status).toBe(200);
+    }
+    expect(platform.starts).toHaveLength(1);
+  });
+
+  it("preserves normal native wake after a no-start request observes an idle shutdown", async () => {
+    const platform = new PlatformContainer();
+    platform.running = true;
+    const state = lifecycle(platform);
+    await state.controller.restore();
+    platform.running = false;
+    expect((await state.controller.forwardExisting(management("config"))).status).toBe(503);
+    expect(platform.starts).toHaveLength(0);
+    const request = new Request("https://gateway.example/v1/messages", { method: "POST", body: "admitted inference" });
+    expect((await state.controller.forward(request)).status).toBe(200);
+    expect(platform.starts).toHaveLength(1);
+    expect(platform.requests.filter((candidate) => candidate.method === "POST")).toHaveLength(1);
+    expect(state.environmentReads()).toBe(1);
+  });
+
+  it("does not let an older no-start readiness operation block a newly admitted native wake", async () => {
+    const oldAttachment = deferred<undefined>();
+    const platform = new PlatformContainer();
+    platform.running = true;
+    let attachments = 0;
+    const controller = new ContainerLifecycle(platform, {
+      idleTimeout: undefined, environment: async () => ({}),
+      attach: async () => { if (++attachments === 1) await oldAttachment.promise; },
+    });
+    const existing = controller.forwardExisting(management("config"));
+    await vi.waitFor(() => { expect(attachments).toBe(1); });
+    platform.running = false;
+    let completed: Response | undefined;
+    const ordinary = controller.forward(new Request("https://gateway.example/v1/messages", { method: "POST", body: "admitted inference" }))
+      .then((response) => { completed = response; });
+    try {
+      await vi.waitFor(() => { expect(completed?.status).toBe(200); }, { timeout: 200 });
+      expect(platform.starts).toHaveLength(1);
+      expect(platform.requests.filter((request) => request.method === "POST")).toHaveLength(1);
+    } finally {
+      oldAttachment.resolve(undefined);
+      await Promise.all([existing, ordinary]);
+    }
   });
 });
 

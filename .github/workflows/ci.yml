@@ -32,7 +32,7 @@ jobs:
       - run: npm ci
       - run: npm run verify
       - name: Verify deployment safeguards
-        run: node --test scripts/deployment.test.mjs
+        run: node --test scripts/deployment.test.mjs container/brand-panel/brand.test.mjs
       - name: Package the compiled container gateway
         run: node scripts/prepare-deployment.mjs container .wrangler/artifacts/container-worker
       - name: Exercise the packaged gateway in workerd

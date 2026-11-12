@@ -1,0 +1,6 @@
+{
+  "name": "sub2api-panel-branding",
+  "private": true,
+  "type": "module",
+  "dependencies": { "typescript": "6.0.3" }
+}

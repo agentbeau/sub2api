@@ -12,7 +12,7 @@ pub fn login_page(error: Option<&str>) -> String {
     page(&format!(
         r#"<form method="post" action="/login">
   <h1>sub2api</h1>
-  <p>Sign in to open the CPA dashboard.</p>
+  <p>Sign in to open the sub2api dashboard.</p>
   {message}
   <input type="password" name="password" autocomplete="current-password" placeholder="Dashboard password" required autofocus>
   <button type="submit">Sign in</button>

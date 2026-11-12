@@ -22,7 +22,11 @@ pub fn classify_path(pathname: &str) -> &'static str {
         "/healthz" => "health",
         "/readyz" => "ready",
         "/callback" | "/auth/callback" | "/oauth-callback" => "oauth-callback",
-        "/management.html" => "dashboard",
+        "/management.html"
+        | "/provider-panel.html"
+        | "/runtime/status"
+        | "/runtime/start"
+        | "/runtime/stop" => "dashboard",
         path if path.starts_with("/v1/") || path.starts_with("/v1beta/") => "api",
         path if path.starts_with("/v0/management/") || path.starts_with("/v8/management/") => {
             "dashboard"
@@ -47,6 +51,10 @@ mod tests {
             ("/auth/callback", "oauth-callback"),
             ("/oauth-callback", "oauth-callback"),
             ("/management.html", "dashboard"),
+            ("/provider-panel.html", "dashboard"),
+            ("/runtime/status", "dashboard"),
+            ("/runtime/start", "dashboard"),
+            ("/runtime/stop", "dashboard"),
             ("/v0/management/config", "dashboard"),
             ("/v8/management/oauth/auth-url", "dashboard"),
             ("/v1/chat/completions", "api"),
