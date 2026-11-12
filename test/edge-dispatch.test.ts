@@ -33,7 +33,7 @@ function binding() {
   };
   return {
     env: { CPA: namespace, DASHBOARD_PASSWORD: PASSWORD, LOGIN_LIMIT: { limit: async () => ({ success: true }) }, STATE: {
-      get: async (key: string) => { reads.push(key); return { body: panel, httpEtag: '"tested-panel"' }; },
+      get: async (key: string) => { reads.push(key); return { body: panel, httpEtag: JSON.stringify("tested-panel") }; },
     } as unknown as R2Bucket },
     names, requests, response, reads,
   };
@@ -64,9 +64,9 @@ describe("public gateway dispatch", () => {
     const response = await worker.fetch(new Request(`https://gateway.example${path}`, { headers: { cookie } }), state.env);
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
-    expect(await response.text()).toContain(path === "/management.html" ? "Start controls" : "tested provider panel");
+    expect(await response.text()).toBe("<html>tested provider panel</html>");
     expect(state.names).toEqual([]);
     expect(state.requests).toEqual([]);
-    expect(state.reads).toEqual(path === "/management.html" ? [] : ["dashboard/management.html"]);
+    expect(state.reads).toEqual(["dashboard/management.html"]);
   });
 });

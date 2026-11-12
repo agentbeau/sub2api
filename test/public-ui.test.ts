@@ -1,19 +1,45 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import { serveDashboard } from "../src/dashboard.ts";
+import { PANEL_KEY, serveDashboard } from "../src/dashboard.ts";
 
-describe("neutral console and custom hostname", () => {
-  it("serves an unbranded controls shell without reading the provider panel or starting anything", async () => {
-    const get = vi.fn();
-    const response = await serveDashboard(new Request("https://api.agentbeau.dev/management.html"), { get });
-    const html = await response.text();
+const PANEL = "<!doctype html><html><head><title>Console</title></head><body>Native console</body></html>";
+const ETAG = JSON.stringify("tested-panel");
+function store() {
+  const body = new Response(PANEL).body;
+  if (body === null) throw new Error("Panel fixture needs a body");
+  const get = vi.fn(async () => ({ body, httpEtag: ETAG } as R2ObjectBody));
+  return { get, body };
+}
+
+describe("direct neutral console and custom hostname", () => {
+  it.each(["/management.html", "/provider-panel.html"])("serves the checked native panel directly at %s", async (path) => {
+    const state = store();
+    const response = await serveDashboard(new Request(`https://api.agentbeau.dev${path}`), state);
     expect(response.status).toBe(200);
-    expect(html).toContain("<title>Provider controls</title>");
-    expect(html).toContain("<h1>Provider controls</h1>");
-    expect(html).not.toMatch(/sub2api|CLIProxyAPI|CLI Proxy API|CPAMC|\bCPA\b|github\.com/);
-    expect(html).toContain("Start controls");
-    expect(html).toContain("panel.src='/provider-panel.html'");
+    expect(response.body).toBe(state.body);
+    expect(await response.text()).toBe(PANEL);
+    expect(state.get).toHaveBeenCalledExactlyOnceWith(PANEL_KEY);
+    expect(response.headers.get("etag")).toBe(ETAG);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("x-frame-options")).toBe("DENY");
+    const source = readFileSync(new URL("../src/dashboard.ts", import.meta.url), "utf8");
+    expect(source).not.toMatch(/<iframe|Start controls|setTimeout\(|setInterval\(|\/runtime\/start|controls_remaining_ms/);
+  });
+
+  it("answers HEAD without consuming or returning the HTML", async () => {
+    const state = store();
+    const response = await serveDashboard(new Request("https://api.agentbeau.dev/management.html", { method: "HEAD" }), state);
+    expect(response.status).toBe(200);
+    expect(response.body).toBeNull();
+    expect(response.headers.get("etag")).toBe(ETAG);
+  });
+
+  it("rejects writes and fails closed when the checked panel is missing", async () => {
+    const get = vi.fn(async () => null);
+    const write = await serveDashboard(new Request("https://api.agentbeau.dev/management.html", { method: "POST" }), { get });
+    expect(write.status).toBe(405);
     expect(get).not.toHaveBeenCalled();
+    expect((await serveDashboard(new Request("https://api.agentbeau.dev/management.html"), { get })).status).toBe(503);
   });
 
   it("keeps the native custom domain and existing state identities in the deployment configuration", () => {

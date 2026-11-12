@@ -26,8 +26,13 @@ function hasPanelReferer(request: Request, url: URL): boolean {
   }
 }
 
-// Model admission and explicit provider controls share the preserved singleton.
-// Ordinary dashboard views are static edge responses and never enter its lifecycle.
+function hasManagementCredential(request: Request): boolean {
+  return /^Bearer\s+\S+$/i.test(request.headers.get("authorization") ?? "")
+    || (request.headers.get("x-management-key") ?? "").trim().length > 0;
+}
+
+// The native console is served at the edge. Its real management requests use
+// the existing session and native management authentication, without a UI gate.
 export class Cpa extends DurableObject<Env> {
   private readonly keyGuard: KeyGuard;
   private readonly lifecycle: ContainerLifecycle | undefined;
@@ -39,6 +44,8 @@ export class Cpa extends DurableObject<Env> {
     const lease = new OAuthLease(ctx.storage);
     const realtime = new RealtimeLease(ctx.storage);
     this.background = new BackgroundActivity(ctx.storage);
+    // Retain old explicit control endpoints for compatibility with an already-open
+    // old tab. The direct console never opens or depends on this editing window.
     this.management = new ManagementWindow(ctx.storage);
     const container = ctx.container;
     this.keyGuard = new KeyGuard(env.STATE, () => container?.running ?? false);
@@ -118,9 +125,10 @@ export class Cpa extends DurableObject<Env> {
     const url = new URL(request.url);
     const path = url.pathname;
     const route = classify(path);
-    // The panel can fetch model catalogs with a saved client key. Its metadata
-    // may reduce wake permission, but never replaces ordinary API authentication.
-    const panelApiRequest = route === "api" && hasPanelReferer(request, url);
+    // Passive console model catalogs do not wake a sleeping provider. Actual model
+    // requests from the console follow the same native admission as other clients.
+    const passivePanelCatalog = route === "api" && (request.method === "GET" || request.method === "HEAD")
+      && (path === "/v1/models" || path === "/v1beta/models") && hasPanelReferer(request, url);
     let mayStart = false;
     return handle(
       request,
@@ -130,7 +138,7 @@ export class Cpa extends DurableObject<Env> {
         apiAccess: {
           authorize: async (candidate) => {
             const decision = await this.keyGuard.authorize(candidate);
-            mayStart = !panelApiRequest && (decision === "allowed" || decision === "runtime-required");
+            mayStart = !passivePanelCatalog && (decision === "allowed" || decision === "runtime-required");
             return decision === "runtime-only" || decision === "runtime-required" ? "allowed" : decision;
           },
           invalidate: () => {
@@ -146,10 +154,15 @@ export class Cpa extends DurableObject<Env> {
           if (request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
           return publicProviderResponse(await (this.lifecycle?.forward(forwarded) ?? containerUnavailable()));
         }
-        // Management polling, failed/expired callbacks and warm-only credentials
-        // may contact an existing process but can never start a replacement.
+        // This callback is reached only after the existing dashboard session gate.
+        // Let the native server validate management credentials instead of duplicating
+        // its authentication at the edge. An invalid management key can therefore wake
+        // the server; missing credentials, status polls and stale callbacks cannot.
+        const nativeManagement = route === "dashboard"
+          && (path.startsWith("/v0/management/") || path.startsWith("/v8/management/"))
+          && hasManagementCredential(forwarded);
         const options = { requireFrontendAuth: route === "api" };
-        const response = await ((route === "api" && mayStart ? this.lifecycle?.forward(forwarded, options) : this.lifecycle?.forwardExisting(forwarded, options))
+        const response = await (((route === "api" && mayStart) || nativeManagement ? this.lifecycle?.forward(forwarded, options) : this.lifecycle?.forwardExisting(forwarded, options))
           ?? containerUnavailable());
         return publicProviderResponse(response);
       },
@@ -163,7 +176,7 @@ export class Cpa extends DurableObject<Env> {
       return methodNotAllowed(status ? "GET, HEAD" : "POST");
     }
     if (!status && request.headers.get("origin") !== url.origin) {
-      return Response.json({ error: { message: "Use the provider controls on this site's dashboard." } }, {
+      return Response.json({ error: { message: "Use a same-origin authenticated request." } }, {
         status: 403, headers: { "cache-control": "no-store" },
       });
     }

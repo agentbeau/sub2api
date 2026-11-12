@@ -57,15 +57,16 @@ try {
   assert.ok(cookie, "Rust login returns a session cookie");
   const home = await publicWorker.dispatchFetch("https://gateway.example/", { headers: { cookie }, redirect: "manual" });
   assert.equal(home.headers.get("location"), "/management.html");
+  const panelHtml = "<html><head><title>Console</title></head><body>tested edge panel</body></html>";
+  await (await publicWorker.getR2Bucket("STATE")).put("dashboard/management.html", panelHtml);
   const dashboard = await publicWorker.dispatchFetch("https://gateway.example/management.html", { headers: { cookie } });
   assert.equal(dashboard.status, 200);
   const dashboardHtml = await dashboard.text();
-  assert.match(dashboardHtml, /Start controls/);
-  assert.doesNotMatch(dashboardHtml, /sub2api|CLIProxyAPI|CPAMC|\bCPA\b|github\.com/);
-  await (await publicWorker.getR2Bucket("STATE")).put("dashboard/management.html", "<html>tested edge panel</html>");
+  assert.equal(dashboardHtml, panelHtml, "The native panel is the complete document, not an iframe wrapper");
+  assert.doesNotMatch(dashboardHtml, /Start controls|<iframe|controls_remaining_ms|sub2api|CLIProxyAPI|CPAMC|\bCPA\b|github\.com/);
   const panel = await publicWorker.dispatchFetch("https://gateway.example/provider-panel.html", { headers: { cookie } });
   assert.equal(panel.status, 200);
-  assert.equal(await panel.text(), "<html>tested edge panel</html>");
+  assert.equal(await panel.text(), panelHtml);
   const blocked = await publicWorker.dispatchFetch("https://gateway.example/private-file");
   assert.equal(blocked.status, 404);
   const privateActivity = await publicWorker.dispatchFetch("https://gateway.example/__sub2api/activity", {
@@ -73,7 +74,7 @@ try {
   });
   assert.equal(privateActivity.status, 404, "Internal activity protocol must never be publicly routed");
   assert.deepEqual(await publicWorker.listDurableObjectIds("CPA"), [], "Local routes must not activate the container Durable Object");
-  console.log("PASS: actual Worker bundle loads Wasm; neutral login/dashboard, liveness, session, panel and blocked routes avoid the container object.");
+  console.log("PASS: actual Worker bundle loads Wasm; direct neutral panel, login, liveness, session and blocked routes avoid the container object.");
   const stopped = await publicWorker.dispatchFetch("https://gateway.example/runtime/status", { headers: { cookie } });
   assert.equal(stopped.status, 200);
   assert.deepEqual(await stopped.json(), { running: false, controls_remaining_ms: 0 });

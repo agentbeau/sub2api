@@ -1,6 +1,7 @@
 FROM golang:1.26-bookworm AS builder
-# "latest" builds the newest CPA release tag at build time; set a tag such as v8.0.67 to pin one.
-ARG CPA_VERSION=latest
+# Keep the deployed, checked provider version unless an upgrade is explicitly selected.
+# Passing CPA_VERSION=latest still opts into testing the newest upstream release.
+ARG CPA_VERSION=v8.0.67
 ENV GOTOOLCHAIN=auto
 WORKDIR /src
 RUN set -eu; repo=https://github.com/router-for-me/CLIProxyAPI.git; tag="${CPA_VERSION}"; \
