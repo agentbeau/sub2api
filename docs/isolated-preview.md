@@ -66,3 +66,17 @@ same source revision before claiming automatic preview deployment works.
 Blank private R2 bucket `sub2api-preview-isolated` created November 12, 2026. No production objects or credentials copied. Access application, secrets, and Builds activation remain pending.
 
 Builds pricing: Paid plans include 6,000 minutes/month, then $0.005/minute. See https://developers.cloudflare.com/workers/ci-cd/builds/limits-and-pricing/ . The account availability API returned an empty result, so remaining allowance is unverified.
+
+## Verified Access provisioning, 2026-11-12
+
+Owner approved the separate preview rule. Created `sub2api private previews` for only
+this Worker’s preview deployments. All paths require Nathan’s email AND membership
+in the Cloudflare account; app and policy sessions are 24 hours. Its audience is wired
+into preview config. Existing production API console app and owner policy were already
+24 hours and remain unchanged. No bypasses were added.
+
+CI run 43326430721 passed both Worker and container jobs, including compiled-preview
+forged-identity denial probes. Preview deployment is still inactive: the documented
+Cloudflare build image does not list Rust, wasm-bindgen or Docker. The independent
+source-building pipeline must not be activated until that prerequisite is proven or
+replaced by a verified CI-artifact consumer. Passing CI is not proof of live deployment.

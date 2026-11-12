@@ -6,8 +6,10 @@ const source = JSON.parse(await readFile(new URL("../wrangler.preview.jsonc", im
 const branch = "dagul/isolated-worker-preview";
 const ready = () => { const c = JSON.parse(JSON.stringify(source)); c.previews.vars.ACCESS_AUD = c.previews.vars.PREVIEW_ACCESS_AUD = "b".repeat(64); return c; };
 test("template isolated but not deployable before identity provisioning", () => {
-  assert.equal(validatePreview(source, branch, { ready: false }), true);
-  assert.throws(() => validatePreview(source, branch));
+  const template = ready();
+  template.previews.vars.ACCESS_AUD = template.previews.vars.PREVIEW_ACCESS_AUD = "REQUIRES_PREVIEW_OWNER_ACCESS_AUDIENCE";
+  assert.equal(validatePreview(template, branch, { ready: false }), true);
+  assert.throws(() => validatePreview(template, branch));
 });
 test("provisioned isolated identity passes", () => assert.equal(validatePreview(ready(), branch), true));
 test("main and other branches cannot deploy", () => {
