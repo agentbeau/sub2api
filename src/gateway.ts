@@ -1,4 +1,5 @@
 import { handleGateway, minPasswordLength } from "./wasm.ts";
+import { withoutAccessCredentials } from "./access.ts";
 
 export type Forward = (request: Request) => Promise<Response>;
 
@@ -17,6 +18,9 @@ export interface LoginLimiter {
 
 export interface GatewayConfig {
   readonly dashboardPassword: string;
+  // Supplied only from verified platform Access context or the private RPC.
+  // false rejects legacy cookies/passwords; undefined retains legacy installs.
+  readonly dashboardAccess?: boolean | undefined;
   readonly nowSeconds: () => number;
   readonly apiAccess: ApiAccess;
   readonly loginLimiter: LoginLimiter;
@@ -31,9 +35,10 @@ export function handle(request: Request, config: GatewayConfig, forward: Forward
     request,
     config.dashboardPassword,
     config.nowSeconds,
-    forward,
+    (forwarded: Request) => forward(withoutAccessCredentials(forwarded)),
     (candidate: Request) => config.apiAccess.authorize(candidate),
     () => { config.apiAccess.invalidate(); },
     async (client: string) => (await config.loginLimiter.limit({ key: client })).success,
+    config.dashboardAccess,
   );
 }

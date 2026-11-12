@@ -1,0 +1,39 @@
+{
+  "application_id": "98ec8386-ce17-4619-9f21-32450205c220",
+  "aud": "a6acab2578806d53309922d135ad923c92c9071cbe22f34677ed763c09951170",
+  "application": {
+    "name": "API console",
+    "type": "self_hosted",
+    "allowed_idps": ["4290244d-b958-430c-9236-fee829d51a3f"],
+    "auto_redirect_to_identity": true,
+    "session_duration": "24h",
+    "app_launcher_visible": false,
+    "policies": [{ "id": "6d7ccd90-01ab-4ed9-94f8-48b7017e2274", "precedence": 1 }],
+    "destinations": [
+      {
+        "type": "public",
+        "uri": "api.agentbeau.dev",
+        "overrides": [
+          { "path_pattern": "/v1", "behavior": "public" },
+          { "path_pattern": "/v1/*", "behavior": "public" },
+          { "path_pattern": "/v1beta", "behavior": "public" },
+          { "path_pattern": "/v1beta/*", "behavior": "public" },
+          { "path_pattern": "/healthz", "behavior": "public" },
+          { "path_pattern": "/readyz", "behavior": "public" }
+        ]
+      },
+      {
+        "type": "public",
+        "uri": "sub2api.agentbeau.workers.dev",
+        "overrides": [
+          { "path_pattern": "/v1", "behavior": "public" },
+          { "path_pattern": "/v1/*", "behavior": "public" },
+          { "path_pattern": "/v1beta", "behavior": "public" },
+          { "path_pattern": "/v1beta/*", "behavior": "public" },
+          { "path_pattern": "/healthz", "behavior": "public" },
+          { "path_pattern": "/readyz", "behavior": "public" }
+        ]
+      }
+    ]
+  }
+}
