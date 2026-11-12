@@ -17,6 +17,8 @@ export function previewMetadata(env) {
   if (!/^[a-f0-9]{32}$/.test(env.CLOUDFLARE_ACCOUNT_ID ?? "")) throw new Error("Cloudflare account required");
   if (!/^[a-f0-9-]{36}$/.test(env.WORKERS_CI_BUILD_UUID ?? "")) throw new Error("Cloudflare build identity required");
   if (env.SKIP_DEPENDENCY_INSTALL !== "1") throw new Error("Dependency installation must run token-free inside the build phase");
+  if (env.WRANGLER_CI_OVERRIDE_NAME && env.WRANGLER_CI_OVERRIDE_NAME !== "sub2api-preview-isolated") throw new Error("Wrong preview Worker name");
+  if (env.WRANGLER_CI_MATCH_TAG && env.WRANGLER_CI_MATCH_TAG !== "e938224d2f694fe5b6f92a60f4a332cd") throw new Error("Wrong preview Worker identity");
   return { revision: env.WORKERS_CI_COMMIT_SHA, account: env.CLOUDFLARE_ACCOUNT_ID, buildId: env.WORKERS_CI_BUILD_UUID };
 }
 export function previewArtifactConfig(source) {
@@ -73,6 +75,9 @@ export async function runPreviewPhase(phase, { root = ROOT, env = process.env, e
   if (JSON.stringify(config) !== JSON.stringify(previewArtifactConfig(source))) throw new Error("Prepared preview bindings differ from reviewed source");
   if (!env.CLOUDFLARE_API_TOKEN) throw new Error("Preview deploy credential missing");
   const deployEnv = { ...clean, CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID: metadata.account };
+  for (const name of ["WRANGLER_CI_MATCH_TAG", "WRANGLER_CI_OVERRIDE_NAME"]) if (env[name]) deployEnv[name] = env[name];
+  const current = run("git", ["ls-remote", "--exit-code", "origin", `refs/heads/${BRANCH}`], clean, true).split(/\s+/)[0];
+  if (current !== metadata.revision) throw new Error("Preview branch advanced; refusing stale deployment");
   // Require an explicitly provisioned bucket. Never create, import or copy production state here.
   const bucketResponse = await fetcher(`https://api.cloudflare.com/client/v4/accounts/${metadata.account}/r2/buckets/${BUCKET}`, { headers: { authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}` }, signal: AbortSignal.timeout(30_000) });
   if (!bucketResponse.ok || (await bucketResponse.json()).success !== true) throw new Error("Private preview bucket must be provisioned before deployment");

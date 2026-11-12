@@ -116,3 +116,18 @@ Do not activate build credentials until their resource scopes have been verified
 The API lists single-Worker roles as not selectable for this connection; the
 existing user build-token policy cannot be inspected through OAuth (HTTP403).
 The preview application is not deployed merely because the deny-all shell exists.
+
+## Build activation, 2026-11-12
+
+Owner explicitly approved reusing the existing `sub2api build token` after the
+production-authority concern was disclosed. The stored token reference was attached
+to this separate Worker's build configuration; its plaintext was not retrieved or
+copied. The only watched branch is `dagul/isolated-worker-preview`; native previews
+are disabled. Existing production build settings were not changed. This is logical
+and resource separation, not a claim that the shared token lacks production rights.
+
+Cloudflare commands are `node scripts/preview-builds.mjs build` and
+`node scripts/preview-builds.mjs deploy`, dependency auto-install disabled. The
+pipeline rejects mismatched Worker name/tag and stale branch heads before deployment.
+A push of this change exercises the actual automatic trigger. Successful GitHub CI
+and artifact publication alone do not establish successful Cloudflare deployment.
