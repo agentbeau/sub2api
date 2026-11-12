@@ -179,6 +179,71 @@ describe("dashboard and API wake admission", () => {
   });
 
   it.each([
+    "https://gateway.example/provider-panel.html",
+    "https://gateway.example/management.html",
+    "https://gateway.example:443/provider-panel.html?view=models#system-info",
+  ])("does not wake for a valid-key model catalog request from %s", async (referer) => {
+    const state = platform(false, Promise.resolve(), new LeaseStorage(), true, configuration);
+    await state.initialized();
+    const headers = new Headers(await signedHeaders());
+    headers.set("authorization", `Bearer ${CLIENT_KEY}`);
+    headers.set("referer", referer);
+    const response = await state.cpa.fetch(new Request("https://gateway.example/v1/models", { headers }));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "runtime_asleep" } });
+    expect(state.starts).toHaveLength(0);
+    expect(state.requests).toHaveLength(0);
+  });
+
+  it.each([
+    "https://other.example/provider-panel.html",
+    "https://gateway.example@other.example/management.html",
+    "http://gateway.example/management.html",
+    "https://gateway.example:8443/provider-panel.html",
+    "https://gateway.example/provider-panel.html.backup",
+    "https://gateway.example/client.html",
+    "not an absolute URL",
+  ])("preserves native API wake for a non-panel referer %s", async (referer) => {
+    const state = platform(false, Promise.resolve(), new LeaseStorage(), true, configuration);
+    await state.initialized();
+    const response = await state.cpa.fetch(new Request("https://gateway.example/v1/models", {
+      headers: { authorization: `Bearer ${CLIENT_KEY}`, referer },
+    }));
+    expect(response.status).toBe(200);
+    expect(state.starts).toHaveLength(1);
+    expect(state.requests.filter((request) => new URL(request.url).pathname === "/v1/models")).toHaveLength(1);
+  });
+
+  it("forwards an authenticated panel API body once to an existing process without reading it", async () => {
+    const state = platform(true, Promise.resolve(), new LeaseStorage(), true, configuration);
+    await state.initialized();
+    const headers = new Headers(await signedHeaders());
+    headers.set("authorization", `Bearer ${CLIENT_KEY}`);
+    headers.set("referer", "https://gateway.example/provider-panel.html");
+    const response = await state.cpa.fetch(new Request("https://gateway.example/v1/messages", {
+      method: "POST", headers, body: '{"model":"provider-model","messages":[]}',
+    }));
+    expect(response.status).toBe(200);
+    expect(state.starts).toHaveLength(0);
+    const forwarded = state.requests.filter((request) => new URL(request.url).pathname === "/v1/messages");
+    expect(forwarded).toHaveLength(1);
+    expect(forwarded[0]?.bodyUsed).toBe(false);
+    expect(await forwarded[0]?.text()).toBe('{"model":"provider-model","messages":[]}');
+  });
+
+  it("does not treat a panel referer or signed-in session as API authentication", async () => {
+    const state = platform(false, Promise.resolve(), new LeaseStorage(), true, configuration);
+    await state.initialized();
+    const headers = new Headers(await signedHeaders());
+    headers.set("authorization", "Bearer invalid-key");
+    headers.set("referer", "https://gateway.example/provider-panel.html");
+    const response = await state.cpa.fetch(new Request("https://gateway.example/v1/models", { headers }));
+    expect(response.status).toBe(401);
+    expect(state.starts).toHaveLength(0);
+    expect(state.requests).toHaveLength(0);
+  });
+
+  it.each([
     ["/v1/models", undefined, 401], ["/v1/models", "wrong-key", 401], ["/v1/not-an-api", CLIENT_KEY, 404],
   ] as const)("rejects %s (%s) before any provider operation", async (path, key, status) => {
     const state = platform(false, Promise.resolve(), new LeaseStorage(), true, configuration);

@@ -15,6 +15,17 @@ import { classify } from "./routes.ts";
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 
+function hasPanelReferer(request: Request, url: URL): boolean {
+  const referer = request.headers.get("referer");
+  if (referer === null) return false;
+  try {
+    const source = new URL(referer);
+    return source.origin === url.origin && (source.pathname === "/provider-panel.html" || source.pathname === "/management.html");
+  } catch {
+    return false;
+  }
+}
+
 // Model admission and explicit provider controls share the preserved singleton.
 // Ordinary dashboard views are static edge responses and never enter its lifecycle.
 export class Cpa extends DurableObject<Env> {
@@ -104,8 +115,12 @@ export class Cpa extends DurableObject<Env> {
   }
 
   override fetch(request: Request): Promise<Response> {
-    const path = new URL(request.url).pathname;
+    const url = new URL(request.url);
+    const path = url.pathname;
     const route = classify(path);
+    // The panel can fetch model catalogs with a saved client key. Its metadata
+    // may reduce wake permission, but never replaces ordinary API authentication.
+    const panelApiRequest = route === "api" && hasPanelReferer(request, url);
     let mayStart = false;
     return handle(
       request,
@@ -115,7 +130,7 @@ export class Cpa extends DurableObject<Env> {
         apiAccess: {
           authorize: async (candidate) => {
             const decision = await this.keyGuard.authorize(candidate);
-            mayStart = decision === "allowed" || decision === "runtime-required";
+            mayStart = !panelApiRequest && (decision === "allowed" || decision === "runtime-required");
             return decision === "runtime-only" || decision === "runtime-required" ? "allowed" : decision;
           },
           invalidate: () => {
