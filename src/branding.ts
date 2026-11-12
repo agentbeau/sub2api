@@ -1,5 +1,6 @@
 function publicHeaderName(name: string): string {
-  return /^x-cpa-/i.test(name) ? `x-sub2api-engine-${name.slice(6).toLowerCase()}` : name;
+  const prefix = name.match(/^x-(?:cpa|sub2api-engine)-/i);
+  return prefix ? `x-engine-${name.slice(prefix[0].length).toLowerCase()}` : name;
 }
 
 // Change only public engine metadata. Provider bodies, protocol values and the
@@ -26,8 +27,7 @@ export function publicProviderResponse(response: Response): Response {
     }
   }
   if (headers === undefined) return response;
-  // workerd carries an upgrade on ResponseInit, outside the body stream. Keep
-  // that native handle when a 101 response needs different public headers.
+  // Preserve workerd's native upgrade handle, streaming and backpressure.
   return new Response(response.body, {
     status: response.status, statusText: response.statusText, headers, cf: response.cf, webSocket: response.webSocket,
   });

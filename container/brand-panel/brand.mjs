@@ -7,19 +7,24 @@ import process from "node:process";
 import { fileURLToPath, URL } from "node:url";
 import ts from "typescript";
 
-const PROJECT = "https://github.com/agentbeau/sub2api";
 const UPSTREAM_LICENSE = readFileSync(new URL("./UPSTREAM_LICENSE", import.meta.url), "utf8").trim();
-const LOGO = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#b5f0ce"/><text x="32" y="43" text-anchor="middle" font-family="system-ui,sans-serif" font-weight="750" font-size="35" fill="#11261d">s2</text></svg>')}`;
 const HEADER_NAMES = new Set(["x-cpa-version", "x-cpa-build-date", "x-cpa-support-plugin"]);
-const OLD_REPOS = new Set([
+const PRODUCT_REPOS = new Set([
   "https://github.com/router-for-me/CLIProxyAPI",
   "https://github.com/router-for-me/Cli-Proxy-API-Management-Center",
+  "https://github.com/agentbeau/sub2api",
+]);
+const UI_KEYS = new Map([
+  ["cli-proxy-auth", "console-auth"],
+  ["cli-proxy-theme", "console-theme"],
+  ["cli-proxy-language", "console-language"],
 ]);
 
 function displayText(text) {
-  return text.replaceAll("CLI Proxy API Management Center", "sub2api Console")
-    .replaceAll("CLI Proxy API", "sub2api").replaceAll("CLIProxyAPI", "sub2api")
-    .replaceAll("CPAMC", "sub2api").replace(/\bCPA\b/g, "sub2api");
+  if (/^(?:CLI Proxy API Management Center|CLI Proxy API|CLIProxyAPI|CPAMC|CPA|sub2api)$/.test(text)) return "Console";
+  return text.replaceAll("CLI Proxy API Management Center", "Management console")
+    .replaceAll("CLI Proxy API", "gateway").replaceAll("CLIProxyAPI", "gateway")
+    .replaceAll("CPAMC", "console").replace(/\bCPA\b/g, "gateway").replace(/\bsub2api\b/gi, "gateway");
 }
 
 function jsonLabels(value) {
@@ -33,42 +38,61 @@ function property(node, name) {
   return node.properties.find((item) => ts.isPropertyAssignment(item) && item.name.getText().replace(/^['"]|['"]$/g, "") === name);
 }
 
+function elementCall(node, tag, ast) {
+  const call = node.parent;
+  return ts.isCallExpression(call) && call.arguments[1] === node
+    && ts.isStringLiteralLike(call.arguments[0]) && call.arguments[0].text === tag
+    && /\.(?:jsx|jsxs|createElement)\b/.test(call.expression.getText(ast)) ? call : undefined;
+}
+
 function scriptBranding(source) {
   const ast = ts.createSourceFile("panel.js", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   if (ast.parseDiagnostics.length !== 0) throw new Error("Upstream dashboard JavaScript does not parse");
   const changes = new Map();
   const logoBindings = new Set();
   const seenHeaders = new Set();
-  let labels = 0;
-  let logos = 0;
-  const edit = (node, text) => changes.set(node.getStart(ast), { end: node.end, text: JSON.stringify(text).replaceAll("<", "\\u003c") });
+  let labels = 0, logos = 0, removedElements = 0;
+  const replace = (node, text) => changes.set(node.getStart(ast), { end: node.end, text });
+  const edit = (node, text) => replace(node, JSON.stringify(text).replaceAll("<", "\\u003c"));
 
   function visit(node) {
     if (ts.isObjectLiteralExpression(node)) {
-      const alt = property(node, "alt"), src = property(node, "src");
+      const alt = property(node, "alt"), src = property(node, "src"), href = property(node, "href");
       if (alt && src && ts.isStringLiteralLike(alt.initializer) && /^CPAMC(?: logo)?$/.test(alt.initializer.text)
-        && ts.isIdentifier(src.initializer)) logoBindings.add(src.initializer.text);
+        && ts.isIdentifier(src.initializer)) {
+        logoBindings.add(src.initializer.text);
+        const call = elementCall(node, "img", ast);
+        if (call) { replace(call, "null"); removedElements += 1; return; }
+        edit(alt.initializer, "");
+      }
+      if (href && ts.isStringLiteralLike(href.initializer) && PRODUCT_REPOS.has(href.initializer.text)) {
+        const call = elementCall(node, "a", ast);
+        if (call) { replace(call, "null"); removedElements += 1; return; }
+        edit(href.initializer, "");
+      }
     }
     if (ts.isStringLiteralLike(node) && !(ts.isPropertyAssignment(node.parent) && node.parent.name === node)) {
+      // A parent may have already cleared a product-only attribute.
+      if (changes.has(node.getStart(ast))) return;
       const before = node.text;
       let after = before;
       if (HEADER_NAMES.has(before)) {
         seenHeaders.add(before);
-        after = before.replace("x-cpa-", "x-sub2api-engine-");
+        after = before.replace("x-cpa-", "x-engine-");
+      } else if (UI_KEYS.has(before)) {
+        after = UI_KEYS.get(before);
       } else if (ts.isCallExpression(node.parent) && node.parent.expression.getText(ast) === "JSON.parse") {
-        try { after = JSON.stringify(jsonLabels(JSON.parse(before))); } catch { /* An unrelated non-JSON argument is not branding data. */ }
+        try { after = JSON.stringify(jsonLabels(JSON.parse(before))); } catch { /* Unrelated non-JSON arguments are not display data. */ }
       } else if (before.startsWith("https://")) {
-        if (ts.isPropertyAssignment(node.parent) && node.parent.name.getText(ast) === "href" && OLD_REPOS.has(before)) after = PROJECT;
-        else {
-          const url = new URL(before);
-          if (["platform.kimi.com", "platform.kimi.ai", "apikey.fan"].includes(url.hostname) && url.searchParams.has("aff")) {
-            url.searchParams.delete("aff");
-            after = url.href;
-          }
+        const url = new URL(before);
+        if (["platform.kimi.com", "platform.kimi.ai", "apikey.fan"].includes(url.hostname) && url.searchParams.has("aff")) {
+          url.searchParams.delete("aff");
+          after = url.href;
         }
       } else if (!before.startsWith("data:")) {
         after = displayText(before);
-        if (before === "cpa-management-key" && ts.isPropertyAssignment(node.parent) && node.parent.name.getText(ast) === "name") after = "sub2api-management-key";
+        if (["cpa-management-key", "sub2api-management-key"].includes(before)
+          && ts.isPropertyAssignment(node.parent) && node.parent.name.getText(ast) === "name") after = "management-key";
       }
       if (after !== before) { edit(node, after); labels += 1; }
     }
@@ -76,15 +100,14 @@ function scriptBranding(source) {
   }
   visit(ast);
 
-  // Resolve only the top-level product asset referenced by the observed product
-  // alt labels. Provider logos and other embedded images remain intact.
+  // Remove the unused product artwork bytes, not provider artwork or QR codes.
   for (const statement of ast.statements) {
     if (!ts.isVariableStatement(statement)) continue;
     for (const declaration of statement.declarationList.declarations) {
       if (ts.isIdentifier(declaration.name) && logoBindings.has(declaration.name.text)
         && declaration.initializer && ts.isStringLiteralLike(declaration.initializer)
         && declaration.initializer.text.startsWith("data:image/")) {
-        edit(declaration.initializer, LOGO);
+        edit(declaration.initializer, "data:,");
         logos += 1;
       }
     }
@@ -92,17 +115,17 @@ function scriptBranding(source) {
   if (logos !== 1) throw new Error("Upstream dashboard product logo structure changed");
   if (seenHeaders.size !== HEADER_NAMES.size) throw new Error("Upstream dashboard version/capability header readers changed");
   if (labels < 3) throw new Error("Upstream dashboard display labels changed");
-  let branded = source;
+  let neutral = source;
   for (const [start, change] of [...changes.entries()].sort((a, b) => b[0] - a[0])) {
-    branded = branded.slice(0, start) + change.text + branded.slice(change.end);
+    neutral = neutral.slice(0, start) + change.text + neutral.slice(change.end);
   }
-  const checked = ts.createSourceFile("branded.js", branded, ts.ScriptTarget.Latest, false, ts.ScriptKind.JS);
-  if (checked.parseDiagnostics.length !== 0) throw new Error("Branded dashboard JavaScript does not parse");
-  return { source: branded, labels, logos };
+  const checked = ts.createSourceFile("neutral.js", neutral, ts.ScriptTarget.Latest, false, ts.ScriptKind.JS);
+  if (checked.parseDiagnostics.length !== 0) throw new Error("Neutral dashboard JavaScript does not parse");
+  return { source: neutral, labels, logos, removedElements };
 }
 
-// Parse JavaScript before editing literal values; never run a global replacement
-// over identifiers, native protocol names, provider artwork or license comments.
+// Edit only parsed display literals and identified product elements. Protocol
+// values, provider identities, trust comparisons and required licenses stay intact.
 export function brandPanel(html) {
   if (!/<html\b/i.test(html) || !/<title>CLI Proxy API Management Center<\/title>/.test(html)) {
     throw new Error("Unexpected upstream dashboard document");
@@ -111,11 +134,11 @@ export function brandPanel(html) {
   if (scripts.length !== 1 || !scripts[0][2]) throw new Error("Unexpected upstream dashboard script layout");
   const script = scripts[0];
   const result = scriptBranding(script[2]);
-  let branded = html.slice(0, script.index) + script[1] + result.source + script[3] + html.slice(script.index + script[0].length);
-  branded = branded.replace(/<title>[^<]*<\/title>/, "<title>sub2api Console</title>")
-    .replace(/<link\b(?=[^>]*\brel=["']icon["'])[^>]*>/i, `<link rel="icon" type="image/svg+xml" href="${LOGO}">`);
-  branded = branded.replace(/<!doctype html>/i, `<!doctype html>\n<!-- Derived dashboard license; product branding modified by sub2api.\n${UPSTREAM_LICENSE}\n-->`);
-  return { html: branded, labels: result.labels, logos: result.logos };
+  let neutral = html.slice(0, script.index) + script[1] + result.source + script[3] + html.slice(script.index + script[0].length);
+  neutral = neutral.replace(/<title>[^<]*<\/title>/, "<title>Console</title>")
+    .replace(/<link\b(?=[^>]*\brel=["']icon["'])[^>]*>/i, '<link rel="icon" href="data:,">');
+  neutral = neutral.replace(/<!doctype html>/i, `<!doctype html>\n<!-- Third-party dashboard license.\n${UPSTREAM_LICENSE}\n-->`);
+  return { html: neutral, labels: result.labels, logos: result.logos, removedElements: result.removedElements };
 }
 
 async function main() {
@@ -137,7 +160,7 @@ async function main() {
   const bytes = Buffer.from(result.html, "utf8");
   await mkdir(dirname(resolve(target)), { recursive: true });
   await writeFile(target, bytes);
-  console.log(JSON.stringify({ product: "sub2api", sourceSha256: sourceHash, brandedSha256: createHash("sha256").update(bytes).digest("hex"), bytes: bytes.length, changedLiterals: result.labels, productLogos: result.logos }));
+  console.log(JSON.stringify({ presentation: "neutral", sourceSha256: sourceHash, outputSha256: createHash("sha256").update(bytes).digest("hex"), bytes: bytes.length, changedLiterals: result.labels, clearedLogos: result.logos, removedElements: result.removedElements }));
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();

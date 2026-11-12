@@ -222,7 +222,7 @@ describe("handle", () => {
     expect(seen[0]?.headers.get("cookie")).toBeNull();
   });
 
-  it("shows the sub2api login receipt after forwarding the provider callback for a signed-in user", async () => {
+  it("shows a neutral login receipt after forwarding the provider callback for a signed-in user", async () => {
     const { forward, seen } = recorder();
     const response = await handle(
       at("/callback?code=abc&state=f1d66a216e61aab0375b6857db64a6a5", { headers: { cookie: await sessionCookie() } }),
@@ -232,7 +232,8 @@ describe("handle", () => {
     expect(response.status).toBe(200);
     const page = await response.text();
     expect(page).toContain("Login received");
-    expect(page).toContain("sub2api is saving this login");
+    expect(page).toContain("the gateway is saving this login");
+    expect(page).not.toMatch(/sub2api|CLIProxyAPI|CPAMC/);
     expect(seen).toHaveLength(1);
     expect(seen[0]?.url).toBe("https://gateway.example/v0/management/oauth-callback?code=abc&state=f1d66a216e61aab0375b6857db64a6a5");
     expect(seen[0]?.headers.get("cookie")).toBeNull();
@@ -262,11 +263,14 @@ describe("handle", () => {
     expect(await response.text()).toContain("Provider answered 503");
   });
 
-  it("identifies the signed-out dashboard as sub2api", async () => {
+  it("serves the signed-out dashboard without product branding", async () => {
     const { forward, seen } = recorder();
     const response = await handle(at("/login"), config, forward);
     expect(response.status).toBe(200);
-    expect(await response.text()).toContain("Sign in to open the sub2api dashboard.");
+    const page = await response.text();
+    expect(page).toContain("Enter your dashboard password to continue.");
+    expect(page).toContain("<title>Console</title>");
+    expect(page).not.toMatch(/sub2api|CLIProxyAPI|CPAMC/);
     expect(seen).toHaveLength(0);
   });
 

@@ -45,7 +45,10 @@ try {
   assert.deepEqual(await health.json(), { status: "ok" });
   const form = await publicWorker.dispatchFetch("https://gateway.example/login");
   assert.equal(form.status, 200);
-  assert.match(await form.text(), /name="password"/);
+  const loginHtml = await form.text();
+  assert.match(loginHtml, /name="password"/);
+  assert.match(loginHtml, /<title>Console<\/title>/);
+  assert.doesNotMatch(loginHtml, /sub2api|CLIProxyAPI|CPAMC|\bCPA\b/);
   const login = await publicWorker.dispatchFetch("https://gateway.example/login", {
     method: "POST", body: new URLSearchParams({ password }), redirect: "manual",
   });
@@ -56,7 +59,9 @@ try {
   assert.equal(home.headers.get("location"), "/management.html");
   const dashboard = await publicWorker.dispatchFetch("https://gateway.example/management.html", { headers: { cookie } });
   assert.equal(dashboard.status, 200);
-  assert.match(await dashboard.text(), /Start controls/);
+  const dashboardHtml = await dashboard.text();
+  assert.match(dashboardHtml, /Start controls/);
+  assert.doesNotMatch(dashboardHtml, /sub2api|CLIProxyAPI|CPAMC|\bCPA\b|github\.com/);
   await (await publicWorker.getR2Bucket("STATE")).put("dashboard/management.html", "<html>tested edge panel</html>");
   const panel = await publicWorker.dispatchFetch("https://gateway.example/provider-panel.html", { headers: { cookie } });
   assert.equal(panel.status, 200);
@@ -68,7 +73,7 @@ try {
   });
   assert.equal(privateActivity.status, 404, "Internal activity protocol must never be publicly routed");
   assert.deepEqual(await publicWorker.listDurableObjectIds("CPA"), [], "Local routes must not activate the container Durable Object");
-  console.log("PASS: actual Worker bundle loads Wasm; liveness/login/session/dashboard/panel/blocked routes avoid the container object.");
+  console.log("PASS: actual Worker bundle loads Wasm; neutral login/dashboard, liveness, session, panel and blocked routes avoid the container object.");
   const stopped = await publicWorker.dispatchFetch("https://gateway.example/runtime/status", { headers: { cookie } });
   assert.equal(stopped.status, 200);
   assert.deepEqual(await stopped.json(), { running: false, controls_remaining_ms: 0 });
@@ -156,9 +161,10 @@ if (process.argv[2]) {
     });
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("x-cpa-version"), null);
-    assert.equal(response.headers.get("x-sub2api-engine-version"), "v8.0.67");
-    assert.equal(response.headers.get("x-sub2api-engine-support-plugin"), "true");
-    assert.equal(response.headers.get("access-control-expose-headers"), "Content-Type, x-sub2api-engine-version, x-sub2api-engine-support-plugin");
+    assert.equal(response.headers.get("x-sub2api-engine-version"), null);
+    assert.equal(response.headers.get("x-engine-version"), "v8.0.67");
+    assert.equal(response.headers.get("x-engine-support-plugin"), "true");
+    assert.equal(response.headers.get("access-control-expose-headers"), "Content-Type, x-engine-version, x-engine-support-plugin");
     const reader = response.body.getReader();
     const first = await reader.read();
     assert.equal(Buffer.from(first.value).toString(), "data: first\n\n");
@@ -176,8 +182,9 @@ if (process.argv[2]) {
     });
     assert.equal(socketResponse.status, 101);
     assert.equal(socketResponse.headers.get("x-cpa-version"), null);
-    assert.equal(socketResponse.headers.get("x-sub2api-engine-version"), "v8.0.67");
-    assert.equal(socketResponse.headers.get("access-control-expose-headers"), "x-sub2api-engine-version, X-Request-ID");
+    assert.equal(socketResponse.headers.get("x-sub2api-engine-version"), null);
+    assert.equal(socketResponse.headers.get("x-engine-version"), "v8.0.67");
+    assert.equal(socketResponse.headers.get("access-control-expose-headers"), "x-engine-version, X-Request-ID");
     const socket = socketResponse.webSocket;
     assert.ok(socket, "WebSocket upgrade object survives the Wasm boundary");
     socket.accept();
@@ -189,7 +196,7 @@ if (process.argv[2]) {
     socket.send("still active");
     assert.equal(await message, "still active");
     socket.close(1000, "verified");
-    console.log("PASS: Rust gateway preserves authorization, 2 MiB upload, SSE, provider readiness and native WebSocket upgrades while branding engine headers.");
+    console.log("PASS: Rust gateway preserves authorization, 2 MiB upload, SSE, provider readiness and native WebSocket upgrades with neutral engine headers.");
     console.log("Container stop/start and provider accounts still require the Docker/live checks; this smoke test does not simulate those guarantees.");
   } finally {
     await gateway.dispose();

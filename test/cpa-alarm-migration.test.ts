@@ -149,7 +149,7 @@ describe("legacy Container helper alarm migration", () => {
 describe("dashboard and API wake admission", () => {
   const configuration = `config-version: 8\naccess:\n  api-keys: [${CLIENT_KEY}]\n`;
 
-  it.each(["/v1/models", "/v8/management/config"])("brands forwarded %s headers without changing provider content", async (path) => {
+  it.each(["/v1/models", "/v8/management/config"])("uses neutral forwarded %s headers without changing provider content", async (path) => {
     const upstream = new Response('{"client_version":"cpa"}', { headers: {
       "X-CPA-VERSION": "v8.0.67", "access-control-expose-headers": "X-CPA-VERSION, ETag",
     } });
@@ -160,8 +160,9 @@ describe("dashboard and API wake admission", () => {
     const response = await state.cpa.fetch(new Request(`https://gateway.example${path}`, { headers }));
     expect(response.status).toBe(200);
     expect(response.headers.get("x-cpa-version")).toBeNull();
-    expect(response.headers.get("x-sub2api-engine-version")).toBe("v8.0.67");
-    expect(response.headers.get("access-control-expose-headers")).toBe("x-sub2api-engine-version, ETag");
+    expect(response.headers.get("x-sub2api-engine-version")).toBeNull();
+    expect(response.headers.get("x-engine-version")).toBe("v8.0.67");
+    expect(response.headers.get("access-control-expose-headers")).toBe("x-engine-version, ETag");
     expect(response.body).toBe(upstream.body);
     expect(response.bodyUsed).toBe(false);
     expect(await response.text()).toBe('{"client_version":"cpa"}');
