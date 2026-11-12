@@ -33,7 +33,7 @@ function binding() {
   };
   return {
     env: { CPA: namespace, DASHBOARD_PASSWORD: PASSWORD, LOGIN_LIMIT: { limit: async () => ({ success: true }) }, STATE: {
-      get: async (key: string) => { reads.push(key); return { body: panel, httpEtag: '\"tested-panel\"' }; },
+      get: async (key: string) => { reads.push(key); return { body: panel, httpEtag: JSON.stringify("tested-panel") }; },
     } as unknown as R2Bucket },
     names, requests, response, reads,
   };

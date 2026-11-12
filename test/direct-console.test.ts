@@ -115,7 +115,8 @@ describe("direct console native forwarding", () => {
     await response.text();
     expect(state.starts()).toBe(1);
     expect(state.requests).toHaveLength(1);
-    const sent = state.requests[0]!;
+    const sent = state.requests[0];
+    if (sent === undefined) throw new Error("Expected the native request");
     expect(sent.headers.get("cookie")).toBeNull();
     expect(sent.headers.get("user-agent")).toBe("test-client/1");
     expect(sent.headers.get("originator")).toBe("test-client");

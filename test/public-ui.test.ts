@@ -3,9 +3,11 @@ import { describe, expect, it, vi } from "vitest";
 import { PANEL_KEY, serveDashboard } from "../src/dashboard.ts";
 
 const PANEL = "<!doctype html><html><head><title>Console</title></head><body>Native console</body></html>";
+const ETAG = JSON.stringify("tested-panel");
 function store() {
-  const body = new Response(PANEL).body!;
-  const get = vi.fn(async () => ({ body, httpEtag: '\"tested-panel\"' } as R2ObjectBody));
+  const body = new Response(PANEL).body;
+  if (body === null) throw new Error("Panel fixture needs a body");
+  const get = vi.fn(async () => ({ body, httpEtag: ETAG } as R2ObjectBody));
   return { get, body };
 }
 
@@ -17,7 +19,7 @@ describe("direct neutral console and custom hostname", () => {
     expect(response.body).toBe(state.body);
     expect(await response.text()).toBe(PANEL);
     expect(state.get).toHaveBeenCalledExactlyOnceWith(PANEL_KEY);
-    expect(response.headers.get("etag")).toBe('\"tested-panel\"');
+    expect(response.headers.get("etag")).toBe(ETAG);
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.headers.get("x-frame-options")).toBe("DENY");
     const source = readFileSync(new URL("../src/dashboard.ts", import.meta.url), "utf8");
@@ -29,7 +31,7 @@ describe("direct neutral console and custom hostname", () => {
     const response = await serveDashboard(new Request("https://api.agentbeau.dev/management.html", { method: "HEAD" }), state);
     expect(response.status).toBe(200);
     expect(response.body).toBeNull();
-    expect(response.headers.get("etag")).toBe('\"tested-panel\"');
+    expect(response.headers.get("etag")).toBe(ETAG);
   });
 
   it("rejects writes and fails closed when the checked panel is missing", async () => {
