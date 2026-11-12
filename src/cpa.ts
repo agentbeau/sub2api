@@ -1,39 +1,65 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { BackgroundActivity, handleBackgroundActivity, type BackgroundAction } from "./background-activity.ts";
+import { publicProviderResponse } from "./branding.ts";
 import { ContainerLifecycle, containerUnavailable } from "./container-lifecycle.ts";
+import { methodNotAllowed, serveDashboard } from "./dashboard.ts";
 import type { Env } from "./env.ts";
 import { handle } from "./gateway.ts";
 import { takeImport } from "./import-config.ts";
 import { KeyGuard } from "./key-guard.ts";
+import { ManagementWindow } from "./management-window.ts";
 import { OAuthLease } from "./oauth-lease.ts";
 import { handleR2Bridge, STATE_BUCKET, STATE_HOST } from "./r2-bridge.ts";
+import { RealtimeLease } from "./realtime-lease.ts";
+import { classify } from "./routes.ts";
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 
-// Provider and dashboard requests share this Durable Object, so one KeyGuard sees every
-// dashboard change no matter which Worker isolate took the request.
+function hasPanelReferer(request: Request, url: URL): boolean {
+  const referer = request.headers.get("referer");
+  if (referer === null) return false;
+  try {
+    const source = new URL(referer);
+    return source.origin === url.origin && (source.pathname === "/provider-panel.html" || source.pathname === "/management.html");
+  } catch {
+    return false;
+  }
+}
+
+// Model admission and explicit provider controls share the preserved singleton.
+// Ordinary dashboard views are static edge responses and never enter its lifecycle.
 export class Cpa extends DurableObject<Env> {
-  private readonly keyGuard = new KeyGuard(nowSeconds);
+  private readonly keyGuard: KeyGuard;
   private readonly lifecycle: ContainerLifecycle | undefined;
   private readonly background: BackgroundActivity;
+  private readonly management: ManagementWindow;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const lease = new OAuthLease(ctx.storage);
+    const realtime = new RealtimeLease(ctx.storage);
     this.background = new BackgroundActivity(ctx.storage);
+    this.management = new ManagementWindow(ctx.storage);
     const container = ctx.container;
+    this.keyGuard = new KeyGuard(env.STATE, () => container?.running ?? false);
     if (container !== undefined) {
       this.lifecycle = new ContainerLifecycle(container, {
         idleTimeout: env.CONTAINER_IDLE_TIMEOUT_MS,
         lease: {
-          remainingMs: () => Math.max(lease.remainingMs(), this.background.remainingMs()),
-          observe: (request, response) => lease.observe(request, response),
+          remainingMs: () => Math.max(lease.remainingMs(), realtime.remainingMs(), this.background.remainingMs(), this.management.remainingMs()),
+          observe: async (request, response) => {
+            const oauthChanged = await lease.observe(request, response);
+            const realtimeChanged = await realtime.observe(request, response);
+            return oauthChanged || realtimeChanged;
+          },
         },
         beforeStart: async () => {
-          // A confirmed process loss also loses its pending OAuth sessions and local writes.
+          // A confirmed process loss also loses its OAuth sessions, realtime keys and writes.
           // Clear only their inactivity holds; provider credentials and R2 data are separate.
           await this.background.clear();
           await lease.clear();
+          await realtime.clear();
+          await this.management.clear();
         },
         // Resolve a pending import before every cold start. A request the Rust gateway handles
         // without forwarding must neither start CPA nor load its first-boot configuration.
@@ -56,10 +82,12 @@ export class Cpa extends DurableObject<Env> {
       // The old Container helper persisted recurring alarms. This application has no other
       // alarms; remove that schedule before restoring native idle handling after an update.
       await ctx.storage.deleteAlarm();
-      // Pending OAuth sessions and deferred object-store writes must survive DO eviction.
+      // Pending OAuth, reusable realtime keys and deferred writes must survive DO eviction.
       // Read their absolute deadlines before restoring a potentially shorter native timeout.
       await lease.restore();
+      await realtime.restore();
       await this.background.restore();
+      await this.management.restore();
       if (container?.running) {
         try {
           await this.lifecycle?.restore();
@@ -87,16 +115,81 @@ export class Cpa extends DurableObject<Env> {
   }
 
   override fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const route = classify(path);
+    // The panel can fetch model catalogs with a saved client key. Its metadata
+    // may reduce wake permission, but never replaces ordinary API authentication.
+    const panelApiRequest = route === "api" && hasPanelReferer(request, url);
+    let mayStart = false;
     return handle(
       request,
       {
         dashboardPassword: this.env.DASHBOARD_PASSWORD ?? "",
         nowSeconds,
-        keyGuard: this.keyGuard,
+        apiAccess: {
+          authorize: async (candidate) => {
+            const decision = await this.keyGuard.authorize(candidate);
+            mayStart = !panelApiRequest && (decision === "allowed" || decision === "runtime-required");
+            return decision === "runtime-only" || decision === "runtime-required" ? "allowed" : decision;
+          },
+          invalidate: () => {
+            if (path.startsWith("/v0/management/") || path.startsWith("/v8/management/")) this.keyGuard.invalidate();
+          },
+        },
         loginLimiter: this.env.LOGIN_LIMIT,
       },
-      (forwarded) => this.lifecycle?.forward(forwarded) ?? Promise.resolve(containerUnavailable()),
+      async (forwarded) => {
+        if (path === "/management.html" || path === "/provider-panel.html") return serveDashboard(forwarded, this.env.STATE);
+        if (path === "/runtime/status" || path === "/runtime/start" || path === "/runtime/stop") return publicProviderResponse(await this.controls(forwarded));
+        if (route === "ready") {
+          if (request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
+          return publicProviderResponse(await (this.lifecycle?.forward(forwarded) ?? containerUnavailable()));
+        }
+        // Management polling, failed/expired callbacks and warm-only credentials
+        // may contact an existing process but can never start a replacement.
+        const options = { requireFrontendAuth: route === "api" };
+        const response = await ((route === "api" && mayStart ? this.lifecycle?.forward(forwarded, options) : this.lifecycle?.forwardExisting(forwarded, options))
+          ?? containerUnavailable());
+        return publicProviderResponse(response);
+      },
     );
+  }
+
+  private async controls(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const status = url.pathname === "/runtime/status";
+    if (status ? request.method !== "GET" && request.method !== "HEAD" : request.method !== "POST") {
+      return methodNotAllowed(status ? "GET, HEAD" : "POST");
+    }
+    if (!status && request.headers.get("origin") !== url.origin) {
+      return Response.json({ error: { message: "Use the provider controls on this site's dashboard." } }, {
+        status: 403, headers: { "cache-control": "no-store" },
+      });
+    }
+    try {
+      if (url.pathname === "/runtime/start") {
+        if (this.lifecycle === undefined) return containerUnavailable();
+        const response = await this.lifecycle.forward(new Request(new URL("/healthz", url), { signal: request.signal }));
+        if (!response.ok) return response;
+        void response.body?.cancel().catch(() => {});
+        if (!this.ctx.container?.running) return containerUnavailable();
+        // Grant only after a successful native start. beforeStart has already
+        // cleared the departed process's holds, and this request is still active.
+        await this.management.open();
+      } else if (url.pathname === "/runtime/stop") {
+        // This releases only the explicit editing hold; never stop active work.
+        await this.management.clear();
+      }
+      await this.lifecycle?.refreshTimeout({ detectProtocol: true });
+      const running = this.ctx.container?.running ?? false;
+      const body = { running, controls_remaining_ms: running ? this.management.remainingMs() : 0 };
+      return new Response(request.method === "HEAD" ? null : JSON.stringify(body), {
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
+      });
+    } catch {
+      return containerUnavailable();
+    }
   }
 }
 

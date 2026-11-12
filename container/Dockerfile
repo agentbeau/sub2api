@@ -22,18 +22,22 @@ RUN CGO_ENABLED=1 GOOS=linux go build -buildvcs=false \
   -ldflags="-s -w -X 'main.Version=$(cat /tmp/cpa-version)' -X 'main.Commit=$(git rev-parse HEAD)'" \
   -o /out/CLIProxyAPI ./cmd/server/
 
-FROM debian:bookworm-slim
-# The dashboard follows CPA: "latest" takes the newest release. Pin a tag, and optionally its
-# PANEL_SHA256, to freeze it.
+FROM node:24-bookworm-slim AS panel
+# Branding is a build-time transform. Node/TypeScript are absent from the runtime image.
 ARG PANEL_VERSION=latest
 ARG PANEL_SHA256=""
+WORKDIR /branding
+COPY brand-panel/package.json brand-panel/package-lock.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
+COPY brand-panel/brand.mjs brand-panel/brand.test.mjs brand-panel/UPSTREAM_LICENSE ./
+RUN node --test brand.test.mjs && node brand.mjs --fetch /out/management.html
+
+FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tzdata \
   && rm -rf /var/lib/apt/lists/*
-RUN set -eu; base=https://github.com/router-for-me/Cli-Proxy-API-Management-Center/releases; \
-  if [ "${PANEL_VERSION}" = latest ]; then url="$base/latest/download/management.html"; \
-  else url="$base/download/${PANEL_VERSION}/management.html"; fi; \
-  mkdir -p /panel && curl -fsSL --retry 5 --retry-all-errors -o /panel/management.html "$url"; \
-  if [ -n "${PANEL_SHA256}" ]; then echo "${PANEL_SHA256}  /panel/management.html" | sha256sum -c -; fi
+COPY --from=panel /out/management.html /panel/management.html
+COPY --from=builder /src/LICENSE /usr/share/licenses/sub2api/provider-LICENSE
+COPY brand-panel/UPSTREAM_LICENSE /usr/share/licenses/sub2api/dashboard-LICENSE
 WORKDIR /CLIProxyAPI
 COPY --from=builder /out/CLIProxyAPI ./CLIProxyAPI
 COPY entrypoint.sh /entrypoint.sh

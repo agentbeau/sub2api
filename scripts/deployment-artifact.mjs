@@ -5,6 +5,8 @@ import { readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 export const PREPARED_IMAGE = `registry.cloudflare.com/${"0".repeat(32)}/sub2api-cpa@sha256:${"0".repeat(64)}`;
+export const DASHBOARD_PANEL_FILE = "management.html";
+export const DASHBOARD_OBJECT_KEY = "dashboard/management.html";
 const DIGEST_IMAGE = /^registry\.cloudflare\.com\/[a-f0-9]{32}\/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$/;
 
 export function sourceIdentity(root) {
@@ -84,6 +86,14 @@ export async function verifyArtifact(directory, revision, install) {
   for (const path of expected) {
     if (await sha256(join(directory, path)) !== manifest.files[path]) throw new Error(`Artifact checksum mismatch: ${path}`);
   }
+  return manifest;
+}
+
+export async function verifyContainerImageArtifact(directory, revision) {
+  const manifest = await verifyArtifact(directory, revision, "container-image");
+  if (!/^sub2api-cpa:[a-f0-9]{12}-\d+-\d+$/.test(manifest.image ?? "") || !/^sha256:[a-f0-9]{64}$/.test(manifest.imageId ?? "")) throw new Error("Invalid tested image identity");
+  if (!/^[a-f0-9]{64}$/.test(manifest.files["image.tar.gz"] ?? "")) throw new Error("The tested image archive is required");
+  if (!/^[a-f0-9]{64}$/.test(manifest.files[DASHBOARD_PANEL_FILE] ?? "")) throw new Error("The checksummed provider dashboard is required");
   return manifest;
 }
 

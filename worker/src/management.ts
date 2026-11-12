@@ -490,6 +490,6 @@ export async function handleManagement(request: Request, account: Account): Prom
         return failure(404, "not_found");
     }
   })();
-  response.headers.set("x-cpa-version", GATEWAY_VERSION);
+  response.headers.set("x-sub2api-engine-version", GATEWAY_VERSION);
   return response;
 }

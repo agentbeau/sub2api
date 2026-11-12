@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds the CPA image and runs it against the Worker's S3 shim (src/s3.ts) served by Node:
-# management, panel, an API key saved the way the dashboard saves it, the open-when-empty behaviour
-# the Worker guards against (src/key-guard.ts), the config surviving a restart from the bucket, and
+# management, branded panel, an API key saved the way the dashboard saves it, empty-provider
+# authentication rejection, the config surviving a restart from the bucket, and
 # a first start that takes a config and logins moved from the Workers-only install.
 set -eu
 
@@ -107,10 +107,13 @@ activity_finished() {
 start_cpa
 expect 200 "$base/healthz"
 expect 200 "$base/__sub2api/lifecycle"
-curl --fail --silent "$base/__sub2api/lifecycle" | node -e 'const x=JSON.parse(require("node:fs").readFileSync(0,"utf8")); if(x.activity_protocol!==1) process.exit(1)' || fail "provider does not advertise activity protocol 1"
+curl --fail --silent "$base/__sub2api/lifecycle" | node -e 'const x=JSON.parse(require("node:fs").readFileSync(0,"utf8")); if(x.activity_protocol!==1 || x.frontend_auth_protocol!==1) process.exit(1)' || fail "provider does not advertise both required lifecycle/auth protocols"
+expect 401 "$base/v1/models"
+expect 401 -H "authorization: Bearer unconfigured-key" "$base/v1/models"
 expect 401 "$base/v8/management/config"
 expect 200 -H "$mgmt" "$base/v8/management/config"
 expect 200 "$base/management.html"
+curl --fail --silent "$base/management.html" | node -e 'const html=require("node:fs").readFileSync(0,"utf8"); if(!html.includes("<title>sub2api Console</title>") || html.includes("<title>CLI Proxy API")) process.exit(1)' || fail "provider image does not contain the branded dashboard"
 expect 204 -X POST http://127.0.0.1:19000/__delay-config-put
 expect 200 -X PUT -H "$mgmt" -H "content-type: application/json" -d "[\"$CLIENT_KEY\"]" "$base/v8/management/config/access/api-keys"
 wait_for activity_pending
@@ -139,8 +142,10 @@ expect 401 -H "x-api-key: wrong-key" "$base/v1/models"
 echo "ok config survived a restart from the bucket"
 
 expect 200 -X PUT -H "$mgmt" -H "content-type: application/json" -d "[]" "$base/v8/management/config/access/api-keys"
-wait_for '[ "$(status -H "authorization: Bearer probe-0123456789abcdef" "$base/v1/models")" = 200 ]'
-echo "ok CPA lets every call through once its key list is empty, so the Worker must refuse"
+wait_for '[ "$(status -H "x-api-key: $CLIENT_KEY" "$base/v1/models")" = 401 ]'
+expect 401 "$base/v1/models"
+expect 401 -H "authorization: Bearer probe-0123456789abcdef" "$base/v1/models"
+echo "ok removing the last effective key rejects old, missing and arbitrary credentials"
 
 state=$(curl -s -H "$mgmt" "$base/v0/management/anthropic-auth-url" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')
 [ -n "$state" ] || fail "anthropic-auth-url returned no state"
