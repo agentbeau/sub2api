@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import test from "node:test";
-import { buildEnvironment, buildMetadata, installBuildTools, runPhase, TOOLCHAIN } from "./cloudflare-builds.mjs";
+import { buildEnvironment, buildMetadata, runPhase } from "./cloudflare-builds.mjs";
 import { writeManifest } from "./deployment-artifact.mjs";
 
 const revision = "a".repeat(40);
@@ -22,8 +22,7 @@ const environment = {
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), "sub2api-builds-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  await writeFile(join(root, "rust-toolchain.toml"), '[toolchain]\nchannel = "1.99.1"\n');
-  const state = { calls: [], installed: 0, head: revision, main: revision, dirty: "", live: "container", fail: "" };
+  const state = { calls: [], consumed: 0, head: revision, main: revision, dirty: "", live: "container", fail: "" };
   const execute = async (command, args, options) => {
     state.calls.push({ command, args, ...options });
     const label = [command, ...args].join(" ");
@@ -33,26 +32,31 @@ async function fixture(t) {
       if (args[0] === "status") return state.dirty;
       if (args[0] === "ls-remote") return `${state.main}\trefs/heads/main\n`;
     }
-    if (args[0]?.endsWith("prepare-deployment.mjs")) {
-      const output = args[2];
-      await mkdir(join(output, "worker"), { recursive: true });
-      await writeFile(join(output, "worker/index.js"), "export default {};");
-      await writeFile(join(output, "wrangler.json"), '{"name":"sub2api"}');
-      await writeManifest(output, { revision, dirty: false, install: "container" });
-    }
-    if (args[0]?.endsWith("build-container-image.mjs")) {
-      const output = args[1];
-      await mkdir(output, { recursive: true });
-      await writeFile(join(output, "image.tar.gz"), "checked image fixture");
-      await writeFile(join(output, "management.html"), "<title>sub2api Console</title>");
-      await writeManifest(output, { revision, dirty: false, install: "container-image", image: `sub2api-cpa:${revision.slice(0, 12)}-1-1`, imageId: `sha256:${"d".repeat(64)}` });
-    }
     if (args[0]?.endsWith("live-install.mjs")) return state.live;
     if (args[0]?.endsWith("deploy-prepared.mjs")) return "https://sub2api.example.workers.dev";
     return "";
   };
-  const install = async () => { state.installed += 1; };
-  return { root, environment: { ...environment }, execute, install, state };
+  const source = { revision, runId: 123, runAttempt: 1 };
+  const consume = async ({ worker, image, env }) => {
+    state.consumed += 1;
+    state.calls.push({ command: "consume-ci-artifacts", args: [], env });
+    if (state.fail === "consume-ci-artifacts") throw new Error("injected gate failure");
+    await mkdir(join(worker, "worker"), { recursive: true });
+    await writeFile(join(worker, "worker/index.js"), "export default {};");
+    await writeFile(join(worker, "wrangler.json"), '{"name":"sub2api"}');
+    await writeManifest(worker, { revision, dirty: false, install: "container" });
+    await mkdir(image, { recursive: true });
+    await writeFile(join(image, "image.tar.gz"), "checked image fixture");
+    await writeFile(join(image, "management.html"), "<title>sub2api Console</title>");
+    await writeManifest(image, { revision, dirty: false, install: "container-image", image: `sub2api-cpa:${revision.slice(0, 12)}-1-1`, imageId: `sha256:${"d".repeat(64)}` });
+    return source;
+  };
+  const verifySource = async receipt => {
+    if (state.fail === "source-provenance") throw new Error("original source provenance changed");
+    assert.deepEqual(receipt, source);
+  };
+  return { root, environment: { ...environment }, execute, consume, verifySource, state };
+
 }
 
 test("build metadata refuses previews, missing platform identities and automatic dependency installation", () => {
@@ -76,14 +80,14 @@ test("child build environments allow only build inputs, preserve network trust a
   assert.equal(clean.CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV, "false");
 });
 
-test("build runs the real gates before recording verified artifacts and never gives credentials to a child", async (t) => {
+test("build consumes checked CI artifacts and runs packaged gates without giving credentials to a child", async (t) => {
   const f = await fixture(t);
   const result = await runPhase("build", f);
-  assert.equal(f.state.installed, 1);
+  assert.equal(f.state.consumed, 1);
   const calls = f.state.calls.map(x => [x.command, ...x.args].join(" "));
-  const order = ["npm ci", "npm run verify", "--test", "prepare-deployment.mjs", "test:runtime", "build-container-image.mjs"];
+  const order = ["npm ci", "--test", "consume-ci-artifacts", "test:runtime"];
   let previous = -1;
-  for (const gate of order) { const at = calls.findIndex(x => x.includes(gate)); assert.ok(at > previous, gate); previous = at; }
+  for (const gate of order) { const at = calls.findIndex(x => gate === "consume-ci-artifacts" ? x === gate : x.includes(gate)); assert.ok(at > previous, gate); previous = at; }
   assert.ok(calls.every(x => !x.includes("deploy-prepared.mjs")));
   for (const call of f.state.calls) {
     assert.ok(!JSON.stringify(call.env).includes("deploy-secret"));
@@ -95,12 +99,13 @@ test("build runs the real gates before recording verified artifacts and never gi
   assert.equal(receipt.account, account);
   assert.match(receipt.workerManifest, /^[a-f0-9]{64}$/);
   assert.match(receipt.imageManifest, /^[a-f0-9]{64}$/);
-  const imageBuild = f.state.calls.find(x => x.args[0]?.endsWith("build-container-image.mjs"));
-  assert.equal(imageBuild.env.SUB2API_DOCKER_NETWORK, "host");
+  assert.deepEqual(receipt.source, { revision, runId: 123, runAttempt: 1 });
+  assert.ok(calls.every(command => !/docker|cargo|build-container-image|prepare-deployment/.test(command)));
+
 });
 
-test("failed compilation, packaged runtime or image smoke cannot leave a successful build receipt", async (t) => {
-  for (const gate of ["npm run verify", "test:runtime", "build-container-image.mjs"]) {
+test("failed dependency setup, provenance or packaged runtime cannot leave a successful build receipt", async (t) => {
+  for (const gate of ["npm ci", "test:runtime", "consume-ci-artifacts"]) {
     const f = await fixture(t);
     await runPhase("build", f);
     f.state.fail = gate;
@@ -110,12 +115,12 @@ test("failed compilation, packaged runtime or image smoke cannot leave a success
   }
 });
 
-test("dirty and stale source fails before installing tools or dependencies", async (t) => {
+test("dirty and stale source fails before dependencies or artifact consumption", async (t) => {
   for (const patch of [{ dirty: " M src/index.ts" }, { head: "e".repeat(40) }, { main: "f".repeat(40) }]) {
     const f = await fixture(t);
     Object.assign(f.state, patch);
     await assert.rejects(runPhase("build", f));
-    assert.equal(f.state.installed, 0);
+    assert.equal(f.state.consumed, 0);
     assert.ok(f.state.calls.every(x => x.command === "git"));
   }
 });
@@ -141,7 +146,7 @@ test("deployment rechecks artifacts and only supplies the deploy token to the in
   assert.ok(f.state.calls.at(-3).args.includes("refs/heads/main"));
   assert.ok(f.state.calls.at(-1).args[0].endsWith("check-deployed.mjs"));
   assert.ok(!f.state.calls.at(-1).env.CLOUDFLARE_API_TOKEN);
-  assert.equal(f.state.installed, 1);
+  assert.equal(f.state.consumed, 1);
 });
 
 test("changed payloads, rewritten manifests and another build receipt cannot deploy", async (t) => {
@@ -182,30 +187,14 @@ test("validation checks the passed artifacts without credentials, deployment or 
   f.state.calls = [];
   await runPhase("validate", f);
   assert.ok(f.state.calls.every(x => x.command === "git"));
-  assert.equal(f.state.installed, 1);
+  assert.equal(f.state.consumed, 1);
 });
 
-test("a changed tool download is rejected before execution", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "sub2api-tool-test-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const calls = [];
-  const execute = async (command, args) => {
-    calls.push(command);
-    assert.equal(command, "curl");
-    const path = args[args.indexOf("--output") + 1];
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, "corrupt executable");
-    return "";
-  };
-  await assert.rejects(installBuildTools({ directory: root, env: {}, execute }), /checksum/);
-  assert.deepEqual(calls, ["curl"]);
-});
-
-test("the Cloudflare tools stay aligned with the pinned GitHub CI tools", async () => {
-  const workflow = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
-  const rust = await readFile(new URL("../rust-toolchain.toml", import.meta.url), "utf8");
-  assert.ok(workflow.includes(`rustup toolchain install ${TOOLCHAIN.rust}`));
-  assert.ok(rust.includes(`channel = "${TOOLCHAIN.rust}"`));
-  assert.ok(workflow.includes(`wasm-bindgen-${TOOLCHAIN.bindgen}-x86_64-unknown-linux-musl.tar.gz`));
-  assert.ok(workflow.includes(TOOLCHAIN.bindgenSha256));
+test("changed original CI provenance blocks deployment even when local checksums still match", async (t) => {
+  const f = await fixture(t);
+  await runPhase("build", f);
+  f.state.fail = "source-provenance";
+  f.state.calls = [];
+  await assert.rejects(runPhase("deploy", f), /source provenance changed/);
+  assert.ok(f.state.calls.every(call => call.command === "git"));
 });

@@ -82,7 +82,7 @@ try {
 // has no container binding, so a valid private notification must be refused without startup.
 const rpcHarness = resolve(temporary, "rpc-harness.ts");
 await writeFile(rpcHarness, `
-export { Cpa, R2Bridge } from ${JSON.stringify(resolve(root, "src/cpa.ts"))};
+export { Cpa, R2Bridge } from ${JSON.stringify(process.argv[2] ? artifact : resolve(root, "src/cpa.ts"))};
 export default { fetch(request, env, ctx) {
   return ctx.exports.R2Bridge.fetch(new Request('http://r2.internal/__sub2api/activity', {
     method: 'POST', headers: {'content-type':'application/json'},
@@ -107,87 +107,91 @@ try {
   await rpcWorker.dispose();
 }
 
-// A controlled provider exercises Web APIs that Node's Response does not implement (status 101).
-// It replaces only the external provider, not the Rust gateway or key guard.
-const harness = resolve(temporary, "provider-harness.ts");
-await writeFile(harness, `
-import { handle } from ${JSON.stringify(resolve(root, "src/gateway.ts"))};
-import { KeyGuard } from ${JSON.stringify(resolve(root, "src/key-guard.ts"))};
-import { publicProviderResponse } from ${JSON.stringify(resolve(root, "src/branding.ts"))};
-const now = () => Math.floor(Date.now()/1000);
-const key = ${JSON.stringify(key)};
-const store = { get: async (path) => path === 'config/config.yaml' ? { text: async () => JSON.stringify({'config-version':8, access:{'api-keys':[key]}}) } : null };
-const config = { dashboardPassword: ${JSON.stringify(password)}, nowSeconds: now, apiAccess: new KeyGuard(store, () => false), loginLimiter: { limit: async () => ({success: true}) } };
-async function provider(request) {
-  if (request.headers.has('cookie')) return new Response('cookie leaked', { status: 500 });
-  if (new URL(request.url).pathname === '/healthz') return new Response('provider ready');
-  if (request.headers.get('x-api-key') !== key) return new Response('unauthorized', {status:401});
-  if (request.headers.get('upgrade') === 'websocket') {
-    const [client, server] = Object.values(new WebSocketPair());
-    server.accept();
-    server.addEventListener('message', event => server.send(event.data));
-    server.addEventListener('close', event => server.close(event.code, event.reason));
-    return new Response(null, {status:101, webSocket:client, headers:{'X-CPA-VERSION':'v8.0.67','access-control-expose-headers':'X-CPA-VERSION, X-Request-ID'}});
+if (process.argv[2]) {
+  console.log("PASS: prepared-bundle checks use only the received Worker/Wasm artifacts; source SSE/WebSocket checks remain a required GitHub CI gate.");
+} else {
+  // A controlled provider exercises Web APIs that Node's Response does not implement (status 101).
+  // It replaces only the external provider, not the Rust gateway or key guard.
+  const harness = resolve(temporary, "provider-harness.ts");
+  await writeFile(harness, `
+  import { handle } from ${JSON.stringify(resolve(root, "src/gateway.ts"))};
+  import { KeyGuard } from ${JSON.stringify(resolve(root, "src/key-guard.ts"))};
+  import { publicProviderResponse } from ${JSON.stringify(resolve(root, "src/branding.ts"))};
+  const now = () => Math.floor(Date.now()/1000);
+  const key = ${JSON.stringify(key)};
+  const store = { get: async (path) => path === 'config/config.yaml' ? { text: async () => JSON.stringify({'config-version':8, access:{'api-keys':[key]}}) } : null };
+  const config = { dashboardPassword: ${JSON.stringify(password)}, nowSeconds: now, apiAccess: new KeyGuard(store, () => false), loginLimiter: { limit: async () => ({success: true}) } };
+  async function provider(request) {
+    if (request.headers.has('cookie')) return new Response('cookie leaked', { status: 500 });
+    if (new URL(request.url).pathname === '/healthz') return new Response('provider ready');
+    if (request.headers.get('x-api-key') !== key) return new Response('unauthorized', {status:401});
+    if (request.headers.get('upgrade') === 'websocket') {
+      const [client, server] = Object.values(new WebSocketPair());
+      server.accept();
+      server.addEventListener('message', event => server.send(event.data));
+      server.addEventListener('close', event => server.close(event.code, event.reason));
+      return new Response(null, {status:101, webSocket:client, headers:{'X-CPA-VERSION':'v8.0.67','access-control-expose-headers':'X-CPA-VERSION, X-Request-ID'}});
+    }
+    if (request.headers.get('x-test-upload') === 'yes') return new Response(String((await request.arrayBuffer()).byteLength));
+    let timer;
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: first\\n\\n'));
+        timer = setTimeout(() => { controller.enqueue(new TextEncoder().encode('data: last\\n\\n')); controller.close(); }, 1200);
+      },
+      cancel() { clearTimeout(timer); },
+    });
+    return new Response(stream, {headers:{'content-type':'text/event-stream','X-CPA-VERSION':'v8.0.67','x-cpa-support-plugin':'true','access-control-expose-headers':'Content-Type, X-CPA-VERSION, X-CPA-SUPPORT-PLUGIN'}});
   }
-  if (request.headers.get('x-test-upload') === 'yes') return new Response(String((await request.arrayBuffer()).byteLength));
-  let timer;
-  const stream = new ReadableStream({
-    start(controller) {
-      controller.enqueue(new TextEncoder().encode('data: first\\n\\n'));
-      timer = setTimeout(() => { controller.enqueue(new TextEncoder().encode('data: last\\n\\n')); controller.close(); }, 1200);
-    },
-    cancel() { clearTimeout(timer); },
-  });
-  return new Response(stream, {headers:{'content-type':'text/event-stream','X-CPA-VERSION':'v8.0.67','x-cpa-support-plugin':'true','access-control-expose-headers':'Content-Type, X-CPA-VERSION, X-CPA-SUPPORT-PLUGIN'}});
-}
-export default { fetch(request) { return handle(request, config, async request => publicProviderResponse(await provider(request))); } };
-`);
-const harnessOutput = resolve(temporary, "harness/index.js");
-await bundle(harness, harnessOutput);
-const gateway = new Miniflare(convertV4MiniflareOptions(await options(harnessOutput)));
-try {
-  const denied = await gateway.dispatchFetch("https://gateway.example/v1/messages", { method: "POST", body: "{}" });
-  assert.equal(denied.status, 401);
-  const response = await gateway.dispatchFetch("https://gateway.example/v1/messages", {
-    method: "POST", headers: { "x-api-key": key, cookie: "private-cookie=value" }, body: "{}",
-  });
-  assert.equal(response.status, 200);
-  assert.equal(response.headers.get("x-cpa-version"), null);
-  assert.equal(response.headers.get("x-sub2api-engine-version"), "v8.0.67");
-  assert.equal(response.headers.get("x-sub2api-engine-support-plugin"), "true");
-  assert.equal(response.headers.get("access-control-expose-headers"), "Content-Type, x-sub2api-engine-version, x-sub2api-engine-support-plugin");
-  const reader = response.body.getReader();
-  const first = await reader.read();
-  assert.equal(Buffer.from(first.value).toString(), "data: first\n\n");
-  const last = await reader.read();
-  assert.equal(Buffer.from(last.value).toString(), "data: last\n\n");
-  assert.equal((await reader.read()).done, true);
-  const upload = await gateway.dispatchFetch("https://gateway.example/v1/messages", {
-    method: "POST", headers: { "x-api-key": key, "x-test-upload": "yes" }, body: Buffer.alloc(2 * 1024 * 1024, 65),
-  });
-  assert.equal(await upload.text(), "2097152");
-  const ready = await gateway.dispatchFetch("https://gateway.example/readyz");
-  assert.equal(await ready.text(), "provider ready");
-  const socketResponse = await gateway.dispatchFetch("https://gateway.example/v1/responses", {
-    headers: { upgrade: "websocket", "x-api-key": key, cookie: "private-cookie=value" },
-  });
-  assert.equal(socketResponse.status, 101);
-  assert.equal(socketResponse.headers.get("x-cpa-version"), null);
-  assert.equal(socketResponse.headers.get("x-sub2api-engine-version"), "v8.0.67");
-  assert.equal(socketResponse.headers.get("access-control-expose-headers"), "x-sub2api-engine-version, X-Request-ID");
-  const socket = socketResponse.webSocket;
-  assert.ok(socket, "WebSocket upgrade object survives the Wasm boundary");
-  socket.accept();
-  await new Promise((resolveDelay) => setTimeout(resolveDelay, 1200));
-  const message = new Promise((resolveMessage, reject) => {
-    const timer = setTimeout(() => reject(new Error("WebSocket echo timed out")), 5000);
-    socket.addEventListener("message", event => { clearTimeout(timer); resolveMessage(event.data); }, { once: true });
-  });
-  socket.send("still active");
-  assert.equal(await message, "still active");
-  socket.close(1000, "verified");
-  console.log("PASS: Rust gateway preserves authorization, 2 MiB upload, SSE, provider readiness and native WebSocket upgrades while branding engine headers.");
-  console.log("Container stop/start and provider accounts still require the Docker/live checks; this smoke test does not simulate those guarantees.");
-} finally {
-  await gateway.dispose();
+  export default { fetch(request) { return handle(request, config, async request => publicProviderResponse(await provider(request))); } };
+  `);
+  const harnessOutput = resolve(temporary, "harness/index.js");
+  await bundle(harness, harnessOutput);
+  const gateway = new Miniflare(convertV4MiniflareOptions(await options(harnessOutput)));
+  try {
+    const denied = await gateway.dispatchFetch("https://gateway.example/v1/messages", { method: "POST", body: "{}" });
+    assert.equal(denied.status, 401);
+    const response = await gateway.dispatchFetch("https://gateway.example/v1/messages", {
+      method: "POST", headers: { "x-api-key": key, cookie: "private-cookie=value" }, body: "{}",
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-cpa-version"), null);
+    assert.equal(response.headers.get("x-sub2api-engine-version"), "v8.0.67");
+    assert.equal(response.headers.get("x-sub2api-engine-support-plugin"), "true");
+    assert.equal(response.headers.get("access-control-expose-headers"), "Content-Type, x-sub2api-engine-version, x-sub2api-engine-support-plugin");
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    assert.equal(Buffer.from(first.value).toString(), "data: first\n\n");
+    const last = await reader.read();
+    assert.equal(Buffer.from(last.value).toString(), "data: last\n\n");
+    assert.equal((await reader.read()).done, true);
+    const upload = await gateway.dispatchFetch("https://gateway.example/v1/messages", {
+      method: "POST", headers: { "x-api-key": key, "x-test-upload": "yes" }, body: Buffer.alloc(2 * 1024 * 1024, 65),
+    });
+    assert.equal(await upload.text(), "2097152");
+    const ready = await gateway.dispatchFetch("https://gateway.example/readyz");
+    assert.equal(await ready.text(), "provider ready");
+    const socketResponse = await gateway.dispatchFetch("https://gateway.example/v1/responses", {
+      headers: { upgrade: "websocket", "x-api-key": key, cookie: "private-cookie=value" },
+    });
+    assert.equal(socketResponse.status, 101);
+    assert.equal(socketResponse.headers.get("x-cpa-version"), null);
+    assert.equal(socketResponse.headers.get("x-sub2api-engine-version"), "v8.0.67");
+    assert.equal(socketResponse.headers.get("access-control-expose-headers"), "x-sub2api-engine-version, X-Request-ID");
+    const socket = socketResponse.webSocket;
+    assert.ok(socket, "WebSocket upgrade object survives the Wasm boundary");
+    socket.accept();
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 1200));
+    const message = new Promise((resolveMessage, reject) => {
+      const timer = setTimeout(() => reject(new Error("WebSocket echo timed out")), 5000);
+      socket.addEventListener("message", event => { clearTimeout(timer); resolveMessage(event.data); }, { once: true });
+    });
+    socket.send("still active");
+    assert.equal(await message, "still active");
+    socket.close(1000, "verified");
+    console.log("PASS: Rust gateway preserves authorization, 2 MiB upload, SSE, provider readiness and native WebSocket upgrades while branding engine headers.");
+    console.log("Container stop/start and provider accounts still require the Docker/live checks; this smoke test does not simulate those guarantees.");
+  } finally {
+    await gateway.dispose();
+  }
 }

@@ -32,9 +32,11 @@ jobs:
       - run: npm ci
       - run: npm run verify
       - name: Verify deployment safeguards
-        run: node --test scripts/deployment.test.mjs scripts/deploy-prepared.test.mjs scripts/cloudflare-builds.test.mjs container/brand-panel/brand.test.mjs
+        run: node --test scripts/deployment.test.mjs scripts/deploy-prepared.test.mjs scripts/cloudflare-builds.test.mjs scripts/consume-ci-artifacts.test.mjs scripts/publish-ci-artifacts.test.mjs container/brand-panel/brand.test.mjs
       - name: Package the compiled container gateway
         run: node scripts/prepare-deployment.mjs container .wrangler/artifacts/container-worker
+      - name: Exercise source gateway streaming and WebSockets in workerd
+        run: npm run test:runtime
       - name: Exercise the packaged gateway in workerd
         run: npm run test:runtime -- .wrangler/artifacts/container-worker/worker/index.js
       - name: Fetch the Workers-only dashboard
@@ -50,6 +52,7 @@ jobs:
           path: .wrangler/artifacts/container-worker
           include-hidden-files: true
           if-no-files-found: error
+          overwrite: true
           retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
@@ -57,6 +60,7 @@ jobs:
           path: .wrangler/artifacts/worker-only
           include-hidden-files: true
           if-no-files-found: error
+          overwrite: true
           retention-days: 14
 
   container:
@@ -77,7 +81,7 @@ jobs:
           PANEL_VERSION: ${{ vars.PANEL_VERSION }}
           PANEL_SHA256: ${{ vars.PANEL_SHA256 }}
         run: node scripts/build-container-image.mjs .wrangler/artifacts/container-image
-      - name: Exercise the same image with Cloudflare Builds networking
+      - name: Exercise the same image with host networking
         env:
           SUB2API_DOCKER_NETWORK: host
         run: |
@@ -90,5 +94,6 @@ jobs:
           path: .wrangler/artifacts/container-image
           include-hidden-files: true
           if-no-files-found: error
+          overwrite: true
           compression-level: 0
           retention-days: 14

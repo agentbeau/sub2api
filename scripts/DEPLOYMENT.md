@@ -2,7 +2,10 @@
 
 For native Cloudflare continuous deployment, use the
 [Workers Builds setup](../docs/cloudflare-builds.md). Its build/deploy entrypoint
-runs the same checked artifact flow below and preserves existing runtime secrets.
+consumes the original checked GitHub CI artifact ZIPs and runs the prepared
+deployment flow below while preserving existing runtime secrets. The separate
+publisher uses only GitHub's automatic job token; Cloudflare verifies the public
+source metadata and archive digests before loading and pushing the tested image.
 
 ## Prepared deployments
 
