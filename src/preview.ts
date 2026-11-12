@@ -2,9 +2,9 @@
 import gateway from "./index.ts";
 import { previewAllowed } from "./preview-access.ts";
 import type { Env } from "./env.ts";
-export { Cpa, R2Bridge } from "./cpa.ts";
+export { Cpa as Engine, R2Bridge } from "./cpa.ts";
 
-type PreviewEnv = Env & { readonly PREVIEW_ACCESS_AUD?: string };
+type PreviewEnv = Omit<Env, "CPA"> & { readonly ENGINE: Env["CPA"]; readonly PREVIEW_ACCESS_AUD?: string };
 export default {
   fetch(request: Request, env: PreviewEnv, ctx: ExecutionContext & { access?: { aud?: string } }): Response | Promise<Response> {
     if (!previewAllowed(env.PREVIEW_ACCESS_AUD, ctx.access)) {
@@ -12,6 +12,6 @@ export default {
         status: 403, headers: { "cache-control": "no-store" },
       });
     }
-    return gateway.fetch(request, env, ctx);
+    return gateway.fetch(request, { ...env, CPA: env.ENGINE }, ctx);
   },
 };

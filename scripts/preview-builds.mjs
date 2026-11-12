@@ -10,14 +10,14 @@ import { DASHBOARD_OBJECT_KEY, DASHBOARD_PANEL_FILE, imageDigest, PREPARED_IMAGE
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BRANCH = "dagul/isolated-worker-preview";
-const BUCKET = "sub2api-preview-isolated";
+const BUCKET = "gateway-preview-state";
 export function previewMetadata(env) {
   if (env.WORKERS_CI !== "1" || env.WORKERS_CI_BRANCH !== BRANCH) throw new Error("Only the isolated preview branch can use this pipeline");
   if (!/^[a-f0-9]{40}$/.test(env.WORKERS_CI_COMMIT_SHA ?? "")) throw new Error("Exact source revision required");
   if (!/^[a-f0-9]{32}$/.test(env.CLOUDFLARE_ACCOUNT_ID ?? "")) throw new Error("Cloudflare account required");
   if (!/^[a-f0-9-]{36}$/.test(env.WORKERS_CI_BUILD_UUID ?? "")) throw new Error("Cloudflare build identity required");
   if (env.SKIP_DEPENDENCY_INSTALL !== "1") throw new Error("Dependency installation must run token-free inside the build phase");
-  if (env.WRANGLER_CI_OVERRIDE_NAME && env.WRANGLER_CI_OVERRIDE_NAME !== "sub2api-preview-isolated") throw new Error("Wrong preview Worker name");
+  if (env.WRANGLER_CI_OVERRIDE_NAME && env.WRANGLER_CI_OVERRIDE_NAME !== "gateway-preview") throw new Error("Wrong preview Worker name");
   if (env.WRANGLER_CI_MATCH_TAG && env.WRANGLER_CI_MATCH_TAG !== "e938224d2f694fe5b6f92a60f4a332cd") throw new Error("Wrong preview Worker identity");
   return { revision: env.WORKERS_CI_COMMIT_SHA, account: env.CLOUDFLARE_ACCOUNT_ID, buildId: env.WORKERS_CI_BUILD_UUID };
 }

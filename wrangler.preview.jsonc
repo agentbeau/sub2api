@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "sub2api-preview-isolated",
+  "name": "gateway-preview",
   "main": "src/preview.ts",
   "compatibility_date": "2026-10-01",
   "workers_dev": true,
@@ -9,7 +9,7 @@
     {
       "tag": "v1",
       "new_sqlite_classes": [
-        "Cpa"
+        "Engine"
       ]
     }
   ],
@@ -21,7 +21,7 @@
   },
   "containers": [
     {
-      "class_name": "Cpa",
+      "class_name": "Engine",
       "image": "./container/Dockerfile",
       "image_build_context": "./container",
       "instance_type": "basic",
@@ -31,15 +31,15 @@
   "durable_objects": {
     "bindings": [
       {
-        "name": "CPA",
-        "class_name": "Cpa"
+        "name": "ENGINE",
+        "class_name": "Engine"
       }
     ]
   },
   "r2_buckets": [
     {
       "binding": "STATE",
-      "bucket_name": "sub2api-preview-isolated"
+      "bucket_name": "gateway-preview-state"
     }
   ],
   "ratelimits": [

@@ -9,7 +9,7 @@ const worker = new Miniflare(convertV4MiniflareOptions({
   modules: [{ type: "ESModule", path: artifact }, ...(await readdir(base, { recursive: true })).filter(path => path.endsWith(".wasm")).map(path => ({ type: "CompiledWasm", path: resolve(base, path) }))],
   modulesRoot: base, compatibilityDate: "2026-10-01", cf: false,
   bindings: { PREVIEW_ACCESS_AUD: "b".repeat(64), ACCESS_AUD: "b".repeat(64), DASHBOARD_AUTH: "cloudflare" },
-  durableObjects: { CPA: { className: "Cpa", useSQLite: true } }, r2Buckets: ["STATE"],
+  durableObjects: { ENGINE: { className: "Engine", useSQLite: true } }, r2Buckets: ["STATE"],
   ratelimits: { LOGIN_LIMIT: { namespace_id: "1101", simple: { limit: 5, period: 60 } } },
 }));
 try {

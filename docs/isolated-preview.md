@@ -131,3 +131,15 @@ Cloudflare commands are `node scripts/preview-builds.mjs build` and
 pipeline rejects mismatched Worker name/tag and stale branch heads before deployment.
 A push of this change exercises the actual automatic trigger. Successful GitHub CI
 and artifact publication alone do not establish successful Cloudflare deployment.
+
+## Branding correction
+
+The running first Cloudflare build was cancelled before deployment to correct the
+preview infrastructure names. The same isolated Worker identity is now named
+`gateway-preview` and its private state bucket is `gateway-preview-state`.
+Access is named `Gateway preview`; scope, audience and 24-hour owner policy remain.
+The deployed class/binding names are Engine/ENGINE; only the private adapter keeps
+the existing internal gateway contract. Production names/state are not changed.
+The previous empty preview bucket remains unbound, not silently deleted.
+The existing stored build token label and repository provenance are not changed
+because they are shared with production. No branding claim removes license duties.

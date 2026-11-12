@@ -15,7 +15,7 @@ test("prepared artifact keeps isolated bindings and prebuilt wrapper", async () 
   const config = previewArtifactConfig(source);
   assert.equal(config.main, "./worker/preview.js");
   assert.equal(config.no_bundle, true);
-  assert.equal(config.name, "sub2api-preview-isolated");
+  assert.equal(config.name, "gateway-preview");
   assert.equal(config.previews, undefined);
   assert.deepEqual(config.r2_buckets, source.r2_buckets);
   assert.match(config.containers[0].image, /@sha256:/);
