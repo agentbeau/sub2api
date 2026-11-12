@@ -15,7 +15,10 @@ const run = process.env.GITHUB_RUN_ID ?? String(Date.now());
 const attempt = process.env.GITHUB_RUN_ATTEMPT ?? "1";
 if (!/^[a-f0-9]{40}$/.test(revision) || !/^\d+$/.test(run) || !/^\d+$/.test(attempt)) throw new Error("Invalid build identity");
 const image = `sub2api-cpa:${revision.slice(0, 12)}-${run}-${attempt}`;
-const args = ["build", "--pull", "--platform", "linux/amd64", "--tag", image, "--label", `org.opencontainers.image.revision=${revision}`];
+const network = process.env.SUB2API_DOCKER_NETWORK ?? "bridge";
+if (!["bridge", "host"].includes(network)) throw new Error("SUB2API_DOCKER_NETWORK must be bridge or host");
+const args = ["build", "--load", "--pull", "--platform", "linux/amd64", "--tag", image, "--label", `org.opencontainers.image.revision=${revision}`];
+if (network === "host") args.push("--network", "host");
 for (const name of ["CPA_VERSION", "PANEL_VERSION", "PANEL_SHA256"]) {
   const value = process.env[name];
   if (value) args.push("--build-arg", `${name}=${value}`);
