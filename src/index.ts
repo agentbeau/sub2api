@@ -2,38 +2,52 @@ import type { Env } from "./env.ts";
 import { handle } from "./gateway.ts";
 import { serveDashboard } from "./dashboard.ts";
 import { classify } from "./routes.ts";
+import { accessRequired, crossOriginWrite, dashboardAccess, isBrowserRoute, withoutAccessCredentials, type NativeAccessContext } from "./access.ts";
 
 export { Cpa, R2Bridge } from "./cpa.ts";
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
-type EdgeEnv = Pick<Env, "DASHBOARD_PASSWORD" | "LOGIN_LIMIT" | "STATE"> & {
+type EdgeEnv = Pick<Env, "DASHBOARD_PASSWORD" | "DASHBOARD_AUTH" | "ACCESS_AUD" | "LOGIN_LIMIT" | "STATE"> & {
   readonly CPA: DurableObjectNamespace;
 };
 
 export default {
-  fetch(request: Request, env: EdgeEnv) {
+  fetch(request: Request, env: EdgeEnv, ctx?: ExecutionContext): Response | Promise<Response> {
     const forward = (forwarded: Request) => env.CPA.getByName("cf-singleton-container").fetch(forwarded);
     const path = new URL(request.url).pathname;
+    const route = classify(path);
+    const authenticated = dashboardAccess(env, ctx as (ExecutionContext & NativeAccessContext) | undefined);
+    if (authenticated !== undefined && isBrowserRoute(route)) {
+      if (!authenticated) return accessRequired();
+      if (crossOriginWrite(request)) {
+        return Response.json({ error: "Use a same-origin authenticated request." }, {
+          status: 403, headers: { "cache-control": "no-store" },
+        });
+      }
+    }
     const config = {
       dashboardPassword: env.DASHBOARD_PASSWORD ?? "", nowSeconds,
+      dashboardAccess: authenticated,
       apiAccess: { authorize: async () => "unavailable" as const, invalidate() {} },
       loginLimiter: env.LOGIN_LIMIT,
     };
     if (path === "/management.html" || path === "/provider-panel.html") {
-      return handle(request, config, (authenticated) => serveDashboard(authenticated, env.STATE));
+      return handle(request, config, (authorized) => serveDashboard(authorized, env.STATE));
     }
-    switch (classify(path)) {
+    switch (route) {
       case "health":
       case "home":
       case "login":
       case "logout":
       case "blocked":
-        // These routes use no provider state. Avoid a DO round trip and do not refresh its
-        // activity merely because a monitor checked liveness or a browser opened the sign-in.
         return handle(request, config, forward);
       default:
-        // API, management, control, callback and explicit readiness requests retain the
-        // original singleton. Its admission and lifecycle decide whether CPA may start.
+        // Access context does not propagate through a Durable Object fetch.
+        // Carry the verified decision over a private, typed RPC, not a header.
+        // Public API requests always retain their independent client-key checks.
+        if (authenticated === true && isBrowserRoute(route)) {
+          return (env.CPA as Env["CPA"]).getByName("cf-singleton-container").fetchWithAccess(withoutAccessCredentials(request));
+        }
         return forward(request);
     }
   },

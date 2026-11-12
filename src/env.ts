@@ -6,5 +6,7 @@ export interface Env {
   readonly LOGIN_LIMIT: RateLimit;
   readonly MANAGEMENT_KEY?: string;
   readonly DASHBOARD_PASSWORD?: string;
+  readonly DASHBOARD_AUTH?: string;
+  readonly ACCESS_AUD?: string;
   readonly CONTAINER_IDLE_TIMEOUT_MS?: string;
 }

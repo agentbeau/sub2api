@@ -40,6 +40,7 @@ pub fn handle_gateway(
     authorize_api: Function,
     invalidate_api_access: Function,
     limit_login: Function,
+    dashboard_access: Option<bool>,
 ) -> Promise {
     let gateway = Gateway {
         password,
@@ -48,6 +49,7 @@ pub fn handle_gateway(
         authorize_api,
         invalidate_api_access,
         limit_login,
+        dashboard_access,
     };
     match dispatch(request, gateway) {
         Ok(response) => response,
@@ -57,7 +59,15 @@ pub fn handle_gateway(
 
 fn dispatch(request: Request, gateway: Gateway) -> Result<Promise, JsValue> {
     let url = Url::new(&request.url())?;
-    match classify_path(&url.pathname()) {
+    let route = classify_path(&url.pathname());
+    // This decision comes from native platform Access context, never a header.
+    // Configured Access replaces password sessions; it is not an extra unlock.
+    if gateway.dashboard_access == Some(false)
+        && matches!(route, "home" | "login" | "logout" | "dashboard" | "oauth-callback")
+    {
+        return resolved(api_error(401, "authentication_error", "Cloudflare login required."));
+    }
+    match route {
         "api" => gateway.api(request),
         "health" => resolved(response(
             Some(r#"{"status":"ok"}"#),
@@ -86,6 +96,9 @@ fn dispatch(request: Request, gateway: Gateway) -> Result<Promise, JsValue> {
             },
             None,
         )),
+        "login" if gateway.dashboard_access.is_some() => {
+            resolved(redirect("/management.html", None))
+        }
         "login" => match request.method().as_str() {
             "POST" => Ok(future_to_promise(async move {
                 gateway.login(&request).await.map(JsValue::from)
@@ -101,7 +114,7 @@ fn dispatch(request: Request, gateway: Gateway) -> Result<Promise, JsValue> {
             _ => resolved(not_found()),
         },
         "logout" => resolved(redirect(
-            "/login",
+            if gateway.dashboard_access.is_some() { "/cdn-cgi/access/logout" } else { "/login" },
             Some(&format!(
                 "{SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"
             )),
@@ -139,6 +152,7 @@ struct Gateway {
     authorize_api: Function,
     invalidate_api_access: Function,
     limit_login: Function,
+    dashboard_access: Option<bool>,
 }
 
 impl Gateway {
@@ -155,6 +169,9 @@ impl Gateway {
     }
 
     fn signed_in(&self, request: &Request) -> Result<bool, JsValue> {
+        if let Some(authenticated) = self.dashboard_access {
+            return Ok(authenticated);
+        }
         if !self.password_configured() {
             return Ok(false);
         }
@@ -242,7 +259,7 @@ impl Gateway {
             return html(
                 &message_page(
                     "Login received",
-                    "sub2api is saving this login. Go back to the dashboard to see it.",
+                    "the gateway is saving this login. Go back to the dashboard to see it.",
                     false,
                 ),
                 200,

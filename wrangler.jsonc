@@ -7,7 +7,11 @@
   "routes": [{ "pattern": "api.agentbeau.dev", "custom_domain": true }],
   "observability": { "enabled": true, "traces": { "enabled": true, "head_sampling_rate": 0.01 } },
   "build": { "command": "npm run build" },
-  "vars": { "CONTAINER_IDLE_TIMEOUT_MS": "1000" },
+  "vars": {
+    "CONTAINER_IDLE_TIMEOUT_MS": "1000",
+    "DASHBOARD_AUTH": "cloudflare",
+    "ACCESS_AUD": "a6acab2578806d53309922d135ad923c92c9071cbe22f34677ed763c09951170"
+  },
   "containers": [
     {
       "name": "sub2api",

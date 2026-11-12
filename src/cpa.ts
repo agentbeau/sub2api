@@ -1,4 +1,5 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { accessRequired, crossOriginWrite } from "./access.ts";
 import { BackgroundActivity, handleBackgroundActivity, type BackgroundAction } from "./background-activity.ts";
 import { publicProviderResponse } from "./branding.ts";
 import { ContainerLifecycle, containerUnavailable } from "./container-lifecycle.ts";
@@ -32,7 +33,7 @@ function hasManagementCredential(request: Request): boolean {
 }
 
 // The native console is served at the edge. Its real management requests use
-// the existing session and native management authentication, without a UI gate.
+// the verified browser identity and native management authentication, without a UI gate.
 export class Cpa extends DurableObject<Env> {
   private readonly keyGuard: KeyGuard;
   private readonly lifecycle: ContainerLifecycle | undefined;
@@ -122,6 +123,25 @@ export class Cpa extends DurableObject<Env> {
   }
 
   override fetch(request: Request): Promise<Response> {
+    // An ordinary fetch never inherits an Access identity from headers or cookies.
+    return this.#dispatch(request, false);
+  }
+
+  // Private binding RPC used only after the public Worker checks ctx.access.aud.
+  // There is no corresponding public URL, token header, or persistent auth flag.
+  fetchWithAccess(request: Request): Promise<Response> {
+    if (this.env.DASHBOARD_AUTH !== "cloudflare" || !this.env.ACCESS_AUD) {
+      return Promise.resolve(accessRequired());
+    }
+    if (crossOriginWrite(request)) {
+      return Promise.resolve(Response.json({ error: "Use a same-origin authenticated request." }, {
+        status: 403, headers: { "cache-control": "no-store" },
+      }));
+    }
+    return this.#dispatch(request, true);
+  }
+
+  #dispatch(request: Request, accessAuthenticated: boolean): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
     const route = classify(path);
@@ -134,6 +154,7 @@ export class Cpa extends DurableObject<Env> {
       request,
       {
         dashboardPassword: this.env.DASHBOARD_PASSWORD ?? "",
+        dashboardAccess: this.env.DASHBOARD_AUTH === undefined ? undefined : accessAuthenticated,
         nowSeconds,
         apiAccess: {
           authorize: async (candidate) => {
@@ -154,7 +175,7 @@ export class Cpa extends DurableObject<Env> {
           if (request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
           return publicProviderResponse(await (this.lifecycle?.forward(forwarded) ?? containerUnavailable()));
         }
-        // This callback is reached only after the existing dashboard session gate.
+        // This callback is reached only after browser authentication.
         // Let the native server validate management credentials instead of duplicating
         // its authentication at the edge. An invalid management key can therefore wake
         // the server; missing credentials, status polls and stale callbacks cannot.
