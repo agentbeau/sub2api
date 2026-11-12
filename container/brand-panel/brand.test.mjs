@@ -83,3 +83,18 @@ test("refuses changed upstream structure rather than silently shipping a partial
   assert.throws(() => brandPanel(fixture("var invalid = ;")), /JavaScript/);
   assert.throws(() => brandPanel("not an HTML dashboard"), /dashboard/);
 });
+
+
+test("removes project repository placeholders without changing configured URLs", () => {
+  const repo = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center";
+  const result = brandPanel(fixture(`
+var field={fieldId:'rmPanelRepo',placeholder:${JSON.stringify(repo)},value:${JSON.stringify(repo)}};
+var quoted={'placeholder':'https://github.com/agentbeau/sub2api'};
+var unrelated={placeholder:'https://provider.example/endpoint'};
+`));
+  const context = evaluate(result.html);
+  assert.equal(context.field.placeholder, "");
+  assert.equal(context.quoted.placeholder, "");
+  assert.equal(context.field.value, repo);
+  assert.equal(context.unrelated.placeholder, "https://provider.example/endpoint");
+});
