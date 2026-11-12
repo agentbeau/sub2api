@@ -17,12 +17,14 @@ the gateway. This is additional protection, not a replacement for an owner-only 
 2. Create a blank private bucket `sub2api-preview-isolated`. Do not copy provider auth files,
    production client keys, pending imports or dashboard sessions. Set a new preview-only
    management secret through Wrangler's preview-secret interface, never Git or plain vars.
-3. Supply a separate preview build/deploy entrypoint. It must compile Rust using the repository's
-   pinned toolchain, run the full CI checks, build and smoke-test the container, retain the
-   tested image digest, publish its checksummed dashboard **only to the preview bucket**, and
-   deploy via `wrangler preview --name isolated --config wrangler.preview.jsonc` using that
-   exact tested image. The supplied config names a Dockerfile as preparation, not permission
-   to rebuild an untested image in a credential-bearing deploy phase.
+3. Configure separate commands `node scripts/preview-builds.mjs build` and
+   `node scripts/preview-builds.mjs deploy`, with `SKIP_DEPENDENCY_INSTALL=1`. The executor
+   must have the pinned Rust/wasm-bindgen tools (see existing CI setup) and Docker. The
+   entrypoint fails preflight without them. It builds and verifies source token-free, smoke-tests
+   the exact image, packages and probes the compiled preview, then records checksummed artifacts.
+   Deploy verifies that same build receipt, loads/pushes only the tested image, publishes its
+   dashboard only to the preview bucket, and invokes `wrangler preview` using its image digest.
+   It never runs the production deploy script or recompiles upstream code with deployment credentials.
 4. Run `WORKERS_CI_BRANCH=dagul/isolated-worker-preview node scripts/preview-guard.mjs` before
    provisioning/deploying. It intentionally fails while the owner audience is unconfigured.
    Restrict automatic activation to this branch in the new entrypoint. Only then configure
@@ -58,3 +60,9 @@ same source revision before claiming automatic preview deployment works.
 - https://developers.cloudflare.com/workers/ci-cd/builds/build-branches/
 - https://developers.cloudflare.com/workers/ci-cd/builds/api-reference/
 - https://developers.cloudflare.com/workers/configuration/cloudflare-access/
+
+## Provisioning record
+
+Blank private R2 bucket `sub2api-preview-isolated` created November 12, 2026. No production objects or credentials copied. Access application, secrets, and Builds activation remain pending.
+
+Builds pricing: Paid plans include 6,000 minutes/month, then $0.005/minute. See https://developers.cloudflare.com/workers/ci-cd/builds/limits-and-pricing/ . The account availability API returned an empty result, so remaining allowance is unverified.
