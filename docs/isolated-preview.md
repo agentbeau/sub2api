@@ -80,3 +80,39 @@ forged-identity denial probes. Preview deployment is still inactive: the documen
 Cloudflare build image does not list Rust, wasm-bindgen or Docker. The independent
 source-building pipeline must not be activated until that prerequisite is proven or
 replaced by a verified CI-artifact consumer. Passing CI is not proof of live deployment.
+
+## Exact-artifact preview pipeline
+
+The preview pipeline now consumes GitHub CI outputs rather than compiling Rust or
+rebuilding the provider image in Cloudflare. `ci.yml` runs on the exact preview
+branch push and publishes a separate `isolated-preview` artifact after its compiled
+Access-boundary tests. A separate read-only validation job waits for that exact
+successful run before a write-capable publisher copies its original ZIP bytes.
+The publisher does not run npm, the provider build, or deployment credentials.
+
+Both publisher and consumer independently verify repository IDs, workflow path/ID,
+branch, full commit SHA, successful push run, attempt, original Actions artifact
+IDs/sizes/SHA-256 digests, release tag commit and manifest file hashes. Preview
+release tags use `sub2api-preview-ci-` and never substitute production artifacts.
+Cloudflare still needs Docker at deployment to load/push the tested image, as does
+the existing production pipeline; no new image build is performed there.
+
+Activation remains pending a deployment credential. The existing production build
+token is not silently reused for this branch. Single-Worker token roles include
+both production and previews, so native preview activation requires approval of
+that authority or a separate Worker design. R2 state remains separate and blank.
+
+## Separate Worker approved and provisioned
+
+The owner chose a separate Worker rather than native previews of production.
+`sub2api-preview-isolated` has been created with a deny-all placeholder. Its separate
+Access application now protects this Worker, retaining owner email AND account
+membership and a 24-hour session. The preview audience is unchanged. No production
+Access or Worker settings changed. The prepared artifact now targets only that
+separate Worker with its own Durable Object namespace, container and R2 bucket.
+Its source branch remains `dagul/isolated-worker-preview`.
+
+Do not activate build credentials until their resource scopes have been verified.
+The API lists single-Worker roles as not selectable for this connection; the
+existing user build-token policy cannot be inspected through OAuth (HTTP403).
+The preview application is not deployed merely because the deny-all shell exists.

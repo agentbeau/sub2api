@@ -26,8 +26,8 @@ export function previewArtifactConfig(source) {
   config.no_bundle = true;
   config.find_additional_modules = true;
   config.rules = [{ type: "ESModule", globs: ["**/*.js"], fallthrough: false }, { type: "CompiledWasm", globs: ["**/*.wasm"], fallthrough: false }];
-  config.previews.containers[0].image = PREPARED_IMAGE;
-  delete config.previews.containers[0].image_build_context;
+  config.containers[0].image = PREPARED_IMAGE;
+  delete config.containers[0].image_build_context;
   return config;
 }
 export async function runPreviewPhase(phase, { root = ROOT, env = process.env, execute = execFileSync, fetcher = fetch } = {}) {
@@ -81,13 +81,13 @@ export async function runPreviewPhase(phase, { root = ROOT, env = process.env, e
   run(wrangler, ["containers", "push", manifest.image], deployEnv);
   const remote = `registry.cloudflare.com/${metadata.account}/${manifest.image}`;
   const digests = JSON.parse(run("docker", ["image", "inspect", "--format", "{{json .RepoDigests}}", remote], clean, true));
-  config.previews.containers[0].image = imageDigest(digests, metadata.account, manifest.image);
+  config.containers[0].image = imageDigest(digests, metadata.account, manifest.image);
   const deployConfig = join(worker, "deploy.json");
   try {
     checkSource();
     run(wrangler, ["r2", "object", "put", `${BUCKET}/${DASHBOARD_OBJECT_KEY}`, "--file", join(image, DASHBOARD_PANEL_FILE), "--content-type", "text/html; charset=utf-8", "--remote"], deployEnv);
     await writeFile(deployConfig, JSON.stringify(config), { flag: "wx" });
-    run(wrangler, ["preview", "--name", "isolated", "--no-bundle", "--config", deployConfig], deployEnv);
+    run(wrangler, ["deploy", "--no-bundle", "--config", deployConfig], deployEnv);
   } finally { await rm(deployConfig, { force: true }); }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await runPreviewPhase(process.argv[2]);

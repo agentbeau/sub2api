@@ -1,27 +1,55 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "sub2api",
+  "name": "sub2api-preview-isolated",
   "main": "src/preview.ts",
   "compatibility_date": "2026-10-01",
-  "workers_dev": false,
+  "workers_dev": true,
   "routes": [],
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Cpa"] }],
-  "previews": {
-    "vars": {
-      "CONTAINER_IDLE_TIMEOUT_MS": "1000",
-      "DASHBOARD_AUTH": "cloudflare",
-      "ACCESS_AUD": "1b72b8d862e131791fa2a4803ac3095c979528e3c8cf7eb1b838402989592683",
-      "PREVIEW_ACCESS_AUD": "1b72b8d862e131791fa2a4803ac3095c979528e3c8cf7eb1b838402989592683"
-    },
-    "containers": [{
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "Cpa"
+      ]
+    }
+  ],
+  "vars": {
+    "CONTAINER_IDLE_TIMEOUT_MS": "1000",
+    "DASHBOARD_AUTH": "cloudflare",
+    "ACCESS_AUD": "1b72b8d862e131791fa2a4803ac3095c979528e3c8cf7eb1b838402989592683",
+    "PREVIEW_ACCESS_AUD": "1b72b8d862e131791fa2a4803ac3095c979528e3c8cf7eb1b838402989592683"
+  },
+  "containers": [
+    {
       "class_name": "Cpa",
       "image": "./container/Dockerfile",
       "image_build_context": "./container",
       "instance_type": "basic",
       "max_instances": 1
-    }],
-    "durable_objects": { "bindings": [{ "name": "CPA", "class_name": "Cpa" }] },
-    "r2_buckets": [{ "binding": "STATE", "bucket_name": "sub2api-preview-isolated" }],
-    "ratelimits": [{ "name": "LOGIN_LIMIT", "namespace_id": "1101", "simple": { "limit": 5, "period": 60 } }]
-  }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CPA",
+        "class_name": "Cpa"
+      }
+    ]
+  },
+  "r2_buckets": [
+    {
+      "binding": "STATE",
+      "bucket_name": "sub2api-preview-isolated"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "LOGIN_LIMIT",
+      "namespace_id": "1101",
+      "simple": {
+        "limit": 5,
+        "period": 60
+      }
+    }
+  ]
 }
