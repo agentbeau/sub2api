@@ -83,10 +83,13 @@ export async function runPreviewPhase(phase, { root = ROOT, env = process.env, e
   if (!bucketResponse.ok || (await bucketResponse.json()).success !== true) throw new Error("Private preview bucket must be provisioned before deployment");
   run("docker", ["image", "load", "--input", join(image, "image.tar.gz")]);
   if (run("docker", ["image", "inspect", "--format", "{{.Id}}", manifest.image], clean, true).trim() !== manifest.imageId) throw new Error("Loaded image differs from tested image");
-  run(wrangler, ["containers", "push", manifest.image], deployEnv);
-  const remote = `registry.cloudflare.com/${metadata.account}/${manifest.image}`;
+  const neutralImage = `gateway-engine:${manifest.image.split(":")[1]}`;
+  run("docker", ["tag", manifest.image, neutralImage]);
+  if (run("docker", ["image", "inspect", "--format", "{{.Id}}", neutralImage], clean, true).trim() !== manifest.imageId) throw new Error("Retagged image differs from tested image");
+  run(wrangler, ["containers", "push", neutralImage], deployEnv);
+  const remote = `registry.cloudflare.com/${metadata.account}/${neutralImage}`;
   const digests = JSON.parse(run("docker", ["image", "inspect", "--format", "{{json .RepoDigests}}", remote], clean, true));
-  config.containers[0].image = imageDigest(digests, metadata.account, manifest.image);
+  config.containers[0].image = imageDigest(digests, metadata.account, neutralImage);
   const deployConfig = join(worker, "deploy.json");
   try {
     checkSource();
