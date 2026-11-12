@@ -11,7 +11,7 @@ The gateway uses Cloudflare's native Container API. Its normal idle timeout is *
 
 | Component | Runtime | Responsibility |
 |---|---|---|
-| Public gateway | Rust compiled to Wasm in Workers | Route policy, dashboard login, HMAC sessions and access decisions |
+| Public gateway | Rust compiled to Wasm in Workers | Route policy and dashboard access decisions; legacy password sessions remain available outside Access mode |
 | Cloudflare adapter | Small TypeScript platform layer | Bindings, streaming I/O and native container lifecycle |
 | Provider engine | Upstream Go CPA in a Linux container | Provider logins, token refresh, model protocols, translation, usage and quotas; a small lifecycle patch reports active background work |
 | Durable state | Existing R2 bucket | Configuration and OAuth credentials across sleep and deployment |
@@ -24,9 +24,9 @@ Provider execution remains in CPA. Bypassing it merely because a model has an AP
 
 ### Rewrite and branding scope
 
-The public gateway is rewritten in Rust/WebAssembly. The provider engine remains the upstream Go implementation in its container; this is not a claim that all provider protocols have been rewritten. The dashboard and public messages use **sub2api** branding. A checked build transform changes the inner panel's title, product logo, visible translations, project links and metadata-header readers. It preserves provider protocol strings, source licenses and actual plugin-publisher identities. The Node/TypeScript branding tools run only during the build and are absent from the container runtime.
+The public gateway is rewritten in Rust/WebAssembly. The provider engine remains the upstream Go implementation in its container; this is not a claim that all provider protocols have been rewritten. The deployed dashboard and public messages are neutral: **Console** / **Sign in**, without application branding. A checked build transform changes the inner panel's title, product logo, visible translations, project links and metadata-header readers. It preserves provider protocol strings, source licenses and actual plugin-publisher identities. The Node/TypeScript branding tools run only during the build and are absent from the container runtime.
 
-The established Cloudflare class/binding names `Cpa`/`CPA`, migration `v1`, singleton and saved configuration formats remain compatibility identities. Renaming them for appearance could create a new state namespace or break a rolling deployment. Public provider metadata uses `X-Sub2api-Engine-*` headers, with the dashboard's readers updated together. See [third-party notices](THIRD_PARTY_NOTICES.md) for retained source attribution.
+The established Cloudflare class/binding names `Cpa`/`CPA`, migration `v1`, singleton and saved configuration formats remain compatibility identities. Renaming them for appearance could create a new state namespace or break a rolling deployment. Public provider metadata uses `X-Engine-*` headers, with the dashboard's readers updated together. See [third-party notices](THIRD_PARTY_NOTICES.md) for retained source attribution.
 
 See [architecture and migration decisions](docs/architecture.md) and [performance measurements](docs/performance.md).
 
@@ -49,15 +49,17 @@ The workerd smoke test does not prove Cloudflare has stopped a production contai
 
 ## Continuous deployment
 
+The existing `api.agentbeau.dev` installation uses Cloudflare Workers Builds and Cloudflare account login. See [dashboard sign-in](docs/dashboard-access.md) and [Workers Builds](docs/cloudflare-builds.md) for its current setup. Do not enable a second automatic deployer. The GitHub workflow steps below describe the alternative install/deploy path, not an instruction to reconfigure this running installation. The checked-in hostname and Access audience are installation-specific; a new installation must configure its own matching Access application before using Access mode. Setting a dashboard password alone does not enable password login while `DASHBOARD_AUTH=cloudflare`.
+
 The main install requires a Cloudflare account with Containers enabled and the appropriate Workers plan. See [Containers availability and limits](https://developers.cloudflare.com/containers/platform-details/limits/) and [pricing](https://developers.cloudflare.com/containers/pricing/) for current requirements.
 
 1. Enable GitHub Actions in this fork.
 2. Add repository secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` for the intended account. The token needs the permissions required to deploy Workers, Containers/registry images and the R2 bucket.
 3. For a **new installation**, also add `SUB2API_DASHBOARD_PASSWORD` and `SUB2API_MANAGEMENT_KEY`. Use different random strings, each at least 32 characters of `A-Z a-z 0-9 _ -`; `openssl rand -hex 32` generates a suitable value. These runtime secrets are supplied only to deployment, never to builds or uploaded artifacts.
 4. Run **deploy container** manually once. It runs the verification pipeline, then installs the Rust gateway and tested provider image.
-5. Open your `sub2api.<account-subdomain>.workers.dev` URL, sign in, select **Start controls**, and add an API key in the provider panel. Viewing the dashboard alone does not start the container.
+5. Open your gateway's `/management.html`, sign in using its configured dashboard authentication, then enter the native management key in the console and add a client API key. The static console does not start the container; authenticated native management requests carrying a management credential can start it directly. There is no **Start controls** or **Extend controls** button.
 
-After installation, each successful `ci` run for the current `main` revision deploys that same tested revision. A weekly run checks and rebuilds the upstream provider image through the same pipeline. Both install variants share a production deployment lock and refuse to overwrite the other variant. A new install is manual; normal pushes do not choose a different architecture for you.
+After installation, each successful `ci` run for the current `main` revision deploys that same tested revision. A weekly run rebuilds the selected provider version through the same pipeline. The default is pinned to v8.0.67; upgrading requires an explicit reviewed `CPA_VERSION` change. Both install variants share a production deployment lock and refuse to overwrite the other variant. A new install is manual; normal pushes do not choose a different architecture for you.
 
 CI builds and smoke-tests the provider image **once**, saves it and its exact dashboard HTML with checksums, and deploys its immutable Cloudflare registry digest. It also packages the verified Worker/Wasm modules once. Deployment uploads the checked panel to R2 before publishing the Worker. It rejects altered artifacts, dirty source provenance and obsolete commits instead of silently rebuilding something different. No Cloudflare credentials are passed to package installation or the upstream image build. The small provider lifecycle patch checks the expected upstream source structure; an incompatible upstream update fails the build and leaves the existing deployment in place.
 
@@ -69,7 +71,7 @@ Existing installations keep their Cloudflare secrets when the optional runtime s
 
 For a manual production release, open **Actions → deploy container → Run workflow** on `main`, after setting the repository secrets above. This runs the same verification and artifact checks as continuous deployment. It extracts the dashboard from the tested provider image, uploads it to `sub2api/dashboard/management.html`, and then deploys the Worker and immutable image.
 
-For a local or connector deployment, follow [the prepared artifact and static panel steps](scripts/DEPLOYMENT.md). The panel must be uploaded before activating Worker code that serves it from R2; `wrangler deploy` alone does not provision that object. Existing installations retain their current secrets, R2 state, Durable Object namespace and migration tag. Serving the dashboard does not start CPA; connecting to the provider is an explicit dashboard action.
+For a local or connector deployment, follow [the prepared artifact and static panel steps](scripts/DEPLOYMENT.md). The panel must be uploaded before activating Worker code that serves it from R2; `wrangler deploy` alone does not provision that object. Existing installations retain their current secrets, R2 state, Durable Object namespace and migration tag. Serving the static dashboard does not start CPA; native management requests with a supplied management credential can start it after dashboard authentication.
 
 [Cloudflare Workers Builds](docs/cloudflare-builds.md) can handle continuous deployment using an existing Cloudflare build token, without GitHub deployment secrets. GitHub CI publishes its exact passed Worker/image ZIPs as run-specific public Release assets; the Cloudflare wrapper verifies their original artifact digests and deploys those bytes, including the static panel upload. The full image smoke remains in GitHub CI, with no image rebuild in Cloudflare. Keep only one automatic production deployer enabled.
 
@@ -82,7 +84,7 @@ CPA has work that continues after an HTTP reply, so the effective timeout also a
 | Situation | Temporary protection |
 |---|---|
 | Normal idle period after a model request | Configured timeout, one second by default |
-| Explicit **Start controls** or **Extend controls** action | A two-minute editing window; dashboard views and status polls do not renew it |
+| Legacy `POST /runtime/start` compatibility endpoint | A two-minute editing hold; the current console does not call or depend on it, and status polls do not renew it |
 | Pending provider sign-in | Provider expiry plus a 60-second completion buffer; six minutes for a known callback flow without an expiry, up to 31 minutes for device, plugin or unidentified flows |
 | Successful settings or credential mutation | A 35-second grace period while asynchronous persistence starts and finishes |
 | Issued temporary realtime credential | Its absolute native expiry, plus a one-second rounding margin; ten minutes by default and at most two hours |
@@ -101,21 +103,23 @@ API forwarding also requires a separate `frontend_auth_protocol: 1` marker. The 
 | `GET /healthz` | Public gateway is responsive | No |
 | Dashboard HTML and provider-panel HTML | Signed-in, edge-served user interface | No |
 | `GET /runtime/status` | Signed-in status without provider startup | No |
-| Management API and signed-in OAuth callback | Use an already-running provider; return 503 if asleep | No |
+| Signed-in native management API with a supplied management credential | Start on demand; CPA validates the management key | Yes, if asleep, even if CPA later rejects the key |
+| Management API without a credential, or signed-in OAuth callback | Use an already-running provider when admitted; cannot recreate lost in-memory state | No |
+| Passive same-origin console model-catalog GET/HEAD | Read through the normal API-key checks without startup | No |
 | Missing/invalid static API key or known unsupported API route/method | Rejected from saved configuration and route policy | No |
-| `POST /runtime/start` | Signed-in, same-origin explicit controls action | Yes, if asleep |
+| `POST /runtime/start` | Legacy signed-in, same-origin compatibility endpoint; unused by the current console | Yes, if asleep |
 | Accepted model/API request | Native provider request | Yes, if asleep |
 | `GET /readyz` | CPA is ready to accept requests | Yes, if asleep |
 
 Use `/healthz` for frequent availability checks. Polling `/readyz` keeps exercising CPA and undermines idle savings. The timeout begins when the Durable Object becomes inactive, not at a fixed interval after the last HTTP request. Deployment and platform failures can still interrupt active connections.
 
-The dashboard opens provider controls only after an explicit start. **Close controls** unloads the panel and releases its editing window; it does not stop active model responses, pending provider sign-ins or saving work. Direct management polling cannot restart a sleeping container. This uses Cloudflare's native `container.running`, `start`, TCP forwarding and inactivity timeout APIs.
+The dashboard serves the native console directly, without a wrapper, countdown, extra unlock page or editing-window controls. After dashboard authentication, native management calls with a supplied management credential can wake CPA, including polling performed by the native console. Missing management credentials, legacy status checks and stale OAuth callbacks do not start it. An incorrect management key can wake CPA before CPA rejects it; the gateway does not duplicate native management-key validation. Legacy `/runtime/start` and `/runtime/stop` remain for already-open older clients; stopping that editing hold does not stop active responses, provider sign-ins or persistence. This uses Cloudflare's native `container.running`, `start`, TCP forwarding and inactivity timeout APIs.
 
 Static API credentials are checked against the current R2 configuration before startup, with no random-key probe. During an in-progress settings save, a bounded fallback may ask the already-running provider to validate a newly changed key. Enabled authentication plugins can require the provider runtime to decide access; those requests retain automatic native startup. A valid request can still fail after startup because of its body, model, provider credentials, quota or an upstream error. The gateway does not promise that every unsuccessful response can be predicted without running the provider.
 
 ## Connect a subscription
 
-1. Select **Start controls**, then open **OAuth login** in the provider panel and choose the provider. Use **Extend controls** if you need longer to edit; a pending provider sign-in has its own activity protection.
+1. Open `/management.html`, complete dashboard sign-in, and supply the native management key. Open **OAuth login** in the native console and choose the provider. Its authenticated management request can start CPA automatically; pending provider sign-in has its own activity protection.
 2. Complete the provider's sign-in.
 3. If the provider redirects to an unavailable localhost page, paste that URL into the dashboard's **Callback URL** field, or replace its localhost origin with your gateway origin and open it in the same signed-in browser.
 
