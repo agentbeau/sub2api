@@ -1,8 +1,7 @@
 #!/bin/sh
-# Builds the CPA image and runs it against the Worker's S3 shim (src/s3.ts) served by Node:
-# management, branded panel, an API key saved the way the dashboard saves it, empty-provider
-# authentication rejection, the config surviving a restart from the bucket, and
-# a first start that takes a config and logins moved from the Workers-only install.
+# Builds the provider image and runs it against the Worker's S3 shim served by Node.
+# Checks management, neutral panel, dashboard-saved keys, empty-provider rejection,
+# durable config, background saves and imported state without deployment credentials.
 set -eu
 
 build=true
@@ -126,7 +125,7 @@ expect 401 -H "authorization: Bearer unconfigured-key" "$base/v1/models"
 expect 401 "$base/v8/management/config"
 expect 200 -H "$mgmt" "$base/v8/management/config"
 expect 200 "$base/management.html"
-curl --fail --silent "$base/management.html" | node -e 'const html=require("node:fs").readFileSync(0,"utf8"); if(!html.includes("<title>sub2api Console</title>") || html.includes("<title>CLI Proxy API")) process.exit(1)' || fail "provider image does not contain the branded dashboard"
+curl --fail --silent "$base/management.html" | node -e 'const html=require("node:fs").readFileSync(0,"utf8"); if(!html.includes("<title>Console</title>") || html.includes("<title>CLI Proxy API") || html.includes("<title>sub2api")) process.exit(1)' || fail "provider image does not contain the neutral dashboard"
 expect 204 -X POST "$S3_BASE/__delay-config-put"
 expect 200 -X PUT -H "$mgmt" -H "content-type: application/json" -d "[\"$CLIENT_KEY\"]" "$base/v8/management/config/access/api-keys"
 wait_for activity_pending
