@@ -12,7 +12,7 @@ type EdgeEnv = Pick<Env, "DASHBOARD_PASSWORD" | "DASHBOARD_AUTH" | "ACCESS_AUD" 
 };
 
 export default {
-  fetch(request: Request, env: EdgeEnv, ctx?: ExecutionContext) {
+  fetch(request: Request, env: EdgeEnv, ctx?: ExecutionContext): Response | Promise<Response> {
     const forward = (forwarded: Request) => env.CPA.getByName("cf-singleton-container").fetch(forwarded);
     const path = new URL(request.url).pathname;
     const route = classify(path);

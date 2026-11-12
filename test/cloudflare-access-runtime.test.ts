@@ -34,7 +34,9 @@ it("carries simulated native Access context through real workerd/Rust/RPC withou
     ratelimits: { LOGIN_LIMIT: { namespace_id: "1001", simple: { limit: 20, period: 60 } } },
   }));
   try {
-    const bucket = await worker.getR2Bucket("STATE");
+    // The pinned Miniflare bridge exposes generic RPC values to TypeScript.
+    // Use narrow external binding shapes; the operations still run in workerd.
+    const bucket = await worker.getR2Bucket("STATE") as unknown as Pick<R2Bucket, "put">;
     await bucket.put("dashboard/management.html", "<title>Console</title><main>native console</main>");
     for (const path of ["/login", "/management.html", "/runtime/status", "/v8/management/config"]) {
       const denied = await worker.dispatchFetch(`https://gateway.example${path}`, { redirect: "manual", headers: { "cf-access-jwt-assertion": "forged", cookie: "CF_Authorization=forged" } });
@@ -54,7 +56,7 @@ it("carries simulated native Access context through real workerd/Rust/RPC withou
     const status = await worker.dispatchFetch("https://gateway.example/runtime/status?test_context=valid");
     assert.equal(status.status, 200, "Verified context crosses the private RPC into the actual object");
     assert.deepEqual(await status.json(), { running: false, controls_remaining_ms: 0 });
-    const ns = await worker.getDurableObjectNamespace("CPA");
+    const ns = await worker.getDurableObjectNamespace("CPA") as unknown as DurableObjectNamespace;
     const stub = ns.get(ns.idFromName("cf-singleton-container"));
     const direct = await stub.fetch("https://gateway.example/runtime/status", { headers: { "cf-access-jwt-assertion": "forged", cookie: "CF_Authorization=forged" } });
     assert.equal(direct.status, 401, "A later ordinary fetch must not inherit an earlier RPC identity");
