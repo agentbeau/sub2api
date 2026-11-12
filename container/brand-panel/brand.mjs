@@ -81,6 +81,10 @@ function scriptBranding(source) {
         after = before.replace("x-cpa-", "x-engine-");
       } else if (UI_KEYS.has(before)) {
         after = UI_KEYS.get(before);
+      } else if (PRODUCT_REPOS.has(before) && ts.isPropertyAssignment(node.parent)
+        && node.parent.name.getText(ast).replace(/^['"]|['"]$/g, "") === "placeholder") {
+        // Clear a product-specific hint, never the user's configured source URL.
+        after = "";
       } else if (ts.isCallExpression(node.parent) && node.parent.expression.getText(ast) === "JSON.parse") {
         try { after = JSON.stringify(jsonLabels(JSON.parse(before))); } catch { /* Unrelated non-JSON arguments are not display data. */ }
       } else if (before.startsWith("https://")) {
