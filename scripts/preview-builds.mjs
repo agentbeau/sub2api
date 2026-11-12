@@ -4,8 +4,9 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildEnvironment } from "./cloudflare-builds.mjs";
+import { consumeCiArtifacts, verifyCiProvenance } from "./consume-preview-artifacts.mjs";
 import { validatePreview } from "./preview-guard.mjs";
-import { DASHBOARD_OBJECT_KEY, DASHBOARD_PANEL_FILE, imageDigest, PREPARED_IMAGE, sha256, sourceIdentity, verifyArtifact, verifyContainerImageArtifact, writeManifest } from "./deployment-artifact.mjs";
+import { DASHBOARD_OBJECT_KEY, DASHBOARD_PANEL_FILE, imageDigest, PREPARED_IMAGE, sha256, sourceIdentity, verifyArtifact, verifyContainerImageArtifact } from "./deployment-artifact.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BRANCH = "dagul/isolated-worker-preview";
@@ -51,34 +52,22 @@ export async function runPreviewPhase(phase, { root = ROOT, env = process.env, e
   if (phase === "build") {
     await rm(output, { recursive: true, force: true });
     await mkdir(worker, { recursive: true });
-    // Fail preflight before an expensive or partly configured build. See the pinned CI setup.
-    run("cargo", ["--version"]); run("wasm-bindgen", ["--version"]); run("docker", ["info"]);
     run("npm", ["ci"]);
-    run("npm", ["run", "verify"]);
     run(process.execPath, ["--test", "scripts/preview-guard.test.mjs", "scripts/preview-builds.test.mjs"]);
-    run(process.execPath, ["scripts/build-container-image.mjs", image]);
-    const temporary = join(output, "compile.json");
-    const compile = JSON.parse(JSON.stringify(source));
-    compile.main = join(root, source.main);
-    compile.previews.containers[0].image = join(root, "container/Dockerfile");
-    compile.previews.containers[0].image_build_context = join(root, "container");
-    try {
-      await writeFile(temporary, JSON.stringify(compile), { flag: "wx" });
-      run(wrangler, ["deploy", "--dry-run", "--containers-rollout", "none", "--config", temporary, "--outdir", join(worker, "worker")]);
-    } finally { await rm(temporary, { force: true }); }
-    await readFile(join(worker, "worker/preview.js"));
+    const provenance = await consumeCiArtifacts({ root, revision: metadata.revision, worker, image, directory: output, env: clean,
+      execute: (cmd, args, options) => execute(cmd, args, { ...options, stdio: "inherit" }) });
     run(process.execPath, ["scripts/preview-runtime.mjs", join(worker, "worker/preview.js")]);
-    await writeFile(join(worker, "wrangler.json"), JSON.stringify(previewArtifactConfig(source)), { flag: "wx" });
     checkSource();
-    await writeManifest(worker, { revision: metadata.revision, dirty: false, install: "isolated-preview" });
+    await verifyArtifact(worker, metadata.revision, "isolated-preview");
     await verifyContainerImageArtifact(image, metadata.revision);
-    await writeFile(receiptPath, JSON.stringify({ ...metadata, workerHash: await sha256(join(worker, "manifest.json")), imageHash: await sha256(join(image, "manifest.json")) }), { flag: "wx" });
+    await writeFile(receiptPath, JSON.stringify({ ...metadata, provenance, workerHash: await sha256(join(worker, "manifest.json")), imageHash: await sha256(join(image, "manifest.json")) }), { flag: "wx" });
     return;
   }
   const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
   for (const key of Object.keys(metadata)) if (receipt[key] !== metadata[key]) throw new Error("Build receipt does not match this build");
   if (receipt.workerHash !== await sha256(join(worker, "manifest.json")) || receipt.imageHash !== await sha256(join(image, "manifest.json"))) throw new Error("Manifest changed after build");
   await verifyArtifact(worker, metadata.revision, "isolated-preview");
+  await verifyCiProvenance(receipt.provenance, metadata.revision);
   const manifest = await verifyContainerImageArtifact(image, metadata.revision);
   const config = JSON.parse(await readFile(join(worker, "wrangler.json"), "utf8"));
   if (JSON.stringify(config) !== JSON.stringify(previewArtifactConfig(source))) throw new Error("Prepared preview bindings differ from reviewed source");
