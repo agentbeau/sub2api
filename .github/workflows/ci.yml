@@ -32,7 +32,7 @@ jobs:
       - run: npm ci
       - run: npm run verify
       - name: Verify deployment safeguards
-        run: node --test scripts/deployment.test.mjs container/brand-panel/brand.test.mjs
+        run: node --test scripts/deployment.test.mjs scripts/deploy-prepared.test.mjs scripts/cloudflare-builds.test.mjs container/brand-panel/brand.test.mjs
       - name: Package the compiled container gateway
         run: node scripts/prepare-deployment.mjs container .wrangler/artifacts/container-worker
       - name: Exercise the packaged gateway in workerd
@@ -77,6 +77,13 @@ jobs:
           PANEL_VERSION: ${{ vars.PANEL_VERSION }}
           PANEL_SHA256: ${{ vars.PANEL_SHA256 }}
         run: node scripts/build-container-image.mjs .wrangler/artifacts/container-image
+      - name: Exercise the same image with Cloudflare Builds networking
+        env:
+          SUB2API_DOCKER_NETWORK: host
+        run: |
+          IMAGE="$(node -e 'const fs = require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(".wrangler/artifacts/container-image/manifest.json", "utf8")).image)')"
+          export IMAGE
+          sh test/container-smoke.sh --prebuilt
       - uses: actions/upload-artifact@v4
         with:
           name: container-image

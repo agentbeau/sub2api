@@ -71,6 +71,8 @@ For a manual production release, open **Actions → deploy container → Run wor
 
 For a local or connector deployment, follow [the prepared artifact and static panel steps](scripts/DEPLOYMENT.md). The panel must be uploaded before activating Worker code that serves it from R2; `wrangler deploy` alone does not provision that object. Existing installations retain their current secrets, R2 state, Durable Object namespace and migration tag. Serving the dashboard does not start CPA; connecting to the provider is an explicit dashboard action.
 
+[Cloudflare Workers Builds](docs/cloudflare-builds.md) can handle continuous deployment using an existing Cloudflare build token, without GitHub deployment secrets. Its wrapper runs the same verification, exact-image smoke and prepared-artifact deployment, including the static panel upload. Keep only one automatic production deployer enabled.
+
 ## Idle behavior and health checks
 
 `CONTAINER_IDLE_TIMEOUT_MS` is set to `"1000"` in `wrangler.jsonc`. Valid values are whole milliseconds from `1` to `21600000`. One millisecond is the smallest accepted setting; one second is the practical default to avoid immediate teardown between closely spaced requests. A shorter timeout reduces idle running time and increases the chance that the next request needs a cold start. It cannot make cold starts disappear.

@@ -1,5 +1,9 @@
 # Verified provider image and dashboard
 
+For native Cloudflare continuous deployment, use the
+[Workers Builds setup](../docs/cloudflare-builds.md). Its build/deploy entrypoint
+runs the same checked artifact flow below and preserves existing runtime secrets.
+
 ## Prepared deployments
 
 `build-container-image.mjs` builds the provider image once and runs the container
@@ -22,6 +26,17 @@ available from the existing `STATE` bucket without starting the provider.
 The upload replaces only `dashboard/management.html`. It does not change the
 container image digest, provider configuration, stored credentials, or the
 Workers-only installation. A failed panel upload stops the Worker deployment.
+
+Cloudflare's Builds wrapper opts into late public-main checks by setting
+`SUB2API_EXPECTED_MAIN_SHA` to the verified `CHECKED_SHA`. An explicit value must
+be a full commit SHA equal to `CHECKED_SHA`. The script checks it after the image
+push before the R2 panel write, then again immediately before Wrangler
+activation. Lookup failures and changed main both stop the remaining writes.
+With this variable absent, ordinary GitHub and manual prepared deployments keep
+their existing behavior without adding a GitHub network lookup. These checks
+are not an atomic lock: main may change after a check, and a panel already
+uploaded remains if the final check prevents Worker activation. See the
+[Workers Builds ordering limits](../docs/cloudflare-builds.md#build-configuration).
 
 For a connector deployment of an older, already tested artifact without the
 separate HTML file, extract the panel from that artifact's verified OCI layers.

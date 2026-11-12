@@ -16,12 +16,20 @@ IMAGE=${IMAGE:-sub2api-cpa:test}
 NODE_IMAGE=node:24-alpine
 NET=sub2api-smoke
 PORT=18317
+S3_BASE=http://127.0.0.1:19000
+S3_ENDPOINT=http://smoke-s3:9000
+NETWORK_MODE=${SUB2API_DOCKER_NETWORK:-bridge}
+case "$NETWORK_MODE" in
+  bridge) ;;
+  host) NET=host; PORT=8317; S3_BASE=http://127.0.0.1:9000; S3_ENDPOINT=$S3_BASE ;;
+  *) echo "SUB2API_DOCKER_NETWORK must be bridge or host" >&2; exit 64 ;;
+esac
 CLIENT_KEY=client-key-0123456789abcdef0123456789abcdef
 MANAGEMENT_KEY=management-key-0123456789abcdef0123456789ab
 
 cleanup() {
   docker rm -f smoke-cpa smoke-s3 >/dev/null 2>&1 || true
-  docker network rm "$NET" >/dev/null 2>&1 || true
+  if [ "$NETWORK_MODE" = bridge ]; then docker network rm "$NET" >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
 cleanup
@@ -47,13 +55,14 @@ expect() {
 
 start_cpa() {
   docker rm -f smoke-cpa >/dev/null 2>&1 || true
-  docker run -d --name smoke-cpa --network "$NET" -p "127.0.0.1:$PORT:8317" \
-    -e OBJECTSTORE_ENDPOINT=http://smoke-s3:9000 \
+  if [ "$NETWORK_MODE" = bridge ]; then set -- -p "127.0.0.1:$PORT:8317" "$@"; fi
+  docker run -d --name smoke-cpa --network "$NET" \
+    -e OBJECTSTORE_ENDPOINT="$S3_ENDPOINT" \
     -e OBJECTSTORE_BUCKET=state \
     -e OBJECTSTORE_ACCESS_KEY=smoke-access \
     -e OBJECTSTORE_SECRET_KEY=smoke-secret-0123456789 \
     -e CPA_MANAGEMENT_KEY="$MANAGEMENT_KEY" \
-    -e SUB2API_ACTIVITY_ENDPOINT=http://smoke-s3:9000/__sub2api/activity \
+    -e SUB2API_ACTIVITY_ENDPOINT="$S3_ENDPOINT/__sub2api/activity" \
     "$@" "$IMAGE" >/dev/null
   for _ in $(seq 1 60); do
     [ "$(status "http://127.0.0.1:$PORT/healthz")" = 200 ] && return 0
@@ -64,21 +73,25 @@ start_cpa() {
 
 start_s3() {
   docker rm -f smoke-s3 >/dev/null 2>&1 || true
-  docker run -d --name smoke-s3 --network "$NET" -p "127.0.0.1:19000:9000" \
+  set --
+  if [ "$NETWORK_MODE" = bridge ]; then set -- -p "127.0.0.1:19000:9000"; fi
+  docker run -d --name smoke-s3 --network "$NET" "$@" \
     -v "$(pwd):/app:ro" -w /app "$NODE_IMAGE" node test/s3-server.ts >/dev/null
   for _ in $(seq 1 30); do
-    [ "$(status http://127.0.0.1:19000/__keys)" = 200 ] && return 0
+    [ "$(status "$S3_BASE/__keys")" = 200 ] && return 0
     sleep 1
   done
   fail "S3 shim did not start"
 }
 
 if [ "$build" = true ]; then
-  docker build -q -t "$IMAGE" container >/dev/null
+  set --
+  if [ "$NETWORK_MODE" = host ]; then set -- --network host; fi
+  docker build -q --load "$@" -t "$IMAGE" container >/dev/null
 else
   docker image inspect "$IMAGE" >/dev/null
 fi
-docker network create "$NET" >/dev/null
+if [ "$NETWORK_MODE" = bridge ]; then docker network create "$NET" >/dev/null; fi
 start_s3
 
 base="http://127.0.0.1:$PORT"
@@ -93,7 +106,7 @@ wait_for() {
 }
 
 activity_status() {
-  curl --fail --silent http://127.0.0.1:19000/__activity
+  curl --fail --silent "$S3_BASE/__activity"
 }
 
 activity_pending() {
@@ -114,13 +127,13 @@ expect 401 "$base/v8/management/config"
 expect 200 -H "$mgmt" "$base/v8/management/config"
 expect 200 "$base/management.html"
 curl --fail --silent "$base/management.html" | node -e 'const html=require("node:fs").readFileSync(0,"utf8"); if(!html.includes("<title>sub2api Console</title>") || html.includes("<title>CLI Proxy API")) process.exit(1)' || fail "provider image does not contain the branded dashboard"
-expect 204 -X POST http://127.0.0.1:19000/__delay-config-put
+expect 204 -X POST "$S3_BASE/__delay-config-put"
 expect 200 -X PUT -H "$mgmt" -H "content-type: application/json" -d "[\"$CLIENT_KEY\"]" "$base/v8/management/config/access/api-keys"
 wait_for activity_pending
 # Hold the actual object-store write beyond the production one-second idle setting.
 sleep 2
 activity_status | node -e 'const x=JSON.parse(require("node:fs").readFileSync(0,"utf8")); if(!x.delayed.pending || !x.delayed.protected || x.active<1 || x.remainingMs<=0) process.exit(1)' || fail "config persistence lost its activity lease while the S3 write was pending"
-expect 204 -X POST http://127.0.0.1:19000/__release-config-put
+expect 204 -X POST "$S3_BASE/__release-config-put"
 wait_for activity_finished
 activity_status | node -e 'const x=JSON.parse(require("node:fs").readFileSync(0,"utf8")); if(!x.delayed.protected || x.delayed.timedOut || x.delayed.elapsedMs<1000 || x.begin<1 || x.end!==x.begin || x.rejected!==0) process.exit(1)' || fail "activity handoff or release did not cover the completed config write"
 echo "ok background reload and persistence stay protected until the delayed bucket write completes"
@@ -158,7 +171,7 @@ echo "ok CPA takes a pasted callback by its state alone"
 MOVED_KEY=moved-key-0123456789abcdef0123456789abcdef
 start_s3
 expect 200 -X PUT --data-binary '{"type":"codex","email":"moved@example.com","access_token":"a","refresh_token":"r","disabled":true}' \
-  http://127.0.0.1:19000/state/auths/codex-moved@example.com.json
+  "$S3_BASE/state/auths/codex-moved@example.com.json"
 start_cpa -e CPA_IMPORT_CONFIG="access:
   api-keys:
     - $MOVED_KEY
@@ -167,7 +180,7 @@ routing:
 expect 200 -H "x-api-key: $MOVED_KEY" "$base/v1/models"
 expect 401 -H "x-api-key: $CLIENT_KEY" "$base/v1/models"
 curl -s -H "$mgmt" "$base/v0/management/auth-files" | grep -q 'codex-moved@example.com.json' || fail "moved login not listed"
-seeded=$(curl -s http://127.0.0.1:19000/state/config/config.yaml)
+seeded=$(curl -s "$S3_BASE/state/config/config.yaml")
 printf '%s' "$seeded" | grep -q "$MOVED_KEY" || fail "moved config not seeded into the bucket"
 printf '%s' "$seeded" | grep -q fill-first || fail "moved routing not seeded into the bucket"
 if printf '%s' "$seeded" | grep -q "$MANAGEMENT_KEY"; then fail "plaintext management key reached the bucket"; fi
