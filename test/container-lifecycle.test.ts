@@ -768,3 +768,30 @@ describe("native inactivity with persisted activity leases", () => {
     expect(platform.timeouts.at(-1)).toBe(180_000);
   });
 });
+
+describe("runtime-selected image configuration", () => {
+  it("passes the selected image and instance without changing environment or egress", async () => {
+    const container = new PlatformContainer();
+    const controller = new ContainerLifecycle(container, {
+      idleTimeout: "1000",
+      environment: async () => ({ TEST: "value" }),
+      attach: async () => {},
+      startup: () => ({ image: "pinned-test-image", instance: "lite" }),
+    });
+    const response = await controller.forward(new Request("https://gateway.example/healthz"));
+    expect(response.status).toBe(200);
+    expect(container.starts).toEqual([{ image: "pinned-test-image", instance: "lite", env: { TEST: "value" }, enableInternet: true }]);
+  });
+  it("never starts when image selection fails", async () => {
+    const container = new PlatformContainer();
+    const controller = new ContainerLifecycle(container, {
+      idleTimeout: "1000",
+      environment: async () => ({}),
+      attach: async () => {},
+      startup: () => { throw new Error("image missing"); },
+    });
+    const response = await controller.forward(new Request("https://gateway.example/healthz"));
+    expect(response.status).toBe(503);
+    expect(container.starts).toEqual([]);
+  });
+});

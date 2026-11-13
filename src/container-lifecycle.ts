@@ -4,7 +4,10 @@ export type ContainerBackend = Pick<Container, "running" | "start" | "setInactiv
   getTcpPort(port: number): Pick<Fetcher, "fetch">;
 };
 
+export type ContainerImageOptions = Pick<ContainerStartupOptions, "image" | "instance">;
+
 export interface LifecycleOptions {
+  readonly startup?: () => ContainerImageOptions;
   readonly idleTimeout: string | undefined;
   readonly environment: () => Promise<Record<string, string>>;
   readonly attach: () => Promise<void>;
@@ -296,8 +299,10 @@ export class ContainerLifecycle {
       signal.throwIfAborted();
       await this.options.attach();
       signal.throwIfAborted();
-      // The existing default scheduler still selects the configured image/basic instance.
-      this.container.start({ env: environment, enableInternet: true });
+      // Only the replacement class supplies image/size. Existing applications retain
+      // their scheduler-configured image and size. Select before starting, fail closed.
+      const startup = this.options.startup?.() ?? {};
+      this.container.start({ ...startup, env: environment, enableInternet: true });
     } else {
       await this.options.attach();
       signal.throwIfAborted();
