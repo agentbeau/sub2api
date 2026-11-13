@@ -141,6 +141,10 @@ export class Cpa extends DurableObject<Env> {
     return this.#dispatch(request, true);
   }
 
+  protected prepareAuthenticatedInference(request: Request): Promise<Request> {
+    return Promise.resolve(request);
+  }
+
   #dispatch(request: Request, accessAuthenticated: boolean): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -150,6 +154,7 @@ export class Cpa extends DurableObject<Env> {
     const passivePanelCatalog = route === "api" && (request.method === "GET" || request.method === "HEAD")
       && (path === "/v1/models" || path === "/v1beta/models") && hasPanelReferer(request, url);
     let mayStart = false;
+    let classificationAllowed = false;
     return handle(
       request,
       {
@@ -159,6 +164,7 @@ export class Cpa extends DurableObject<Env> {
         apiAccess: {
           authorize: async (candidate) => {
             const decision = await this.keyGuard.authorize(candidate);
+            classificationAllowed = decision === "allowed" && this.keyGuard.classificationSafe;
             mayStart = !passivePanelCatalog && (decision === "allowed" || decision === "runtime-required");
             return decision === "runtime-only" || decision === "runtime-required" ? "allowed" : decision;
           },
@@ -182,6 +188,9 @@ export class Cpa extends DurableObject<Env> {
         const nativeManagement = route === "dashboard"
           && (path.startsWith("/v0/management/") || path.startsWith("/v8/management/"))
           && hasManagementCredential(forwarded);
+        if (route === "api" && classificationAllowed && this.keyGuard.classificationSafe) {
+          forwarded = await this.prepareAuthenticatedInference(forwarded);
+        }
         const options = { requireFrontendAuth: route === "api" };
         const response = await (((route === "api" && mayStart) || nativeManagement ? this.lifecycle?.forward(forwarded, options) : this.lifecycle?.forwardExisting(forwarded, options))
           ?? containerUnavailable());
