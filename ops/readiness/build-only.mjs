@@ -1,6 +1,6 @@
 // One-off enhanced image build. Does not deploy a Worker, change configuration, or update a container app.
 import {execFileSync,spawnSync} from 'node:child_process';
-import {readFileSync} from 'node:fs';
+import process from 'node:process';
 import {prepareSource} from './prepare-source.mjs';
 const run=(c,a,options={})=>execFileSync(c,a,{stdio:'inherit',...options});
 const capture=(c,a)=>execFileSync(c,a,{encoding:'utf8'}).trim();
@@ -12,7 +12,7 @@ const token=process.env.CLOUDFLARE_API_TOKEN;
 if(!token)throw Error('Existing Cloudflare build credential required');
 const prepared=await prepareSource();
 try {
-const response=await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/containers/registries/registry.cloudflare.com/credentials`,{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({expiration_minutes:15,permissions:['pull','push']})});
+const response=await globalThis.fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/containers/registries/registry.cloudflare.com/credentials`,{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({expiration_minutes:15,permissions:['pull','push']})});
 if(!response.ok)throw Error(`Registry authorization status ${response.status}`);
 const data=await response.json();const credentials=data.result||data;
 if(!credentials.username||!credentials.password)throw Error('Registry credentials missing');
