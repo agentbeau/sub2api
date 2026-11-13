@@ -7,11 +7,12 @@ export function validatePreview(config, branch, { ready = true } = {}) {
   assert.equal(config.name, "gateway-preview");
   assert.equal(config.main, "src/preview.ts");
   assert.equal(config.workers_dev, true);
+  assert.equal(config.preview_urls, false);
   assert.deepEqual(config.routes, []);
   for (const key of ["services", "secrets_store_secrets", "env", "previews"])
     assert.equal(config[key], undefined, `No top-level ${key} allowed`);
   const p = config;
-  assert.deepEqual(Object.keys(p).sort(), ["$schema", "compatibility_date", "containers", "durable_objects", "main", "migrations", "name", "r2_buckets", "ratelimits", "routes", "vars", "workers_dev"]);
+  assert.deepEqual(Object.keys(p).sort(), ["$schema", "compatibility_date", "containers", "durable_objects", "main", "migrations", "name", "preview_urls", "r2_buckets", "ratelimits", "routes", "vars", "workers_dev"]);
   assert.deepEqual(p.r2_buckets, [{ binding: "STATE", bucket_name: "gateway-preview-state" }]);
   assert.deepEqual(p.durable_objects, { bindings: [{ name: "ENGINE", class_name: "Engine" }] });
   assert.deepEqual(p.containers, [{ class_name: "Engine", image: "./container/Dockerfile", image_build_context: "./container", instance_type: "basic", max_instances: 1 }]);
