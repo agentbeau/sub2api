@@ -405,6 +405,9 @@ describe("native container lifecycle", () => {
     state.container.startError = new Error("allocation unavailable");
     expect((await state.controller.forward(new Request("https://gateway.example/v1/models"))).status).toBe(503);
     expect(state.container.requests).toHaveLength(0);
+    const notSent = await state.controller.forward(management("config", "PATCH"));
+    expect(notSent.headers.get("retry-after")).toBe("1");
+    expect(await notSent.json()).toMatchObject({ error: { code: "runtime_not_ready" } });
     state.container.startError = undefined;
     expect((await state.controller.forward(new Request("https://gateway.example/v1/models"))).status).toBe(200);
   });
@@ -426,6 +429,19 @@ describe("native container lifecycle", () => {
     const response = await state.controller.forward(new Request("https://gateway.example/v1/messages", { method: "POST", body: "one billed request" }));
     expect(response.status).toBe(503);
     expect(submissions).toBe(1);
+    expect(response.headers.has("retry-after")).toBe(false);
+    expect(await response.json()).toMatchObject({ error: { code: "runtime_outcome_unknown" } });
+  });
+
+  it("does not invite a retry when a management save loses confirmation", async () => {
+    const state = lifecycle();
+    let writes = 0;
+    state.container.upstream = async () => { writes += 1; throw new Error("lost reply"); };
+    const response = await state.controller.forward(management("config", "PATCH"));
+    expect(writes).toBe(1);
+    expect(response.status).toBe(503);
+    expect(response.headers.has("retry-after")).toBe(false);
+    expect(await response.json()).toMatchObject({ error: { code: "runtime_outcome_unknown" } });
   });
 
   it("returns the original response stream before its first chunk and propagates cancellation", async () => {
