@@ -34,7 +34,7 @@ function fixture(nativeStatus = 200) {
         const request = input instanceof Request && init === undefined ? input : new Request(input, init);
         const path = new URL(request.url).pathname;
         if (path === "/healthz") return new Response("ok");
-        if (path === "/__sub2api/lifecycle") return Response.json({ activity_protocol: 1, frontend_auth_protocol: 1 });
+        if (path === "/__sub2api/lifecycle") return Response.json({ activity_protocol: 1, frontend_auth_protocol: 1, initialization_protocol: 1, initialization_ready: true });
         requests.push(request);
         return Response.json({ status: nativeStatus === 200 ? "ok" : "denied by native server" }, { status: nativeStatus });
       },

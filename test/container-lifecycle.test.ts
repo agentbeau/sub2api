@@ -19,7 +19,7 @@ class PlatformContainer implements ContainerBackend {
   readonly ports: number[] = [];
   startError: Error | undefined;
   health: (request: Request) => Promise<Response> = async () => new Response("ok");
-  capability: (request: Request) => Promise<Response> = async () => Response.json({ activity_protocol: 1, frontend_auth_protocol: 1 });
+  capability: (request: Request) => Promise<Response> = async () => Response.json({ activity_protocol: 1, frontend_auth_protocol: 1, initialization_protocol: 1, initialization_ready: true });
   upstream: (request: Request) => Promise<Response> = async () => new Response("provider reply");
 
   start(options?: ContainerStartupOptions): void {
@@ -110,7 +110,7 @@ describe("container image rollout compatibility", () => {
     await state.controller.restore();
     expect(platform.timeouts).toEqual([1_800_000]);
     expect(platform.requests).toHaveLength(0);
-    expect((await state.controller.forward(new Request("https://gateway.example/v1/models"))).status).toBe(200);
+    expect((await state.controller.forward(new Request("https://gateway.example/v1/models"))).status).toBe(503);
     expect(platform.timeouts.at(-1)).toBe(1_800_000);
     expect(platform.requests.filter((request) => new URL(request.url).pathname === "/__sub2api/lifecycle")).toHaveLength(1);
     const requests = platform.requests.length;
@@ -123,9 +123,9 @@ describe("container image rollout compatibility", () => {
   it("detects a replacement image only when another real request arrives", async () => {
     const state = lifecycle();
     state.container.capability = async () => new Response(null, { status: 404 });
-    expect((await state.controller.forward(new Request("https://gateway.example/v1/models"))).status).toBe(200);
+    expect((await state.controller.forward(new Request("https://gateway.example/v1/models"))).status).toBe(503);
     expect(state.container.timeouts.at(-1)).toBe(1_800_000);
-    state.container.capability = async () => Response.json({ activity_protocol: 1 });
+    state.container.capability = async () => Response.json({ activity_protocol: 1, initialization_protocol: 1, initialization_ready: true });
     expect((await state.controller.forward(new Request("https://gateway.example/v1/models"))).status).toBe(200);
     expect(state.container.timeouts.at(-1)).toBe(1000);
     expect(state.container.starts).toHaveLength(1);
@@ -140,7 +140,7 @@ describe("container image rollout compatibility", () => {
     await vi.waitFor(() => { expect(state.container.requests.some((request) => new URL(request.url).pathname === "/__sub2api/lifecycle")).toBe(true); });
     expect(state.container.timeouts).toEqual([1_800_000]);
     expect(state.container.requests.some((request) => request.method === "POST")).toBe(false);
-    marker.resolve(Response.json({ activity_protocol: 1 }));
+    marker.resolve(Response.json({ activity_protocol: 1, initialization_protocol: 1, initialization_ready: true }));
     expect((await pending).status).toBe(200);
     expect(state.container.timeouts).toEqual([1_800_000, 1]);
     expect(state.container.requests.filter((request) => request.method === "POST")).toHaveLength(1);
@@ -151,20 +151,20 @@ describe("container image rollout compatibility", () => {
     ["malformed JSON", () => new Response("{", { headers: { "content-type": "application/json" } })],
     ["unconfigured hooks", () => Response.json({ activity_protocol: 1 }, { status: 503 })],
     ["oversized marker", () => Response.json({ activity_protocol: 1, padding: "x".repeat(2048) })],
-  ] as const)("preserves service with conservative idle for %s", async (_name, response) => {
+  ] as const)("fails closed with conservative idle for %s", async (_name, response) => {
     const state = lifecycle();
     state.container.capability = async () => response();
-    expect((await state.controller.forward(new Request("https://gateway.example/v1/models"))).status).toBe(200);
+    expect((await state.controller.forward(new Request("https://gateway.example/v1/models"))).status).toBe(503);
     expect(state.container.timeouts.at(-1)).toBe(1_800_000);
   });
 
-  it("bounds an unresponsive capability probe without disabling a healthy legacy image", async () => {
+  it("bounds an unresponsive capability probe and refuses an unverified legacy image", async () => {
     vi.useFakeTimers();
     const state = lifecycle();
     state.container.capability = async () => new Promise<Response>(() => {});
     const pending = state.controller.forward(new Request("https://gateway.example/v1/models"));
     await vi.advanceTimersByTimeAsync(1000);
-    expect((await pending).status).toBe(200);
+    expect((await pending).status).toBe(503);
     expect(state.container.timeouts.at(-1)).toBe(1_800_000);
     const probe = state.container.requests.find((request) => new URL(request.url).pathname === "/__sub2api/lifecycle");
     expect(probe?.signal.aborted).toBe(true);
@@ -195,7 +195,7 @@ describe("provider frontend authentication rollout", () => {
   ])("refuses API forwarding to an %s even after successful readiness", async (_name, marker) => {
     const platform = new PlatformContainer();
     platform.running = true;
-    platform.capability = async () => Response.json(marker);
+    platform.capability = async () => Response.json({ ...marker, initialization_protocol: 1, initialization_ready: true });
     const state = lifecycle(platform);
     const request = inference();
     const response = await state.controller.forwardExisting(request, requireFrontendAuth);
@@ -223,7 +223,7 @@ describe("provider frontend authentication rollout", () => {
     await vi.waitFor(() => { expect(state.container.requests.some((request) => new URL(request.url).pathname === "/__sub2api/lifecycle")).toBe(true); });
     expect(state.container.starts).toHaveLength(1);
     expect(state.container.requests.some((request) => request.method === "POST")).toBe(false);
-    marker.resolve(Response.json({ activity_protocol: 1, frontend_auth_protocol: 1 }));
+    marker.resolve(Response.json({ activity_protocol: 1, frontend_auth_protocol: 1, initialization_protocol: 1, initialization_ready: true }));
     expect(await pending).toBe(upstream);
     expect(state.container.requests.filter((request) => request.method === "POST")).toHaveLength(1);
     expect(state.environmentReads()).toBe(1);
@@ -233,14 +233,14 @@ describe("provider frontend authentication rollout", () => {
 
   it("treats frontend authentication and background activity as independent protocols", async () => {
     const state = lifecycle();
-    state.container.capability = async () => Response.json({ frontend_auth_protocol: 1 });
+    state.container.capability = async () => Response.json({ frontend_auth_protocol: 1, initialization_protocol: 1, initialization_ready: true });
     expect((await state.controller.forward(inference(), requireFrontendAuth)).status).toBe(200);
     expect(state.container.timeouts.at(-1)).toBe(1_800_000);
   });
 
   it("keeps readiness and management usable on an old image while requiring an upgrade for APIs", async () => {
     const state = lifecycle();
-    state.container.capability = async () => Response.json({ activity_protocol: 1 });
+    state.container.capability = async () => Response.json({ activity_protocol: 1, initialization_protocol: 1, initialization_ready: true });
     expect((await state.controller.forward(new Request("https://gateway.example/healthz"))).status).toBe(200);
     expect((await state.controller.forwardExisting(management("config"))).status).toBe(200);
     const response = await state.controller.forward(inference(), requireFrontendAuth);
@@ -253,12 +253,12 @@ describe("provider frontend authentication rollout", () => {
   it("recognizes an upgraded image on a later API request without adding a polling timer", async () => {
     vi.useFakeTimers();
     const state = lifecycle();
-    state.container.capability = async () => Response.json({ activity_protocol: 1 });
+    state.container.capability = async () => Response.json({ activity_protocol: 1, initialization_protocol: 1, initialization_ready: true });
     expect((await state.controller.forward(inference(), requireFrontendAuth)).status).toBe(503);
     const requests = state.container.requests.length;
     await vi.advanceTimersByTimeAsync(60_000);
     expect(state.container.requests).toHaveLength(requests);
-    state.container.capability = async () => Response.json({ activity_protocol: 1, frontend_auth_protocol: 1 });
+    state.container.capability = async () => Response.json({ activity_protocol: 1, frontend_auth_protocol: 1, initialization_protocol: 1, initialization_ready: true });
     expect((await state.controller.forward(inference(), requireFrontendAuth)).status).toBe(200);
     expect(state.container.starts).toHaveLength(1);
     expect(state.container.requests.filter((request) => request.method === "POST")).toHaveLength(1);
@@ -269,7 +269,7 @@ describe("provider frontend authentication rollout", () => {
     const state = lifecycle();
     expect((await state.controller.forward(inference(), requireFrontendAuth)).status).toBe(200);
     state.container.running = false;
-    state.container.capability = async () => Response.json({ activity_protocol: 1 });
+    state.container.capability = async () => Response.json({ activity_protocol: 1, initialization_protocol: 1, initialization_ready: true });
     const response = await state.controller.forward(inference(), requireFrontendAuth);
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({ error: { code: "runtime_upgrade_required" } });
@@ -286,9 +286,9 @@ describe("provider frontend authentication rollout", () => {
     const existing = state.controller.forwardExisting(inference(), requireFrontendAuth);
     await vi.waitFor(() => { expect(platform.requests.some((request) => new URL(request.url).pathname === "/__sub2api/lifecycle")).toBe(true); });
     platform.running = false;
-    platform.capability = async () => Response.json({ activity_protocol: 1 });
+    platform.capability = async () => Response.json({ activity_protocol: 1, initialization_protocol: 1, initialization_ready: true });
     const replacement = await state.controller.forward(inference(), requireFrontendAuth);
-    oldMarker.resolve(Response.json({ activity_protocol: 1, frontend_auth_protocol: 1 }));
+    oldMarker.resolve(Response.json({ activity_protocol: 1, frontend_auth_protocol: 1, initialization_protocol: 1, initialization_ready: true }));
     const earlier = await existing;
     expect(replacement.status).toBe(503);
     expect(earlier.status).toBe(503);
@@ -545,7 +545,7 @@ describe("forwarding without starting a container", () => {
     const pending = state.controller.forwardExisting(management("config"));
     await vi.waitFor(() => { expect(platform.requests.some((request) => new URL(request.url).pathname === "/__sub2api/lifecycle")).toBe(true); });
     platform.running = false;
-    marker.resolve(Response.json({ activity_protocol: 1 }));
+    marker.resolve(Response.json({ activity_protocol: 1, initialization_protocol: 1, initialization_ready: true }));
     const response = await pending;
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({ error: { code: "runtime_asleep" } });
@@ -766,5 +766,146 @@ describe("native inactivity with persisted activity leases", () => {
     await Promise.all([first, second]);
     expect(overlap).toBe(false);
     expect(platform.timeouts.at(-1)).toBe(180_000);
+  });
+});
+
+describe("bounded allocation recovery before submission", () => {
+  const unavailable = () => new Error("There is no container instance that can be provided to this Durable Object, try again later");
+
+  it("recovers an async allocation failure with one import and one payload per concurrent caller", async () => {
+    vi.useFakeTimers();
+    const state = lifecycle();
+    const original = state.container.setInactivityTimeout.bind(state.container);
+    let attempts = 0;
+    state.container.setInactivityTimeout = async (timeout) => {
+      if (++attempts === 1) { state.container.running = false; throw unavailable(); }
+      return original(timeout);
+    };
+    const a = state.controller.forward(new Request("https://gateway.example/v1/responses", { method: "POST", body: "a" }));
+    const b = state.controller.forward(new Request("https://gateway.example/v1/responses", { method: "POST", body: "b" }));
+    await vi.advanceTimersByTimeAsync(250);
+    expect((await a).status).toBe(200);
+    expect((await b).status).toBe(200);
+    expect(state.environmentReads()).toBe(1);
+    expect(state.container.starts).toHaveLength(2);
+    expect(state.container.requests.filter(r => r.method === "POST")).toHaveLength(2);
+  });
+
+  it("does not restart a still-pending allocation", async () => {
+    vi.useFakeTimers();
+    const state = lifecycle();
+    const original = state.container.setInactivityTimeout.bind(state.container);
+    let attempts = 0;
+    state.container.setInactivityTimeout = async (timeout) => {
+      if (++attempts === 1) throw unavailable();
+      return original(timeout);
+    };
+    const response = state.controller.forward(new Request("https://gateway.example/v1/models"));
+    await vi.advanceTimersByTimeAsync(250);
+    expect((await response).status).toBe(200);
+    expect(state.container.starts).toHaveLength(1);
+  });
+
+  it("bounds persistent allocation failures and submits no payload", async () => {
+    vi.useFakeTimers();
+    const state = lifecycle();
+    state.container.startError = unavailable();
+    const start = vi.spyOn(state.container, "start");
+    const response = state.controller.forward(new Request("https://gateway.example/v1/responses", { method: "POST" }));
+    await vi.advanceTimersByTimeAsync(5750);
+    expect((await response).status).toBe(503);
+    expect(start).toHaveBeenCalledTimes(6);
+    expect(state.environmentReads()).toBe(1);
+    expect(state.container.requests).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("fails unknown setup errors immediately", async () => {
+    const state = lifecycle();
+    state.container.setInactivityTimeout = async () => { throw new Error("invalid configuration"); };
+    expect((await state.controller.forward(new Request("https://gateway.example/v1/models"))).status).toBe(503);
+    expect(state.container.starts).toHaveLength(1);
+    expect(state.container.requests).toHaveLength(0);
+  });
+
+  it("never submits an aborted caller after recovery", async () => {
+    vi.useFakeTimers();
+    const state = lifecycle();
+    state.container.startError = unavailable();
+    const abort = new AbortController();
+    const response = state.controller.forward(new Request("https://gateway.example/v1/responses", { method: "POST", signal: abort.signal }));
+    await vi.advanceTimersByTimeAsync(0);
+    abort.abort();
+    state.container.startError = undefined;
+    await vi.advanceTimersByTimeAsync(250);
+    expect((await response).status).toBe(503);
+    expect(state.container.requests.filter(r => r.method === "POST")).toHaveLength(0);
+  });
+});
+
+
+describe("allocation attachment race", () => {
+  it("prepares imports when a live instance stops during attachment", async () => {
+    const container = new PlatformContainer();
+    container.running = true;
+    let attaches = 0;
+    let imports = 0;
+    const controller = new ContainerLifecycle(container, {
+      idleTimeout: "30000",
+      environment: async () => { imports++; return { CONFIG: "preserved" }; },
+      attach: async () => { if (++attaches === 1) container.running = false; },
+    });
+    expect((await controller.forward(new Request("https://gateway.example/v1/models"))).status).toBe(200);
+    expect(imports).toBe(1);
+    expect(container.starts).toEqual([{ env: { CONFIG: "preserved" }, enableInternet: true }]);
+    expect(container.timeouts.at(-1)).toBe(30000);
+  });
+});
+
+describe("explicit provider initialization gate", () => {
+  it("holds the original request until initialization completes, even with no models configured", async () => {
+    vi.useFakeTimers();
+    const state = lifecycle();
+    let ready = false;
+    state.container.capability = async () => Response.json({ activity_protocol: 1, frontend_auth_protocol: 1,
+      initialization_protocol: 1, initialization_ready: ready, models: [] });
+    const request = new Request("https://gateway.example/v1/responses", { method: "POST", body: "unchanged" });
+    const result = state.controller.forward(request);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(state.container.requests.filter(r => r.method === "POST")).toHaveLength(0);
+    expect(request.bodyUsed).toBe(false);
+    await state.controller.refreshTimeout({ detectProtocol: true });
+    expect(state.container.timeouts.at(-1)).toBe(1_800_000);
+    ready = true;
+    await vi.advanceTimersByTimeAsync(100);
+    expect((await result).status).toBe(200);
+    const sent = state.container.requests.filter(r => r.method === "POST");
+    expect(sent).toHaveLength(1);
+    expect(await sent[0]?.text()).toBe("unchanged");
+  });
+
+  it("bounds incomplete initialization by the existing startup deadline", async () => {
+    vi.useFakeTimers();
+    const state = lifecycle();
+    state.container.capability = async () => Response.json({ activity_protocol: 1,
+      initialization_protocol: 1, initialization_ready: false });
+    const result = state.controller.forward(new Request("https://gateway.example/v1/responses", { method: "POST" }));
+    await vi.advanceTimersByTimeAsync(30000);
+    expect((await result).status).toBe(503);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(state.container.requests.filter(r => r.method === "POST")).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    {}, { initialization_protocol: 1 }, { initialization_protocol: 2, initialization_ready: true },
+    { initialization_protocol: 1, initialization_ready: "true" },
+  ])("fails closed for missing or invalid initialization marker %j", async marker => {
+    const state = lifecycle();
+    state.container.capability = async () => Response.json({ activity_protocol: 1, ...marker });
+    const result = await state.controller.forward(new Request("https://gateway.example/v1/responses", { method: "POST" }));
+    expect(result.status).toBe(503);
+    expect(await result.json()).toMatchObject({ error: { code: "runtime_upgrade_required" } });
+    expect(state.container.requests.filter(r => r.method === "POST")).toHaveLength(0);
   });
 });

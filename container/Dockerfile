@@ -14,11 +14,13 @@ RUN set -eu; repo=https://github.com/router-for-me/CLIProxyAPI.git; tag="${CPA_V
   && printf '%s' "$tag" > /tmp/cpa-version
 COPY activity /src/internal/sub2apiactivity
 COPY patch-cpa /build/patch-cpa
+COPY readiness-test/service_readiness_window_repro_test.go /src/sdk/cliproxy/service_readiness_window_repro_test.go
 # Source drift fails the image build before any hook can be omitted. Tests exercise
 # the real internal HTTP protocol, parent/child handoff, and synchronous-save ordering.
 RUN go test /build/patch-cpa/main.go /build/patch-cpa/main_test.go \
   && go run /build/patch-cpa/main.go /src \
-  && go test -race ./internal/sub2apiactivity
+  && go test -race ./internal/sub2apiactivity \
+  && go test ./sdk/cliproxy -run '^(TestReadinessWindowHealthIsNotModelReady|TestInitializationReadinessEmptyAndFailedBootstrap)$' -count=1
 RUN CGO_ENABLED=1 GOOS=linux go build -buildvcs=false \
   -ldflags="-s -w -X 'main.Version=$(cat /tmp/cpa-version)' -X 'main.Commit=$(git rev-parse HEAD)'" \
   -o /out/CLIProxyAPI ./cmd/server/

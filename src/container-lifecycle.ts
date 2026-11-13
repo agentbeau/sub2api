@@ -19,9 +19,11 @@ export interface ForwardOptions {
 interface RuntimeProtocols {
   readonly activity: boolean;
   readonly frontendAuth: boolean;
+  readonly initialization: boolean;
+  readonly initializationReady: boolean;
 }
 
-const NO_PROTOCOLS: RuntimeProtocols = { activity: false, frontendAuth: false };
+const NO_PROTOCOLS: RuntimeProtocols = { activity: false, frontendAuth: false, initialization: false, initializationReady: false };
 const PORT = 8317;
 const STARTUP_TIMEOUT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 1000;
@@ -31,6 +33,7 @@ const MAX_IDLE_TIMEOUT_MS = 21_600_000;
 const LEGACY_IDLE_TIMEOUT_MS = 30 * 60_000;
 const MAX_CAPABILITY_BYTES = 1024;
 const RUNTIME_ASLEEP = Symbol("runtime_asleep");
+const INITIALIZATION_UNSUPPORTED = Symbol("initialization_unsupported");
 
 export function containerIdleTimeout(value?: string): number {
   if (value === undefined) return DEFAULT_IDLE_TIMEOUT_MS;
@@ -111,6 +114,9 @@ async function readProtocols(response: Response, signal: AbortSignal): Promise<R
     return {
       activity: "activity_protocol" in marker && marker.activity_protocol === 1,
       frontendAuth: "frontend_auth_protocol" in marker && marker.frontend_auth_protocol === 1,
+      initialization: "initialization_protocol" in marker && marker.initialization_protocol === 1 &&
+        "initialization_ready" in marker && typeof marker.initialization_ready === "boolean",
+      initializationReady: "initialization_ready" in marker && marker.initialization_ready === true,
     };
   } catch {
     return NO_PROTOCOLS;
@@ -130,6 +136,8 @@ export class ContainerLifecycle {
   private timeoutUpdate: Promise<void> | undefined;
   private activityProtocol = false;
   private frontendAuthProtocol = false;
+  private initializationProtocol = false;
+  private initializationReady = false;
   private capabilityCheck: Promise<void> | undefined;
   private incarnation = 0;
 
@@ -192,6 +200,7 @@ export class ContainerLifecycle {
       return response;
     } catch (error) {
       this.ready = false;
+      if (error === INITIALIZATION_UNSUPPORTED) return containerUpgradeRequired();
       if (!allowStart && (error === RUNTIME_ASLEEP || !this.container.running)) return containerAsleep();
       return containerUnavailable();
     }
@@ -201,7 +210,7 @@ export class ContainerLifecycle {
     this.baseIdleTimeout ??= containerIdleTimeout(this.options.idleTimeout);
     // Worker code is deployed before the default-policy image rollout completes. An old
     // process cannot notify us about background work, so retain its prior idle allowance.
-    return Math.max(this.baseIdleTimeout, this.activityProtocol ? 0 : LEGACY_IDLE_TIMEOUT_MS, Math.ceil(this.options.lease?.remainingMs() ?? 0));
+    return Math.max(this.baseIdleTimeout, this.activityProtocol && this.initializationReady ? 0 : LEGACY_IDLE_TIMEOUT_MS, Math.ceil(this.options.lease?.remainingMs() ?? 0));
   }
 
   private applyInactivityTimeout(force = false): Promise<void> {
@@ -270,11 +279,17 @@ export class ContainerLifecycle {
       if (incarnation === this.incarnation) {
         this.activityProtocol = supported.activity;
         this.frontendAuthProtocol = supported.frontendAuth;
+        this.initializationProtocol = supported.initialization;
+        this.initializationReady = supported.initializationReady;
       }
     }, () => {
       // A missing or unreachable marker cannot prove frontend authentication is fail-closed.
-      // Readiness and management remain available while the provider image is updated.
-      if (incarnation === this.incarnation) this.frontendAuthProtocol = false;
+      // Missing initialization support must also fail closed before provider forwarding.
+      if (incarnation === this.incarnation) {
+        this.frontendAuthProtocol = false;
+        this.initializationProtocol = false;
+        this.initializationReady = false;
+      }
     }).finally(() => {
       if (this.capabilityCheck === check) this.capabilityCheck = undefined;
     });
@@ -284,30 +299,54 @@ export class ContainerLifecycle {
 
   private async startAndWait(signal: AbortSignal): Promise<void> {
     this.effectiveIdleTimeout();
-    if (!this.container.running) {
-      this.incarnation += 1;
-      this.activityProtocol = false;
-      this.frontendAuthProtocol = false;
-      this.capabilityCheck = undefined;
-      // The prior process is gone, so its background jobs cannot still be running.
-      await this.options.beforeStart?.();
+    // Prepare imports once. Allocation retries must not consume first-boot configuration
+    // again, change credentials, destroy a pending instance, or replay a provider request.
+    let environment: Record<string, string> | undefined;
+    const delays = [250, 500, 1000, 2000, 2000];
+    for (let attempt = 0; ; attempt += 1) {
       signal.throwIfAborted();
-      const environment = await this.options.environment();
-      signal.throwIfAborted();
+      if (!this.container.running && environment === undefined) {
+        this.incarnation += 1;
+        this.activityProtocol = false;
+        this.frontendAuthProtocol = false;
+        this.initializationProtocol = false;
+        this.initializationReady = false;
+        this.capabilityCheck = undefined;
+        await this.options.beforeStart?.();
+        signal.throwIfAborted();
+        environment = await this.options.environment();
+        signal.throwIfAborted();
+      }
+      // Connector/import failures are not allocator failures and must fail immediately.
       await this.options.attach();
       signal.throwIfAborted();
-      // The existing default scheduler still selects the configured image/basic instance.
-      this.container.start({ env: environment, enableInternet: true });
-    } else {
-      await this.options.attach();
-      signal.throwIfAborted();
+      try {
+        if (!this.container.running) {
+          // It may have stopped while attaching; prepare its environment next iteration.
+          if (environment === undefined) continue;
+          // Never destroy an allocation; start again only when the platform reports not running.
+          this.container.start({ env: environment, enableInternet: true });
+        }
+        // start() can return before allocation finishes. Its async setup operation can
+        // surface the same transient platform allocation error as start() itself.
+        await this.applyInactivityTimeout(true);
+        signal.throwIfAborted();
+        break;
+      } catch (error) {
+        signal.throwIfAborted();
+        const unavailable = error instanceof Error && error.message ===
+          "There is no container instance that can be provided to this Durable Object, try again later";
+        if (!unavailable || attempt >= delays.length) throw error;
+        console.warn({ event: "container_allocation_retry", attempt: attempt + 1, delay_ms: delays[attempt] });
+        await new Promise<void>((resolve) => setTimeout(resolve, delays[attempt]));
+      }
     }
-    await this.waitUntilReady(signal);
+    await this.waitUntilReady(signal, false, true);
   }
 
-  private async waitUntilReady(signal: AbortSignal, existingOnly = false): Promise<void> {
+  private async waitUntilReady(signal: AbortSignal, existingOnly = false, timeoutApplied = false): Promise<void> {
     if (existingOnly) this.requireRunning();
-    await this.applyInactivityTimeout(true);
+    if (!timeoutApplied) await this.applyInactivityTimeout(true);
     if (existingOnly) this.requireRunning();
     const port = this.container.getTcpPort(PORT);
     for (;;) {
@@ -322,14 +361,19 @@ export class ContainerLifecycle {
           await this.checkProtocols(signal);
           signal.throwIfAborted();
           if (existingOnly) this.requireRunning();
-          await this.applyInactivityTimeout();
-          if (existingOnly) this.requireRunning();
-          this.ready = true;
-          return;
+          // Listening health is not provider readiness. The image explicitly confirms
+          // configuration, account and model initialization, including valid empty sets.
+          if (!this.initializationProtocol) throw INITIALIZATION_UNSUPPORTED;
+          if (this.initializationReady) {
+            await this.applyInactivityTimeout();
+            if (existingOnly) this.requireRunning();
+            this.ready = true;
+            return;
+          }
         }
       } catch (error) {
         signal.throwIfAborted();
-        if (error === RUNTIME_ASLEEP) throw error;
+        if (error === RUNTIME_ASLEEP || error === INITIALIZATION_UNSUPPORTED) throw error;
         if (existingOnly) this.requireRunning();
       }
       await new Promise<void>((resolve) => setTimeout(resolve, PROBE_INTERVAL_MS));
