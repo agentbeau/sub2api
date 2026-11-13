@@ -185,7 +185,7 @@ export class Cpa extends DurableObject<Env> {
         const options = { requireFrontendAuth: route === "api" };
         const response = await (((route === "api" && mayStart) || nativeManagement ? this.lifecycle?.forward(forwarded, options) : this.lifecycle?.forwardExisting(forwarded, options))
           ?? containerUnavailable());
-        return publicProviderResponse(response);
+        return publicProviderResponse(response, route === "api");
       },
     );
   }

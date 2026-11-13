@@ -161,8 +161,8 @@ describe("dashboard and API wake admission", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("x-cpa-version")).toBeNull();
     expect(response.headers.get("x-sub2api-engine-version")).toBeNull();
-    expect(response.headers.get("x-engine-version")).toBe("v8.0.67");
-    expect(response.headers.get("access-control-expose-headers")).toBe("x-engine-version, ETag");
+    expect(response.headers.get("x-engine-version")).toBe(path.startsWith("/v1/") ? null : "v8.0.67");
+    expect(response.headers.get("access-control-expose-headers")).toBe(path.startsWith("/v1/") ? "ETag" : "x-engine-version, ETag");
     expect(response.body).toBe(upstream.body);
     expect(response.bodyUsed).toBe(false);
     expect(await response.text()).toBe('{"client_version":"cpa"}');

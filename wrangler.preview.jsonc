@@ -1,0 +1,56 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gateway-preview",
+  "main": "src/preview.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  "routes": [],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "Engine"
+      ]
+    }
+  ],
+  "vars": {
+    "CONTAINER_IDLE_TIMEOUT_MS": "30000",
+    "DASHBOARD_AUTH": "cloudflare",
+    "ACCESS_AUD": "1b72b8d862e131791fa2a4803ac3095c979528e3c8cf7eb1b838402989592683",
+    "PREVIEW_ACCESS_AUD": "1b72b8d862e131791fa2a4803ac3095c979528e3c8cf7eb1b838402989592683"
+  },
+  "containers": [
+    {
+      "class_name": "Engine",
+      "image": "./container/Dockerfile",
+      "image_build_context": "./container",
+      "instance_type": "basic",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ENGINE",
+        "class_name": "Engine"
+      }
+    ]
+  },
+  "r2_buckets": [
+    {
+      "binding": "STATE",
+      "bucket_name": "gateway-preview-state"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "LOGIN_LIMIT",
+      "namespace_id": "1101",
+      "simple": {
+        "limit": 5,
+        "period": 60
+      }
+    }
+  ]
+}
