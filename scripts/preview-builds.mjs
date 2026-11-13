@@ -53,7 +53,8 @@ export async function runPreviewPhase(phase, { root = ROOT, env = process.env, e
   });
   if (phase === "build") {
     await rm(output, { recursive: true, force: true });
-    await mkdir(worker, { recursive: true });
+    // The safe extractor creates fresh child destinations and rejects existing ones.
+    await mkdir(output, { recursive: true });
     run("npm", ["ci"]);
     run(process.execPath, ["--test", "scripts/preview-guard.test.mjs", "scripts/preview-builds.test.mjs"]);
     const provenance = await consumeCiArtifacts({ root, revision: metadata.revision, worker, image, directory: output, env: clean,
