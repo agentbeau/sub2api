@@ -164,6 +164,7 @@ export class ContainerLifecycle {
   }
 
   private async forwardRequest(request: Request, allowStart: boolean, requireFrontendAuth: boolean): Promise<Response> {
+    let submitted = false;
     try {
       request.signal.throwIfAborted();
       await (allowStart ? this.ensureReady(requireFrontendAuth) : this.ensureExistingReady(requireFrontendAuth));
@@ -179,7 +180,9 @@ export class ContainerLifecycle {
       url.host = "container";
       const forwarded = new Request(url, request);
       forwarded.headers.delete("host");
-      const response = await this.container.getTcpPort(PORT).fetch(forwarded);
+      const port = this.container.getTcpPort(PORT);
+      submitted = true;
+      const response = await port.fetch(forwarded);
       try {
         // The lease inspects only bounded credential and management JSON. Inference streams and upgrade
         // responses pass through untouched, without cloning, buffering or retrying them.
@@ -192,8 +195,20 @@ export class ContainerLifecycle {
       return response;
     } catch (error) {
       this.ready = false;
+      // A failed response after submission does not establish whether a mutation applied.
+      // Never encourage an automatic replay or include URLs, credentials or error text.
+      console.error({ event: "container_forward_failed", phase: submitted ? "after_submission" : "before_submission" });
+      if (submitted) {
+        return Response.json({ error: {
+          type: "api_error", code: "runtime_outcome_unknown",
+          message: "The gateway lost confirmation after sending your request. Check the saved result before trying again.",
+        } }, { status: 503, headers: { "cache-control": "no-store" } });
+      }
       if (!allowStart && (error === RUNTIME_ASLEEP || !this.container.running)) return containerAsleep();
-      return containerUnavailable();
+      return Response.json({ error: {
+        type: "api_error", code: "runtime_not_ready",
+        message: "The gateway could not become ready. Your request was not sent; try again shortly.",
+      } }, { status: 503, headers: { "cache-control": "no-store", "retry-after": "1" } });
     }
   }
 

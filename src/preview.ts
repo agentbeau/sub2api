@@ -19,9 +19,21 @@ function previewEnv(env: PreviewEnv): Env {
 export class Engine extends Cpa {
   private readonly classifierEnv: PreviewEnv;
   private inFlight = 0;
+  private classifierCalls = 0;
+  private classifierApplied = 0;
   constructor(ctx: DurableObjectState, env: PreviewEnv) {
     super(ctx, previewEnv(env));
     this.classifierEnv = env;
+  }
+  override async fetchWithAccess(request: Request): Promise<Response> {
+    const response = await super.fetchWithAccess(request);
+    if (new URL(request.url).pathname !== "/runtime/status" || response.status !== 200) return response;
+    const headers = new Headers(response.headers);
+    headers.set("x-pmlabs-engine-revision", "clef-hardening-20261113");
+    headers.set("x-pmlabs-container-attached", String(this.ctx.container !== undefined));
+    headers.set("x-pmlabs-clef-calls", String(this.classifierCalls));
+    headers.set("x-pmlabs-clef-applied", String(this.classifierApplied));
+    return new Response(response.body, {status: response.status, headers});
   }
   protected override async prepareAuthenticatedInference(request: Request): Promise<Request> {
     const ai = this.classifierEnv.AI;
@@ -29,10 +41,11 @@ export class Engine extends Cpa {
     this.inFlight++;
     let pending = false;
     try {
-      return await classifyEffort(request, {
+      const prepared = await classifyEffort(request, {
         supported: SUPPORTED,
         reserve: () => reserveClassification(this.ctx.storage),
         decide: text => {
+          this.classifierCalls++;
           const task = ai.run("@cf/cloudflare/clef-flash", clefInput(text));
           pending = true;
           return task.finally(() => { this.inFlight--; });
@@ -40,6 +53,8 @@ export class Engine extends Cpa {
         waitUntil: task => this.ctx.waitUntil(task),
         timeoutMs: 600,
       });
+      if (prepared !== request) this.classifierApplied++;
+      return prepared;
     } finally { if (!pending) this.inFlight--; }
   }
 }
