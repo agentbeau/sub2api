@@ -1,6 +1,6 @@
 # Isolated Worker preview
 
-Status: preparation only. No preview deployment or shared-state migration is implied by this branch.
+Status (2026-11-13): the existing isolated preview is deployed with a verified binding-adapter hotfix. The clean automated build and newer scheduling-policy migration remain incomplete. See [current acceptance and handoff](preview-acceptance-2026-11-13.md); the dated provisioning sections below are historical, not current activation status.
 
 Production keeps `wrangler.jsonc`, its existing main-only Cloudflare Builds entrypoint, domain,
 container and `sub2api` R2 bucket unchanged. Do not weaken those guards to run a preview.
