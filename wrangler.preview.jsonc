@@ -18,7 +18,8 @@
     "CONTAINER_IDLE_TIMEOUT_MS": "30000",
     "DASHBOARD_AUTH": "cloudflare",
     "ACCESS_AUD": "1b72b8d862e131791fa2a4803ac3095c979528e3c8cf7eb1b838402989592683",
-    "PREVIEW_ACCESS_AUD": "1b72b8d862e131791fa2a4803ac3095c979528e3c8cf7eb1b838402989592683"
+    "PREVIEW_ACCESS_AUD": "1b72b8d862e131791fa2a4803ac3095c979528e3c8cf7eb1b838402989592683",
+    "CLEF_ENABLED": "true"
   },
   "containers": [
     {
@@ -52,5 +53,8 @@
         "period": 60
       }
     }
-  ]
+  ],
+  "ai": {
+    "binding": "AI"
+  }
 }
