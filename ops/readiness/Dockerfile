@@ -1,7 +1,7 @@
 FROM golang:1.26.10-bookworm AS builder
-ENV GOTOOLCHAIN=local
+ENV GOTOOLCHAIN=local GOFLAGS=-mod=vendor GOPROXY=off GOSUMDB=off
 WORKDIR /src
-RUN git init -q . && git remote add origin https://github.com/router-for-me/CLIProxyAPI.git && git fetch -q --depth 1 origin 8bba7a77c6bcbfd993516d26606bfecaa4ff49d0 && git checkout -q 8bba7a77c6bcbfd993516d26606bfecaa4ff49d0 && test "$(git rev-parse HEAD)" = 8bba7a77c6bcbfd993516d26606bfecaa4ff49d0
+COPY source /src
 COPY container/activity /src/internal/sub2apiactivity
 COPY container/patch-cpa /build/patch-cpa
 COPY container/readiness-test/service_readiness_window_repro_test.go /src/sdk/cliproxy/service_readiness_window_repro_test.go
