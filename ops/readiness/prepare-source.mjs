@@ -1,7 +1,7 @@
 // Host-side preparation only: pinned public source and checksum-verified dependencies.
 // Docker RUN stages need no network. No credentials or checkout .git enter the context.
 import {execFileSync} from 'node:child_process';
-import {mkdtempSync, mkdirSync, writeFileSync, readFileSync, cpSync, rmSync} from 'node:fs';
+import {mkdtempSync, mkdirSync, writeFileSync, readFileSync, cpSync, rmSync, lstatSync, readdirSync, chmodSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import {createHash} from 'node:crypto';
@@ -10,6 +10,19 @@ export const providerCommit='8bba7a77c6bcbfd993516d26606bfecaa4ff49d0';
 const goSHA='ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5';
 export async function prepareSource(root=process.cwd()) {
   const staging=mkdtempSync(join(tmpdir(),'gateway-readiness-'));
+  const cleanup=()=>{
+    // Go module-cache directories are deliberately read-only. Repair only our
+    // private temporary tree; never follow symlinks or touch an external GOPATH.
+    const unlock=(path)=>{
+      const stat=lstatSync(path);
+      if(stat.isDirectory()&&!stat.isSymbolicLink()){
+        chmodSync(path,stat.mode|0o700);
+        for(const name of readdirSync(path))unlock(join(path,name));
+      }
+    };
+    try { unlock(staging); } catch(error) { if(error.code!=='ENOENT')throw error; }
+    rmSync(staging,{recursive:true,force:true});
+  };
   try {
   const context=join(staging,'context'), source=join(context,'source'), checkout=join(staging,'checkout');
   const run=(c,a,options={})=>execFileSync(c,a,{stdio:'inherit',...options});
@@ -42,8 +55,11 @@ export async function prepareSource(root=process.cwd()) {
   if(!originalMod.equals(readFileSync(join(source,'go.mod')))||!originalSum.equals(readFileSync(join(source,'go.sum'))))throw Error('Pinned module manifests unexpectedly changed');
   cpSync(join(root,'container'),join(context,'container'),{recursive:true});
   writeFileSync(join(context,'preparation.json'),JSON.stringify({providerCommit,goVersion:'1.26.10',goSHA,goSumSHA:createHash('sha256').update(originalSum).digest('hex')})+'\n');
-  return {staging,context,cleanup:()=>rmSync(staging,{recursive:true,force:true})};
-  } catch(error) { rmSync(staging,{recursive:true,force:true}); throw error; }
+  return {staging,context,cleanup};
+  } catch(error) {
+    try { cleanup(); } catch(cleanupError) { throw new AggregateError([error,cleanupError],'Preparation and cleanup failed'); }
+    throw error;
+  }
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(resolve(process.argv[1])).href) {
   const p=await prepareSource(); console.log(`PREPARED_CONTEXT=${p.context}`);

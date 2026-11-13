@@ -27,4 +27,7 @@ const tag=`gateway-readiness:${revision.slice(0,12)}`;
  const remote=`registry.cloudflare.com/${account}/${tag}`;
  const digests=JSON.parse(capture('docker',['image','inspect','--format','{{json .RepoDigests}}',remote]));
  console.log('VERIFIED_BUILD_RECEIPT '+JSON.stringify({revision,imageId,digests,providerCommit:'8bba7a77c6bcbfd993516d26606bfecaa4ff49d0',baseImage:'sha256:6a8959018529d6d505278eae7e346d550fbd511da3ba069d7be11871a05a47f1',tests:'container-smoke passed',deployed:false}));
-}finally{prepared.cleanup();spawnSync('docker',['logout','registry.cloudflare.com'],{stdio:'ignore'});}
+}finally{
+ try { prepared.cleanup(); }
+ finally { spawnSync('docker',['logout','registry.cloudflare.com'],{stdio:'ignore'}); }
+}
