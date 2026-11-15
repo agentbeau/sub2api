@@ -311,3 +311,31 @@ func TestInvalidGeneratedGoDoesNotWriteAnyFile(t *testing.T) {
 		t.Fatal("invalid Go overwrote original source")
 	}
 }
+
+func TestInitializationReadinessAnchors(t *testing.T) {
+	root := fixtureTree(t)
+	var selected []filePatch
+	for _, patch := range plans() {
+		if patch.path == "sdk/cliproxy/service_lifecycle.go" || patch.path == "internal/api/server_routes.go" {
+			selected = append(selected, patch)
+		}
+	}
+	if err := applyPlan(root, selected); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(root, "sdk/cliproxy/service_lifecycle.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(body)
+	if strings.Index(s, "MarkInitialized") < strings.Index(s, "registerModelRefreshCallback") {
+		t.Fatal("ready before bootstrap complete")
+	}
+	if !strings.Contains(s, "ctx.Err()") || strings.Count(s, "EndInitialization") != 2 {
+		t.Fatal("missing cancellation/shutdown readiness reset")
+	}
+	routes, _ := os.ReadFile(filepath.Join(root, "internal/api/server_routes.go"))
+	if !strings.Contains(string(routes), `"initialization_protocol": 1`) || !strings.Contains(string(routes), `"initialization_ready": sub2apiactivity.Initialized()`) {
+		t.Fatal("readiness marker missing")
+	}
+}
