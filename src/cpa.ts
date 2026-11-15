@@ -2,7 +2,7 @@ import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { accessRequired, crossOriginWrite } from "./access.ts";
 import { BackgroundActivity, handleBackgroundActivity, type BackgroundAction } from "./background-activity.ts";
 import { publicProviderResponse } from "./branding.ts";
-import { ContainerLifecycle, containerUnavailable } from "./container-lifecycle.ts";
+import { ContainerLifecycle, containerUnavailable, type ContainerImageOptions } from "./container-lifecycle.ts";
 import { methodNotAllowed, serveDashboard } from "./dashboard.ts";
 import type { Env } from "./env.ts";
 import { handle } from "./gateway.ts";
@@ -53,6 +53,7 @@ export class Cpa extends DurableObject<Env> {
     if (container !== undefined) {
       this.lifecycle = new ContainerLifecycle(container, {
         idleTimeout: env.CONTAINER_IDLE_TIMEOUT_MS,
+        startup: () => this.containerStartup(),
         lease: {
           remainingMs: () => Math.max(lease.remainingMs(), realtime.remainingMs(), this.background.remainingMs(), this.management.remainingMs()),
           observe: async (request, response) => {
@@ -105,6 +106,10 @@ export class Cpa extends DurableObject<Env> {
         }
       }
     });
+  }
+
+  protected containerStartup(): ContainerImageOptions {
+    return {};
   }
 
   override async alarm(): Promise<void> {
