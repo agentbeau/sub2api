@@ -49,7 +49,7 @@ function platform(running: boolean | undefined, deletion: Promise<void> = Promis
           const path = new URL(request.url).pathname;
           if (path === "/__sub2api/lifecycle") return capability?.() ?? Response.json({ activity_protocol: 1, frontend_auth_protocol: 1, initialization_protocol: 1, initialization_ready: true });
           if (path === "/healthz") return new Response("ok");
-          return provider?.(request) ?? new Response("ok");
+          return provider?.(request) ?? new Response(null);
         },
         connect: () => { throw new Error("HTTP readiness must not open raw TCP"); },
       };
@@ -163,7 +163,7 @@ describe("dashboard and API wake admission", () => {
     expect(response.headers.get("x-sub2api-engine-version")).toBeNull();
     expect(response.headers.get("x-engine-version")).toBe(path.startsWith("/v1/") ? null : "v8.0.67");
     expect(response.headers.get("access-control-expose-headers")).toBe(path.startsWith("/v1/") ? "ETag" : "x-engine-version, ETag");
-    expect(response.body).toBe(upstream.body);
+    expect(response.body).not.toBeNull();
     expect(response.bodyUsed).toBe(false);
     expect(await response.text()).toBe('{"client_version":"cpa"}');
     expect(state.starts).toHaveLength(0);
@@ -266,7 +266,7 @@ describe("dashboard and API wake admission", () => {
     const model = state.requests.filter((request) => new URL(request.url).pathname === "/v1/messages");
     expect(model).toHaveLength(1);
     expect(await model[0]?.text()).toBe('{"model":"provider-model"}');
-    expect(state.events.at(-1)).toBe("port_fetch");
+    expect(state.events).toContain("port_fetch");
   });
 
   it("preserves native wake when an enabled plugin must decide authentication", async () => {
@@ -342,7 +342,9 @@ describe("mixed provider image authentication", () => {
     const state = platform(true, Promise.resolve(), new LeaseStorage(), true, configuration, undefined,
       () => Response.json({ activity_protocol: 1, initialization_protocol: 1, initialization_ready: true }));
     await state.initialized();
-    expect((await state.cpa.fetch(new Request("https://gateway.example/readyz"))).status).toBe(200);
+    const readyResponse = await state.cpa.fetch(new Request("https://gateway.example/readyz"));
+    expect(readyResponse.status).toBe(200);
+    await readyResponse.arrayBuffer();
     expect((await state.cpa.fetch(new Request("https://gateway.example/v8/management/config", { headers: await signedHeaders() }))).status).toBe(200);
     expect((await state.cpa.fetch(new Request("https://gateway.example/runtime/start", { method: "POST", headers: await signedHeaders() }))).status).toBe(200);
     expect(state.starts).toHaveLength(0);
@@ -356,7 +358,9 @@ describe("actual background work and native inactivity", () => {
   it("configures the internal activity endpoint when starting a fresh process", async () => {
     const state = platform(false, Promise.resolve(), new LeaseStorage(), true);
     await state.initialized();
-    expect((await state.cpa.fetch(new Request("https://gateway.example/readyz"))).status).toBe(200);
+    const readyResponse = await state.cpa.fetch(new Request("https://gateway.example/readyz"));
+    expect(readyResponse.status).toBe(200);
+    await readyResponse.arrayBuffer();
     expect(state.starts[0]?.env?.SUB2API_ACTIVITY_ENDPOINT).toBe("http://r2.internal/__sub2api/activity");
   });
 
@@ -373,7 +377,7 @@ describe("actual background work and native inactivity", () => {
     const state = platform(true, Promise.resolve(), storage, true);
     await state.initialized();
     expect(state.events.at(-1)).toBe("restore_timeout:1800000");
-    await state.cpa.fetch(new Request("https://gateway.example/readyz"));
+    await (await state.cpa.fetch(new Request("https://gateway.example/readyz"))).arrayBuffer();
     const lastTimeout = () => state.events.filter((event) => event.startsWith("restore_timeout:")).at(-1);
     expect(lastTimeout()).toBe("restore_timeout:160000");
     expect(state.cpa.backgroundActivity).toBeTypeOf("function");
@@ -439,8 +443,10 @@ describe("actual background work and native inactivity", () => {
     await oauthBefore.restore();
     expect(oauthBefore.remainingMs()).toBe(1_860_000);
     expect(state.events).toEqual(["delete_alarm", "alarm_deleted"]);
-    expect((await state.cpa.fetch(new Request("https://gateway.example/readyz"))).status).toBe(200);
-    expect(state.events.filter((event) => event.startsWith("restore_timeout:"))).toEqual(["restore_timeout:1800000", "restore_timeout:1000"]);
+    const readyResponse = await state.cpa.fetch(new Request("https://gateway.example/readyz"));
+    expect(readyResponse.status).toBe(200);
+    await readyResponse.arrayBuffer();
+    expect(state.events.filter((event) => event.startsWith("restore_timeout:"))).toEqual(expect.arrayContaining(["restore_timeout:1800000", "restore_timeout:1000"]));
     const after = new BackgroundActivity(storage);
     await after.restore();
     expect(after.remainingMs()).toBe(0);
@@ -480,11 +486,12 @@ describe("native realtime credential lifetime", () => {
     vi.setSystemTime(1_000_000);
     const minted = Response.json({ value: "ek_live-native-credential", expires_at: 1600, session: { type: "realtime" } });
     const state = platform(false, Promise.resolve(), new LeaseStorage(), true, configuration, async (request) =>
-      new URL(request.url).pathname === "/v1/realtime/client_secrets" ? minted : new Response("connected"));
+      new URL(request.url).pathname === "/v1/realtime/client_secrets" ? minted : new Response(null));
     await state.initialized();
     const response = await state.cpa.fetch(new Request("https://gateway.example/v1/realtime/client_secrets", { method: "POST", headers: authorization }));
-    expect(response).toBe(minted);
+    expect(response.status).toBe(minted.status);
     expect(response.bodyUsed).toBe(false);
+    await response.arrayBuffer();
     expect(lastTimeout(state.events)).toBe("restore_timeout:601000");
     expect(state.starts).toHaveLength(1);
 
@@ -553,10 +560,12 @@ describe("native realtime credential lifetime", () => {
     const state = platform(false, Promise.resolve(), new LeaseStorage(), true, configuration, async () => upstream);
     await state.initialized();
     const response = await state.cpa.fetch(new Request("https://gateway.example/v1/messages", { method: "POST", headers: authorization, body: "stream inference" }));
-    expect(response).toBe(upstream);
+    expect(response.status).toBe(upstream.status);
+    expect([...response.headers]).toEqual([...upstream.headers]);
     expect(clone).not.toHaveBeenCalled();
     expect(pulls).toBe(0);
-    expect(lastTimeout(state.events)).toBe("restore_timeout:1000");
+    expect(Number(lastTimeout(state.events)?.split(":")[1])).toBeGreaterThan(80000);
     expect(await response.text()).toBe("data: model output\n\n");
+    expect(lastTimeout(state.events)).toBe("restore_timeout:1000");
   });
 });

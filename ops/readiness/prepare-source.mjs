@@ -1,6 +1,8 @@
 // Host-side preparation only: pinned public source and checksum-verified dependencies.
 // Docker RUN stages need no network. No credentials or checkout .git enter the context.
 import {execFileSync} from 'node:child_process';
+import process from 'node:process';
+import {Buffer} from 'node:buffer';
 import {mkdtempSync, mkdirSync, writeFileSync, readFileSync, cpSync, rmSync, lstatSync, readdirSync, chmodSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
@@ -31,7 +33,7 @@ export async function prepareSource(root=process.cwd()) {
   const archive=join(staging,'go.tar.gz');
   if(process.env.READINESS_GO_ARCHIVE) cpSync(process.env.READINESS_GO_ARCHIVE,archive);
   else {
-    const r=await fetch('https://go.dev/dl/go1.26.10.linux-amd64.tar.gz');
+    const r=await globalThis.fetch('https://go.dev/dl/go1.26.10.linux-amd64.tar.gz');
     if(!r.ok)throw Error(`Official Go download HTTP ${r.status}`);
     writeFileSync(archive,Buffer.from(await r.arrayBuffer()));
   }
@@ -57,7 +59,7 @@ export async function prepareSource(root=process.cwd()) {
   writeFileSync(join(context,'preparation.json'),JSON.stringify({providerCommit,goVersion:'1.26.10',goSHA,goSumSHA:createHash('sha256').update(originalSum).digest('hex')})+'\n');
   return {staging,context,cleanup};
   } catch(error) {
-    try { cleanup(); } catch(cleanupError) { throw new AggregateError([error,cleanupError],'Preparation and cleanup failed'); }
+    try { cleanup(); } catch(cleanupError) { throw new AggregateError([error,cleanupError],'Preparation and cleanup failed',{cause:cleanupError}); }
     throw error;
   }
 }

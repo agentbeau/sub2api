@@ -34,6 +34,8 @@ const LEGACY_IDLE_TIMEOUT_MS = 30 * 60_000;
 const MAX_CAPABILITY_BYTES = 1024;
 const RUNTIME_ASLEEP = Symbol("runtime_asleep");
 const INITIALIZATION_UNSUPPORTED = Symbol("initialization_unsupported");
+const FOREGROUND_HOLD_MS = 90_000;
+const FOREGROUND_RENEW_MS = 30_000;
 
 export function containerIdleTimeout(value?: string): number {
   if (value === undefined) return DEFAULT_IDLE_TIMEOUT_MS;
@@ -140,6 +142,7 @@ export class ContainerLifecycle {
   private initializationReady = false;
   private capabilityCheck: Promise<void> | undefined;
   private incarnation = 0;
+  private readonly foreground = new Map<symbol, number>();
 
   constructor(private readonly container: ContainerBackend, private readonly options: LifecycleOptions) {}
 
@@ -172,6 +175,7 @@ export class ContainerLifecycle {
   }
 
   private async forwardRequest(request: Request, allowStart: boolean, requireFrontendAuth: boolean): Promise<Response> {
+    let foreground: Awaited<ReturnType<ContainerLifecycle["beginForeground"]>> | undefined;
     try {
       request.signal.throwIfAborted();
       await (allowStart ? this.ensureReady(requireFrontendAuth) : this.ensureExistingReady(requireFrontendAuth));
@@ -185,7 +189,9 @@ export class ContainerLifecycle {
       const url = new URL(request.url);
       url.protocol = "http:";
       url.host = "container";
-      const forwarded = new Request(url, request);
+      foreground = await this.beginForeground(request);
+      request.signal.throwIfAborted();
+      const forwarded = new Request(url, new Request(request, { signal: foreground.signal }));
       forwarded.headers.delete("host");
       const response = await this.container.getTcpPort(PORT).fetch(forwarded);
       try {
@@ -197,8 +203,9 @@ export class ContainerLifecycle {
         // deadlines so unrelated requests and status polling cannot renew an OAuth lease.
         await this.applyInactivityTimeout();
       }
-      return response;
+      return await foreground.wrap(response);
     } catch (error) {
+      await foreground?.cancel(error);
       this.ready = false;
       if (error === INITIALIZATION_UNSUPPORTED) return containerUpgradeRequired();
       if (!allowStart && (error === RUNTIME_ASLEEP || !this.container.running)) return containerAsleep();
@@ -206,11 +213,103 @@ export class ContainerLifecycle {
     }
   }
 
+  // The platform fetch resolves at headers, not at stream completion. Keep a
+  // foreground hold until the returned body reaches EOF, fails, or is cancelled.
+  // Renew only existing work: this never wakes a stopped container or replays it.
+  private async beginForeground(request: Request) {
+    const id = Symbol("foreground");
+    const incarnation = this.incarnation;
+    const abort = new AbortController();
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const finish = async () => {
+      if (!active) return;
+      active = false;
+      clearTimeout(timer);
+      request.signal.removeEventListener("abort", onAbort);
+      this.foreground.delete(id);
+      if (this.container.running) {
+        try { await this.applyInactivityTimeout(); } catch {
+          console.error({ event: "container_foreground_release_failed" });
+        }
+      }
+    };
+    const onAbort = () => {
+      abort.abort(request.signal.reason);
+      if (reader) void reader.cancel(request.signal.reason).catch(() => {});
+      void finish();
+    };
+    const renew = async () => {
+      if (!active) return;
+      if (!this.container.running || incarnation !== this.incarnation) {
+        abort.abort(new Error("Provider runtime stopped during request"));
+        if (reader) void reader.cancel(abort.signal.reason).catch(() => {});
+        await finish();
+        return;
+      }
+      this.foreground.set(id, Date.now() + FOREGROUND_HOLD_MS);
+      try { await this.applyInactivityTimeout(true); } catch {
+        abort.abort(new Error("Provider foreground hold could not be renewed"));
+        if (reader) void reader.cancel(abort.signal.reason).catch(() => {});
+        await finish();
+        return;
+      }
+      if (active) timer = setTimeout(() => { void renew(); }, FOREGROUND_RENEW_MS);
+    };
+    request.signal.throwIfAborted();
+    this.foreground.set(id, Date.now() + FOREGROUND_HOLD_MS);
+    request.signal.addEventListener("abort", onAbort, { once: true });
+    try { await this.applyInactivityTimeout(); } catch (error) { await finish(); throw error; }
+    if (active) timer = setTimeout(() => { void renew(); }, FOREGROUND_RENEW_MS);
+    return {
+      signal: abort.signal,
+      finish,
+      cancel: async (reason: unknown) => {
+        abort.abort(reason);
+        if (reader) void reader.cancel(reason).catch(() => {});
+        await finish();
+      },
+      wrap: async (response: Response): Promise<Response> => {
+        // WebSocket lifecycle uses the existing realtime credential hold. A null
+        // body has no outstanding HTTP stream to protect.
+        if (response.body === null || response.webSocket) { await finish(); return response; }
+        if (abort.signal.aborted) {
+          void response.body.cancel(abort.signal.reason).catch(() => {});
+          abort.signal.throwIfAborted();
+        }
+        reader = response.body.getReader();
+        const body = new ReadableStream<Uint8Array>({
+          pull: async controller => {
+            try {
+              abort.signal.throwIfAborted();
+              const result = await reader?.read();
+              abort.signal.throwIfAborted();
+              if (result?.done || result === undefined) { await finish(); controller.close(); }
+              else controller.enqueue(result.value);
+            } catch (error) {
+              await finish();
+              controller.error(error);
+            }
+          },
+          cancel: async reason => {
+            abort.abort(reason);
+            const cancelled = reader?.cancel(reason);
+            await finish();
+            await cancelled;
+          },
+        }, { highWaterMark: 0 });
+        return new Response(body, { status: response.status, statusText: response.statusText,
+          headers: response.headers, cf: response.cf, encodeBody: "manual" });
+      },
+    };
+  }
+
   private effectiveIdleTimeout(): number {
     this.baseIdleTimeout ??= containerIdleTimeout(this.options.idleTimeout);
     // Worker code is deployed before the default-policy image rollout completes. An old
     // process cannot notify us about background work, so retain its prior idle allowance.
-    return Math.max(this.baseIdleTimeout, this.activityProtocol && this.initializationReady ? 0 : LEGACY_IDLE_TIMEOUT_MS, Math.ceil(this.options.lease?.remainingMs() ?? 0));
+    return Math.max(this.baseIdleTimeout, this.activityProtocol && this.initializationReady ? 0 : LEGACY_IDLE_TIMEOUT_MS, Math.ceil(this.options.lease?.remainingMs() ?? 0), ...[...this.foreground.values()].map(until => Math.max(0, until - Date.now())));
   }
 
   private applyInactivityTimeout(force = false): Promise<void> {
@@ -306,6 +405,7 @@ export class ContainerLifecycle {
     for (let attempt = 0; ; attempt += 1) {
       signal.throwIfAborted();
       if (!this.container.running && environment === undefined) {
+        this.foreground.clear();
         this.incarnation += 1;
         this.activityProtocol = false;
         this.frontendAuthProtocol = false;
