@@ -255,6 +255,27 @@ describe("dashboard and API wake admission", () => {
     expect(state.requests).toHaveLength(0);
   });
 
+  it.each([undefined, "wrong-key"])("never classifies unauthenticated inference (%s)", async key => {
+    const state = platform(false, Promise.resolve(), new LeaseStorage(), true, configuration);
+    await state.initialized();
+    const hook = vi.spyOn(state.cpa as unknown as {prepareAuthenticatedInference(r: Request): Promise<Request>}, "prepareAuthenticatedInference");
+    const response = await state.cpa.fetch(new Request("https://gateway.example/v1/chat/completions", {
+      method: "POST", headers: key ? {authorization: `Bearer ${key}`} : {}, body: '{}',
+    }));
+    expect(response.status).toBe(401); expect(hook).not.toHaveBeenCalled(); expect(state.starts).toHaveLength(0);
+  });
+
+  it("classifies a verified key before starting the container", async () => {
+    const state = platform(false, Promise.resolve(), new LeaseStorage(), true, configuration);
+    await state.initialized();
+    const hook = vi.spyOn(state.cpa as unknown as {prepareAuthenticatedInference(r: Request): Promise<Request>}, "prepareAuthenticatedInference");
+    hook.mockImplementation(async request => { expect(state.starts).toHaveLength(0); return request; });
+    const response = await state.cpa.fetch(new Request("https://gateway.example/v1/chat/completions", {
+      method: "POST", headers: {authorization: `Bearer ${CLIENT_KEY}`}, body: '{}',
+    }));
+    expect(response.status).toBe(200); expect(hook).toHaveBeenCalledTimes(1); expect(state.starts).toHaveLength(1);
+  });
+
   it("still wakes natively for a valid client key and forwards its request once", async () => {
     const state = platform(false, Promise.resolve(), new LeaseStorage(), true, configuration);
     await state.initialized();
@@ -273,7 +294,9 @@ describe("dashboard and API wake admission", () => {
     const state = platform(false, Promise.resolve(), new LeaseStorage(), true,
       "config-version: 8\nplugins:\n  enabled: true\n  configs:\n    frontend-auth:\n      enabled: true\n");
     await state.initialized();
+    const hook = vi.spyOn(state.cpa as unknown as {prepareAuthenticatedInference(r: Request): Promise<Request>}, "prepareAuthenticatedInference");
     expect((await state.cpa.fetch(new Request("https://gateway.example/v1/models", { headers: { authorization: "plugin-credential" } }))).status).toBe(200);
+    expect(hook).not.toHaveBeenCalled();
     expect(state.starts).toHaveLength(1);
   });
 

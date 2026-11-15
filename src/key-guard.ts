@@ -173,6 +173,10 @@ export class KeyGuard {
     }
   }
 
+  get classificationSafe(): boolean {
+    return Date.now() >= this.mutationUntil;
+  }
+
   invalidate(): void {
     this.mutationUntil = Date.now() + MUTATION_GRACE_MS;
   }
