@@ -19,7 +19,7 @@ export function validatePreview(config, branch, { ready = true } = {}) {
   assert.deepEqual(p.ratelimits, [{ name: "LOGIN_LIMIT", namespace_id: "1101", simple: { limit: 5, period: 60 } }]);
   assert.deepEqual(Object.keys(p.vars).sort(), ["ACCESS_AUD", "CONTAINER_IDLE_TIMEOUT_MS", "DASHBOARD_AUTH", "PREVIEW_ACCESS_AUD"]);
   assert.equal(p.vars.DASHBOARD_AUTH, "cloudflare");
-  assert.equal(p.vars.CONTAINER_IDLE_TIMEOUT_MS, "1000");
+  assert.equal(p.vars.CONTAINER_IDLE_TIMEOUT_MS, "30000");
   assert.equal(p.vars.ACCESS_AUD, p.vars.PREVIEW_ACCESS_AUD);
   assert.notEqual(p.vars.ACCESS_AUD, "a6acab2578806d53309922d135ad923c92c9071cbe22f34677ed763c09951170", "Production Access audience is forbidden");
   if (ready) assert.match(p.vars.PREVIEW_ACCESS_AUD, /^[a-f0-9]{64}$/, "Provision preview-only owner Access before deployment");

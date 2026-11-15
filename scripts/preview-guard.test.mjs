@@ -25,3 +25,10 @@ test("production audience and secrets in vars forbidden", () => {
   assert.throws(() => validatePreview(c, branch));
   const d = ready(); d.vars.MANAGEMENT_KEY = "secret"; assert.throws(() => validatePreview(d, branch));
 });
+
+test("idle timeout stays at the approved thirty seconds", () => {
+  for (const timeout of ["1000", "0", "60000"]) {
+    const config = ready(); config.vars.CONTAINER_IDLE_TIMEOUT_MS = timeout;
+    assert.throws(() => validatePreview(config, branch));
+  }
+});
