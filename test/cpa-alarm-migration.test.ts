@@ -47,7 +47,7 @@ function platform(running: boolean | undefined, deletion: Promise<void> = Promis
           const request = input instanceof Request && init === undefined ? input : new Request(input, init);
           requests.push(request);
           const path = new URL(request.url).pathname;
-          if (path === "/__sub2api/lifecycle") return capability?.() ?? Response.json({ activity_protocol: 1, frontend_auth_protocol: 1 });
+          if (path === "/__sub2api/lifecycle") return capability?.() ?? Response.json({ activity_protocol: 1, frontend_auth_protocol: 1, initialization_protocol: 1, initialization_ready: true });
           if (path === "/healthz") return new Response("ok");
           return provider?.(request) ?? new Response("ok");
         },
@@ -327,7 +327,7 @@ describe("mixed provider image authentication", () => {
       configuration: "config-version: 8\nplugins:\n  enabled: true\n  configs:\n    frontend-auth:\n      enabled: true\n" },
   ])("does not forward $label to an activity-only image", async (testCase) => {
     const state = platform(testCase.running, Promise.resolve(), new LeaseStorage(), true, testCase.configuration,
-      async () => new Response("old engine would accept any credential"), () => Response.json({ activity_protocol: 1 }));
+      async () => new Response("old engine would accept any credential"), () => Response.json({ activity_protocol: 1, initialization_protocol: 1, initialization_ready: true }));
     await state.initialized();
     const response = await state.cpa.fetch(new Request(`https://gateway.example${testCase.path}`, {
       method: testCase.method, headers: { authorization: `Bearer ${testCase.key}` },
@@ -340,7 +340,7 @@ describe("mixed provider image authentication", () => {
 
   it("retains native readiness, management and explicit controls while an old image is being replaced", async () => {
     const state = platform(true, Promise.resolve(), new LeaseStorage(), true, configuration, undefined,
-      () => Response.json({ activity_protocol: 1 }));
+      () => Response.json({ activity_protocol: 1, initialization_protocol: 1, initialization_ready: true }));
     await state.initialized();
     expect((await state.cpa.fetch(new Request("https://gateway.example/readyz"))).status).toBe(200);
     expect((await state.cpa.fetch(new Request("https://gateway.example/v8/management/config", { headers: await signedHeaders() }))).status).toBe(200);

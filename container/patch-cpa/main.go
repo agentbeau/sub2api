@@ -181,6 +181,44 @@ func (w *Watcher) reloadConfigIfChangedWithActivity(ctx context.Context) {
 			},
 		},
 		{
+			path: "sdk/cliproxy/service_lifecycle.go",
+			edits: []replacement{
+				{`"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"`, `"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"` + "\n\t" + helperImport},
+				{`func (s *Service) Run(ctx context.Context) error {
+\tif s == nil {
+\t\treturn fmt.Errorf("cliproxy: service is nil")
+\t}`, `func (s *Service) Run(ctx context.Context) error {
+\tif s == nil {
+\t\treturn fmt.Errorf("cliproxy: service is nil")
+\t}
+\tinitializationGeneration := sub2apiactivity.BeginInitialization()
+\tdefer sub2apiactivity.EndInitialization(initializationGeneration)`},
+				{`\tdefer func() {
+\t\tshutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)`, `\tdefer func() {
+\t\tsub2apiactivity.EndInitialization(initializationGeneration)
+\t\tshutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)`},
+				{`\ts.registerModelRefreshCallback()
+\tif !homeEnabled {
+\t\tgo s.runAntigravityModelRefresh(ctx)
+\t}
+
+\tselect {`, `\ts.registerModelRefreshCallback()
+\tif !homeEnabled {
+\t\tgo s.runAntigravityModelRefresh(ctx)
+\t}
+
+\t// HTTP liveness precedes watcher startup and OAuth model registration.
+\t// Never admit inference until bootstrap completes; an empty configured
+\t// model set is still a completed initialization, not an endless wait.
+\tif errContext := ctx.Err(); errContext != nil {
+\t\treturn errContext
+\t}
+\tsub2apiactivity.MarkInitialized(initializationGeneration)
+
+\tselect {`},
+			},
+		},
+		{
 			path: "internal/api/server_routes.go",
 			edits: []replacement{
 				{`"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"`, `"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"` + "\n\t" + helperImport},
@@ -195,7 +233,7 @@ func (w *Watcher) reloadConfigIfChangedWithActivity(ctx context.Context) {
 \t\t\tc.Status(http.StatusServiceUnavailable)
 \t\t\treturn
 \t\t}
-\t\tc.JSON(http.StatusOK, gin.H{"activity_protocol": 1, "frontend_auth_protocol": 1})
+\t\tc.JSON(http.StatusOK, gin.H{"activity_protocol": 1, "frontend_auth_protocol": 1, "initialization_protocol": 1, "initialization_ready": sub2apiactivity.Initialized()})
 \t})
 
 \ts.engine.GET("/management.html", s.serveManagementControlPanel)`},

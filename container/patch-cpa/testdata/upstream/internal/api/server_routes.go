@@ -1,5 +1,13 @@
 package api
+
+import (
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+)
+
 func (s *Server) setupRoutes() {
+	s.engine.HEAD("/healthz", healthzHandler)
+
+	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager))
