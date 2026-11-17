@@ -9,4 +9,8 @@ export interface Env {
   readonly DASHBOARD_AUTH?: string;
   readonly ACCESS_AUD?: string;
   readonly CONTAINER_IDLE_TIMEOUT_MS?: string;
+  readonly CLEF_ENABLED?: string;
+  readonly AI?: {
+    run(model: string, input: Record<string, unknown>): Promise<unknown>;
+  };
 }

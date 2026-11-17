@@ -5,10 +5,11 @@ vi.mock("cloudflare:workers", () => {
   return { DurableObject: PlatformEntrypoint, WorkerEntrypoint: PlatformEntrypoint };
 });
 import { Engine } from "../src/preview.ts";
+import { Cpa } from "../src/cpa.ts";
 const KEY = "synthetic-preview-integration-0123456789";
 const configuration = `config-version: 8\naccess:\n  api-keys: [${KEY}]\n`;
 const low = { answers: { effort: { choice: "low", probabilities: { low: 0.95 } } } };
-function platform(decide: () => Promise<unknown>, withContainer = true, revision = "f".repeat(40)) {
+function platform(decide: () => Promise<unknown>, withContainer = true, revision = "f".repeat(40), implementation: "preview" | "production" = "preview", enabled = true) {
   const events: string[] = [], forwarded: Request[] = [];
   let running = false, initialization: Promise<unknown> = Promise.resolve();
   const store = new LeaseStorage();
@@ -34,9 +35,13 @@ function platform(decide: () => Promise<unknown>, withContainer = true, revision
       } }),
     } } : {}),
   };
-  const ai = vi.fn(async () => { events.push("clef"); return decide(); });
+  const ai = vi.fn(async (_model: string, _input: unknown) => {
+    events.push(_model === "@cf/cloudflare/clef-flash" ? "clef" : "unexpected-clef-model");
+    if (typeof _input !== "object" || _input === null) events.push("invalid-clef-input");
+    return decide();
+  });
   const env = {
-    CLEF_ENABLED: "true", AI: { run: ai }, CONTAINER_IDLE_TIMEOUT_MS: "30000",
+    CLEF_ENABLED: enabled ? "true" : "false", AI: { run: ai }, CONTAINER_IDLE_TIMEOUT_MS: "30000",
     DASHBOARD_AUTH: "cloudflare", ACCESS_AUD: "synthetic-preview-audience", PREVIEW_SOURCE_REVISION: revision,
     STATE: {
       get: async (key: string) => {
@@ -47,7 +52,9 @@ function platform(decide: () => Promise<unknown>, withContainer = true, revision
     },
     LOGIN_LIMIT: { limit: async () => ({ success: true }) },
   };
-  const engine = new Engine(context as unknown as DurableObjectState, env as unknown as ConstructorParameters<typeof Engine>[1]);
+  const engine = implementation === "production"
+    ? new Cpa(context as unknown as DurableObjectState, env as unknown as ConstructorParameters<typeof Cpa>[1])
+    : new Engine(context as unknown as DurableObjectState, env as unknown as ConstructorParameters<typeof Engine>[1]);
   return { engine, ai, events, forwarded, initialized: () => initialization };
 }
 function request(effort?: string, key = KEY) {
@@ -72,6 +79,23 @@ describe("real enhanced Engine/Cpa classifier integration", () => {
     expect(p.events.indexOf("start")).toBeLessThan(p.events.indexOf("forward"));
     expect(p.ai).toHaveBeenCalledTimes(1); expect(p.forwarded).toHaveLength(1);
     expect(await p.forwarded[0]?.json()).toEqual({ ...original as object, reasoning_effort: "low" });
+  });
+  it("uses the same authenticated classifier from the production Cpa entrypoint", async () => {
+    const p = platform(async () => low, true, "f".repeat(40), "production"); await p.initialized();
+    const input = request(); const original = await input.clone().json();
+    expect((await p.engine.fetch(input)).status).toBe(200);
+    expect(p.events.indexOf("key-policy")).toBeLessThan(p.events.indexOf("clef"));
+    expect(p.ai).toHaveBeenCalledWith("@cf/cloudflare/clef-flash", expect.objectContaining({ model: "clef-flash", state: "Calculate 21 plus 22" }));
+    const classified = await p.forwarded[0]?.json() as Record<string, unknown>;
+    expect(classified).toEqual({ ...original as object, reasoning_effort: "low" });
+    expect(JSON.stringify(p.ai.mock.calls[0]?.[1])).not.toMatch(/Keep this instruction|retain|authorization|synthetic-preview-integration/);
+  });
+  it("keeps production Clef disabled until the release flag is explicitly enabled", async () => {
+    const p = platform(async () => low, true, "f".repeat(40), "production", false); await p.initialized();
+    const input = request(); const original = await input.clone().text();
+    expect((await p.engine.fetch(input)).status).toBe(200);
+    expect(p.ai).not.toHaveBeenCalled();
+    expect(await p.forwarded[0]?.text()).toBe(original);
   });
   it("rejects invalid key without AI or container startup", async () => {
     const p = platform(async () => low); await p.initialized();

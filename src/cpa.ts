@@ -13,6 +13,7 @@ import { OAuthLease } from "./oauth-lease.ts";
 import { handleR2Bridge, STATE_BUCKET, STATE_HOST } from "./r2-bridge.ts";
 import { RealtimeLease } from "./realtime-lease.ts";
 import { classify } from "./routes.ts";
+import { InferenceClassifier } from "./inference-classifier.ts";
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 
@@ -39,6 +40,7 @@ export class Cpa extends DurableObject<Env> {
   private readonly lifecycle: ContainerLifecycle | undefined;
   private readonly background: BackgroundActivity;
   private readonly management: ManagementWindow;
+  protected readonly inferenceClassifier: InferenceClassifier;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -48,6 +50,12 @@ export class Cpa extends DurableObject<Env> {
     // Retain old explicit control endpoints for compatibility with an already-open
     // old tab. The direct console never opens or depends on this editing window.
     this.management = new ManagementWindow(ctx.storage);
+    this.inferenceClassifier = new InferenceClassifier({
+      enabled: env.CLEF_ENABLED === "true",
+      ...(env.AI === undefined ? {} : { ai: env.AI }),
+      storage: ctx.storage,
+      waitUntil: task => ctx.waitUntil(task),
+    });
     const container = ctx.container;
     this.keyGuard = new KeyGuard(env.STATE, () => container?.running ?? false);
     if (container !== undefined) {
@@ -142,7 +150,11 @@ export class Cpa extends DurableObject<Env> {
   }
 
   protected prepareAuthenticatedInference(request: Request): Promise<Request> {
-    return Promise.resolve(request);
+    return this.inferenceClassifier.prepare(request);
+  }
+
+  protected classifierStats(): { calls: number; applied: number; inFlight: number } {
+    return this.inferenceClassifier.stats();
   }
 
   #dispatch(request: Request, accessAuthenticated: boolean): Promise<Response> {
