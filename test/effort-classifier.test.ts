@@ -18,6 +18,12 @@ describe("preview effort classification",()=>{
 });
 
 describe("fail-safe request preservation",()=>{
+ it("stops waiting for a slow body when the caller disconnects",async()=>{
+  const controller=new AbortController();const stream=new ReadableStream<Uint8Array>({start(){}});
+  const r=new Request("https://preview.example/v1/responses",{method:"POST",headers:{"content-type":"application/json"},body:stream,signal:controller.signal,duplex:"half"} as RequestInit);
+  const o=options();const pending=classifyEffort(r,o);controller.abort();
+  expect(await pending).toBe(r);expect(o.reserve).not.toHaveBeenCalled();expect(o.decide).not.toHaveBeenCalled();
+ });
  it("slow body does not block forwarding indefinitely",async()=>{
   const stream = new ReadableStream<Uint8Array>({start(){}});
   const r = new Request("https://preview.example/v1/responses",{method:"POST",headers:{"content-type":"application/json"},body:stream,duplex:"half"} as RequestInit);

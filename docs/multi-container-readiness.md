@@ -11,7 +11,7 @@ These boundaries mean simply changing `max_instances`, hashing a request header,
 
 ## Preparation in this branch
 
-`src/pool-coordination.ts` contains atomic lease, fencing epoch, OAuth callback-owner, stable session-placement and versioned shared-state compare-and-swap primitives. Its tests cover concurrent claim exclusion, stale-owner rejection, session affinity, callback routing, restart takeover and write conflicts. These primitives are intentionally not connected to production request routing, CPA's Go refresh code, or the R2 S3 write path; the tests validate the primitive only, not an operating multi-container deployment.
+`src/pool-coordination.ts` contains atomic lease, fencing epoch, OAuth callback-owner, stable session-placement and versioned shared-state compare-and-swap primitives. Its tests cover concurrent claim exclusion (including same-owner re-entry), explicit lease renewal, stale-owner rejection, session affinity, callback routing, restart takeover, write conflicts, conflicting callback binds and writes delayed past lease expiry. Every lease decision reads the injected clock inside the storage transaction so queue delay cannot extend an owner's rights. CPA still needs an owner-local refresh mutex around each credential and a unique owner ID per process boot. These primitives are intentionally not connected to production request routing, CPA's Go refresh code, or the R2 S3 write path; the tests validate the primitive only, not an operating multi-container deployment.
 
 ## Required integration before raising `max_instances`
 

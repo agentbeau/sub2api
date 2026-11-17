@@ -54,25 +54,43 @@ export function sessionShard(sessionId: string, shardCount: number): number {
 }
 
 export class PoolCoordinator {
-  constructor(private readonly storage: PoolStorage) {}
+  constructor(private readonly storage: PoolStorage, private readonly clock: () => number = Date.now) {}
 
-  async claimRefresh(resource: string, owner: string, now: number, leaseMs: number): Promise<FencedLease | undefined> {
-    this.validateLeaseInput(resource, owner, now, leaseMs);
+  async claimRefresh(resource: string, owner: string, leaseMs: number): Promise<FencedLease | undefined> {
+    this.validateLeaseInput(resource, owner, leaseMs);
     return this.storage.transaction(async txn => {
+      const now = this.now();
       const key = LEASE_PREFIX + resource;
       const old = await txn.get<unknown>(key);
       if (old !== undefined && !validLease(old)) throw new Error("Invalid persisted pool lease");
-      if (old !== undefined && old.expiresAt > now && old.owner !== owner) return undefined;
-      const epoch = old === undefined ? 1 : old.epoch + (old.owner === owner && old.expiresAt > now ? 0 : 1);
+      // A boot ID is shared by work in one process, so even the same owner cannot
+      // reacquire an active lease and accidentally run two refreshes concurrently.
+      if (old !== undefined && old.expiresAt > now) return undefined;
+      const epoch = old === undefined ? 1 : old.epoch + 1;
       const saved: SavedLease = { epoch, owner, expiresAt: now + leaseMs };
       await txn.put(key, saved);
       return { resource, ...saved };
     });
   }
 
-  async release(lease: FencedLease, now: number): Promise<boolean> {
-    this.validateLease(lease, now);
+  async renewRefresh(lease: FencedLease, leaseMs: number): Promise<FencedLease | undefined> {
+    this.validateLease(lease);
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1000 || leaseMs > MAX_LEASE_MS) throw new RangeError("Invalid pool lease input");
     return this.storage.transaction(async txn => {
+      const now = this.now();
+      const key = LEASE_PREFIX + lease.resource;
+      const current = await txn.get<unknown>(key);
+      if (!validLease(current) || current.owner !== lease.owner || current.epoch !== lease.epoch || current.expiresAt <= now) return undefined;
+      const renewed: SavedLease = { epoch: current.epoch, owner: current.owner, expiresAt: now + leaseMs };
+      await txn.put(key, renewed);
+      return { resource: lease.resource, ...renewed };
+    });
+  }
+
+  async release(lease: FencedLease): Promise<boolean> {
+    this.validateLease(lease);
+    return this.storage.transaction(async txn => {
+      const now = this.now();
       const key = LEASE_PREFIX + lease.resource;
       const current = await txn.get<unknown>(key);
       if (!validLease(current) || current.owner !== lease.owner || current.epoch !== lease.epoch || current.expiresAt <= now) return false;
@@ -82,12 +100,13 @@ export class PoolCoordinator {
     });
   }
 
-  async bindOAuthState(state: string, shard: number, now: number, ttlMs: number): Promise<boolean> {
+  async bindOAuthState(state: string, shard: number, ttlMs: number): Promise<boolean> {
     if (!safeId(state, 128) || !Number.isSafeInteger(shard) || shard < 0 || shard > 15
-      || !Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(ttlMs) || ttlMs < 1 || ttlMs > MAX_OAUTH_MS) {
+      || !Number.isSafeInteger(ttlMs) || ttlMs < 1 || ttlMs > MAX_OAUTH_MS) {
       throw new RangeError("Invalid OAuth ownership input");
     }
     return this.storage.transaction(async txn => {
+      const now = this.now();
       const key = OAUTH_PREFIX + state;
       const current = await txn.get<unknown>(key);
       if (typeof current === "object" && current !== null) {
@@ -101,9 +120,10 @@ export class PoolCoordinator {
     });
   }
 
-  async callbackShard(state: string, now: number): Promise<number | undefined> {
-    if (!safeId(state, 128) || !Number.isSafeInteger(now) || now < 0) return undefined;
+  async callbackShard(state: string): Promise<number | undefined> {
+    if (!safeId(state, 128)) return undefined;
     return this.storage.transaction(async txn => {
+      const now = this.now();
       const key = OAUTH_PREFIX + state;
       const saved = await txn.get<unknown>(key);
       if (typeof saved !== "object" || saved === null) return undefined;
@@ -118,10 +138,11 @@ export class PoolCoordinator {
     });
   }
 
-  async writeShared<T>(lease: FencedLease, object: string, expectedVersion: number, value: T, now: number): Promise<{ok: true; version: number} | {ok: false; reason: "stale_owner" | "conflict"}> {
-    this.validateLease(lease, now);
+  async writeShared<T>(lease: FencedLease, object: string, expectedVersion: number, value: T): Promise<{ok: true; version: number} | {ok: false; reason: "stale_owner" | "conflict"}> {
+    this.validateLease(lease);
     if (!safeId(object, 256) || !Number.isSafeInteger(expectedVersion) || expectedVersion < 0) throw new RangeError("Invalid shared state write");
     return this.storage.transaction(async txn => {
+      const now = this.now();
       const savedLease = await txn.get<unknown>(LEASE_PREFIX + lease.resource);
       if (!validLease(savedLease) || savedLease.owner !== lease.owner || savedLease.epoch !== lease.epoch || savedLease.expiresAt <= now) {
         return { ok: false, reason: "stale_owner" } as const;
@@ -157,13 +178,19 @@ export class PoolCoordinator {
     return { version: record.version, fence: record.fence, value: record.value as T };
   }
 
-  private validateLeaseInput(resource: string, owner: string, now: number, leaseMs: number): void {
-    if (!safeId(resource) || !safeId(owner) || !Number.isSafeInteger(now) || now < 0
+  private validateLeaseInput(resource: string, owner: string, leaseMs: number): void {
+    if (!safeId(resource) || !safeId(owner)
       || !Number.isSafeInteger(leaseMs) || leaseMs < 1000 || leaseMs > MAX_LEASE_MS) throw new RangeError("Invalid pool lease input");
   }
 
-  private validateLease(lease: FencedLease, now: number): void {
+  private validateLease(lease: FencedLease): void {
     if (!safeId(lease.resource) || !safeId(lease.owner) || !Number.isSafeInteger(lease.epoch) || lease.epoch < 1
-      || !Number.isSafeInteger(lease.expiresAt) || !Number.isSafeInteger(now) || now < 0) throw new RangeError("Invalid fenced lease");
+      || !Number.isSafeInteger(lease.expiresAt)) throw new RangeError("Invalid fenced lease");
+  }
+
+  private now(): number {
+    const now = this.clock();
+    if (!Number.isSafeInteger(now) || now < 0) throw new RangeError("Invalid pool clock");
+    return now;
   }
 }
