@@ -42,6 +42,8 @@ test("prepared configuration preserves state identity and cannot rebuild code or
   assert.deepEqual(config.r2_buckets, ROOT_CONFIG.r2_buckets);
   assert.equal(ROOT_CONFIG.build.command, "npm run build");
   assert.throws(() => artifactConfig(ROOT_CONFIG, "container", "registry.cloudflare.com/account/cpa:latest"), /digest/);
+  assert.throws(() => artifactConfig({ ...ROOT_CONFIG, containers: [{ ...ROOT_CONFIG.containers[0], max_instances: 3 }] }, "container", IMAGE), /single-instance/);
+  assert.throws(() => artifactConfig({ ...ROOT_CONFIG, containers: [{ class_name: "Cpa", image: "./container/Dockerfile" }] }, "container", IMAGE), /single-instance/);
 });
 
 test("worker alternative retains Store while assets move into its artifact", () => {

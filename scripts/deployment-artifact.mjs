@@ -38,7 +38,9 @@ export function artifactConfig(source, install, image = PREPARED_IMAGE) {
   ];
   if (install === "container") {
     if (!DIGEST_IMAGE.test(image)) throw new Error("A Cloudflare registry image pinned by digest is required");
-    if (config.containers?.length !== 1 || config.containers[0].class_name !== "Cpa") throw new Error("Expected the existing Cpa container");
+    if (config.containers?.length !== 1 || config.containers[0].class_name !== "Cpa" || config.containers[0].max_instances !== 1) {
+      throw new Error("Expected the existing single-instance Cpa container");
+    }
     config.containers[0].image = image;
     delete config.containers[0].image_build_context;
     delete config.containers[0].image_vars;

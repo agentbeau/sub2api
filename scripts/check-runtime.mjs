@@ -89,11 +89,36 @@ try {
 const rpcHarness = resolve(temporary, "rpc-harness.ts");
 await writeFile(rpcHarness, `
 export { Cpa, R2Bridge } from ${JSON.stringify(process.argv[2] ? artifact : resolve(root, "src/cpa.ts"))};
-export default { fetch(request, env, ctx) {
-  return ctx.exports.R2Bridge.fetch(new Request('http://r2.internal/__sub2api/activity', {
+export default { async fetch(request, env, ctx) {
+  const activityRequest = () => new Request('http://r2.internal/__sub2api/activity', {
     method: 'POST', headers: {'content-type':'application/json'},
     body: JSON.stringify({action:'begin', id:'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'})
-  }));
+  });
+  const bridgeFor = (containerId) => ctx.exports.R2Bridge({ props: { containerId } });
+  if (new URL(request.url).pathname === '/activity') {
+    const outcomes = await Promise.all(['owner-a', 'owner-b'].map(async name => {
+      const containerId = env.CPA.idFromName(name).toString();
+      const response = await bridgeFor(containerId).fetch(activityRequest());
+      return { containerId, status: response.status };
+    }));
+    return Response.json(outcomes);
+  }
+  if (new URL(request.url).pathname === '/bad-props') {
+    const response = await bridgeFor('not-an-id').fetch(activityRequest());
+    return Response.json({ status: response.status });
+  }
+  if (new URL(request.url).pathname === '/conditional-write') {
+    const bridge = bridgeFor(env.CPA.idFromName('r2-write-test').toString());
+    const key = 'http://r2.internal/state/runtime-conditional-write-test';
+    const seed = await bridge.fetch(new Request(key, { method: 'PUT', headers: {'if-none-match':'*'}, body:'seed' }));
+    const etag = seed.headers.get('etag');
+    const results = await Promise.all(['writer-a', 'writer-b'].map(body => bridge.fetch(new Request(key, {
+      method:'PUT', headers:{'if-match':etag}, body
+    }))));
+    const final = await bridge.fetch(new Request(key));
+    return Response.json({ seed: seed.status, etag, writers: results.map(response => response.status), final: await final.text() });
+  }
+  return new Response(null, {status:404});
 } };
 `);
 const rpcOutput = resolve(temporary, "rpc/index.js");
@@ -105,10 +130,22 @@ const rpcWorker = new Miniflare(convertV4MiniflareOptions({
   ratelimits: { LOGIN_LIMIT: { namespace_id: "1001", simple: { limit: 20, period: 60 } } },
 }));
 try {
-  const refused = await rpcWorker.dispatchFetch("https://internal-test.example/notify");
-  assert.equal(refused.status, 409, "Real private RPC refuses work when no container is running");
-  assert.equal((await rpcWorker.listDurableObjectIds("CPA")).length, 1);
-  console.log("PASS: real workerd entrypoint/RPC wiring reaches the preserved Cpa namespace and refuses stopped-container activity.");
+  const routed = await rpcWorker.dispatchFetch("https://internal-test.example/activity");
+  const outcomes = await routed.json();
+  assert.equal(outcomes.length, 2);
+  assert.equal(new Set(outcomes.map(outcome => outcome.containerId)).size, 2);
+  assert.deepEqual(outcomes.map(outcome => outcome.status), [409, 409], "Each owner-local RPC refuses stopped-container activity");
+  assert.equal((await rpcWorker.listDurableObjectIds("CPA")).length, 2, "Activity callbacks address each requested owner DO");
+  const badProps = await rpcWorker.dispatchFetch("https://internal-test.example/bad-props");
+  assert.deepEqual(await badProps.json(), { status: 404 }, "Missing or malformed owner identity fails closed");
+  assert.equal((await rpcWorker.listDurableObjectIds("CPA")).length, 2, "Invalid owner identity must not create or route to a DO");
+  const conditional = await rpcWorker.dispatchFetch("https://internal-test.example/conditional-write");
+  const writeResult = await conditional.json();
+  assert.equal(writeResult.seed, 200, "Create-only put is supported by the actual workerd R2 binding");
+  assert.match(writeResult.etag, /^".+"$/);
+  assert.deepEqual(writeResult.writers.sort(), [200, 412], "R2 atomically rejects one competing stale If-Match writer");
+  assert.ok(["writer-a", "writer-b"].includes(writeResult.final));
+  console.log("PASS: real workerd RPC routes activity to two explicit Cpa owner IDs; invalid owner IDs fail closed; concurrent conditional R2 writes yield one success and one 412.");
 } finally {
   await rpcWorker.dispose();
 }

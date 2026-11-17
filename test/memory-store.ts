@@ -19,7 +19,14 @@ export class MemoryStore implements ObjectStore {
     return { ...entry.meta, arrayBuffer: async () => entry.bytes.slice().buffer };
   }
 
-  async put(key: string, value: ArrayBuffer): Promise<StoredObject> {
+  async put(key: string, value: ArrayBuffer, options?: { onlyIf?: Headers }): Promise<StoredObject | null> {
+    const current = this.entries.get(key)?.meta;
+    const ifMatch = options?.onlyIf?.get("if-match");
+    const ifNoneMatch = options?.onlyIf?.get("if-none-match");
+    const matches = (condition: string, etag: string): boolean => condition.trim() === "*"
+      || condition.split(",").some((candidate) => candidate.trim() === `"${etag}"` || candidate.trim() === etag);
+    if (ifMatch !== null && ifMatch !== undefined && (current === undefined || !matches(ifMatch, current.etag))) return null;
+    if (ifNoneMatch !== null && ifNoneMatch !== undefined && current !== undefined && matches(ifNoneMatch, current.etag)) return null;
     this.version += 1;
     const bytes = new Uint8Array(value.slice(0));
     const meta = { key, size: bytes.length, etag: `etag-${this.version}`, uploaded: new Date(Date.UTC(2026, 9, 12, 0, 0, this.version)) };

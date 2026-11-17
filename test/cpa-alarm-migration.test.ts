@@ -70,7 +70,8 @@ function platform(running: boolean | undefined, deletion: Promise<void> = Promis
         events.push("alarm_deleted");
       },
     },
-    exports: { R2Bridge: {} },
+    id: { toString: () => "a".repeat(64) },
+    exports: { R2Bridge: () => ({ fetch: async () => new Response(null, { status: 204 }) }) },
     blockConcurrencyWhile: <T>(callback: () => Promise<T>): Promise<T> => {
       const pending = callback();
       initialization = pending;
@@ -83,7 +84,7 @@ function platform(running: boolean | undefined, deletion: Promise<void> = Promis
     head: async (key: string) => key === "config/config.yaml" && configuration !== null ? {} : null,
     get: async (key: string) => key === "config/config.yaml" && configuration !== null ? { text: async () => configuration } : null,
   };
-  const cpa = new Cpa(context as DurableObjectState, {
+  const cpa = new Cpa(context as unknown as DurableObjectState, {
     CONTAINER_IDLE_TIMEOUT_MS: "1000", STATE: objectStore, DASHBOARD_PASSWORD,
     LOGIN_LIMIT: { limit: async () => ({ success: true }) },
   } as unknown as Env);
@@ -480,22 +481,24 @@ describe("actual background work and native inactivity", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("dispatches internal activity to the same typed Cpa singleton through R2Bridge", async () => {
+  it("dispatches internal activity to the Durable Object ID supplied as RPC props", async () => {
     const calls: Array<{ name: string; action: BackgroundAction; id: string }> = [];
+    const ownerId = "b".repeat(64);
     const env = {
       CPA: {
-        getByName: (name: string) => ({ backgroundActivity: async (action: BackgroundAction, id: string) => {
-          calls.push({ name, action, id });
+        idFromString: (id: string) => ({ id }),
+        get: (id: { id: string }) => ({ backgroundActivity: async (action: BackgroundAction, activityId: string) => {
+          calls.push({ name: id.id, action, id: activityId });
           return true;
         } }),
       },
     };
-    const bridge = new R2Bridge({} as ExecutionContext, env as Env);
+    const bridge = new R2Bridge({ props: { containerId: ownerId } } as unknown as ExecutionContext<{ containerId: string }>, env as unknown as Env);
     const response = await bridge.fetch(new Request("http://r2.internal/__sub2api/activity", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "begin", id: firstId }),
     }));
     expect(response.status).toBe(204);
-    expect(calls).toEqual([{ name: "cf-singleton-container", action: "begin", id: firstId }]);
+    expect(calls).toEqual([{ name: ownerId, action: "begin", id: firstId }]);
   });
 });
 

@@ -23,7 +23,7 @@ async function fixture(t, install = "container", live = install) {
   const config = artifactConfig({
     name: "sub2api", main: "src/index.ts",
     ...(install === "container" ? {
-      containers: [{ class_name: "Cpa", image: "./container/Dockerfile" }],
+      containers: [{ class_name: "Cpa", image: "./container/Dockerfile", max_instances: 1 }],
       r2_buckets: [{ binding: "STATE", bucket_name: "sub2api" }],
     } : {}),
   }, install);
@@ -163,6 +163,17 @@ test("an explicitly invalid or different expected-main revision is rejected befo
     await assert.rejects(deployPrepared(f.args, f.options), /expected main revision/);
     assert.deepEqual(writes(f.state), []);
   }
+});
+
+test("a prepared container artifact that raises max_instances is rejected before any external write", async (t) => {
+  const f = await fixture(t);
+  const configPath = join(f.worker, "wrangler.json");
+  const config = JSON.parse(await readFile(configPath, "utf8"));
+  config.containers[0].max_instances = 3;
+  await writeFile(configPath, JSON.stringify(config));
+  await writeManifest(f.worker, { revision, dirty: false, install: "container" });
+  await assert.rejects(deployPrepared(f.args, f.options), /single-instance/);
+  assert.deepEqual(writes(f.state), [], "The gate runs before image publication, R2 writes or Worker activation");
 });
 
 test("the shared public-main check rejects malformed or ambiguous responses", async () => {

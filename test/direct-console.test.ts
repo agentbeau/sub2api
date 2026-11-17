@@ -41,7 +41,8 @@ function fixture(nativeStatus = 200) {
     }; },
   };
   const ctx = {
-    container, exports: { R2Bridge: {} },
+    container, id: { toString: () => "a".repeat(64) },
+    exports: { R2Bridge: () => ({ fetch: async () => new Response(null, { status: 204 }) }) },
     storage: { get: <T>(key: string) => storage.get<T>(key), put: (key: string, value: unknown) => storage.put(key, value), delete: (key: string) => storage.delete(key), deleteAlarm: async () => {} },
     blockConcurrencyWhile: <T>(callback: () => Promise<T>) => { const result = callback(); initialized = result; return result; },
   };

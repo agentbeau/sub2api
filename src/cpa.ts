@@ -91,7 +91,12 @@ export class Cpa extends DurableObject<Env> {
             ...(imported === null ? {} : { CPA_IMPORT_CONFIG: imported }),
           };
         },
-        attach: () => container.interceptOutboundHttp(STATE_HOST, this.ctx.exports.R2Bridge),
+        // The activity endpoint must return to the Durable Object that owns this
+        // container. The bridge receives the stable DO ID as RPC props; it never
+        // guesses or falls back to the singleton name.
+        attach: () => container.interceptOutboundHttp(STATE_HOST, this.ctx.exports.R2Bridge({
+          props: { containerId: this.ctx.id.toString() },
+        })),
       });
     }
     void ctx.blockConcurrencyWhile(async () => {
@@ -250,10 +255,19 @@ export class Cpa extends DurableObject<Env> {
 
 // The only intercepted egress is CPA's internal HTTP object store. Provider HTTPS connections
 // leave the Linux container directly, preserving CPA's transport and TLS behavior.
-export class R2Bridge extends WorkerEntrypoint<Env> {
+export class R2Bridge extends WorkerEntrypoint<Env, { containerId: string }> {
   override fetch(request: Request): Promise<Response> {
     if (new URL(request.url).pathname === "/__sub2api/activity") {
-      return handleBackgroundActivity(request, (action, id) => this.env.CPA.getByName("cf-singleton-container").backgroundActivity(action, id));
+      const containerId = this.ctx.props?.containerId;
+      if (typeof containerId !== "string" || !/^[a-f0-9]{64}$/.test(containerId)) {
+        return Promise.resolve(new Response(null, { status: 404, headers: { "cache-control": "no-store" } }));
+      }
+      try {
+        const owner = this.env.CPA.get(this.env.CPA.idFromString(containerId));
+        return handleBackgroundActivity(request, (action, id) => owner.backgroundActivity(action, id));
+      } catch {
+        return Promise.resolve(new Response(null, { status: 404, headers: { "cache-control": "no-store" } }));
+      }
     }
     return handleR2Bridge(request, this.env.STATE);
   }

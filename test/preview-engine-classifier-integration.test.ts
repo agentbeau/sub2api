@@ -20,7 +20,8 @@ function platform(decide: () => Promise<unknown>, withContainer = true, revision
     transaction: <T>(callback: (txn: LeaseStorage) => Promise<T>) => callback(store),
   };
   const context = {
-    storage, exports: { R2Bridge: {} },
+    storage, id: { toString: () => "a".repeat(64) },
+    exports: { R2Bridge: () => ({ fetch: async () => new Response(null, { status: 204 }) }) },
     blockConcurrencyWhile: <T>(callback: () => Promise<T>) => { const result = callback(); initialization = result; return result; },
     waitUntil: (task: Promise<unknown>) => { waitUntilTasks.push(task); void task.catch(() => {}); },
     ...(withContainer ? { container: {
