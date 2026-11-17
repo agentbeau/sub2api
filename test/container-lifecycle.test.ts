@@ -930,6 +930,37 @@ describe("explicit provider initialization gate", () => {
 });
 
 describe("foreground body lifetime", () => {
+  it("keeps a stream protected across multiple 30-second renewals until EOF", async () => {
+    vi.useFakeTimers();
+    const state = lifecycle();
+    let source: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let submissions = 0;
+    state.container.upstream = async () => {
+      submissions++;
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) { source = controller; },
+      }, { highWaterMark: 0 }), { headers: { "content-type": "text/event-stream" } });
+    };
+    const result = await state.controller.forward(new Request("https://gateway.example/v1/responses", { method: "POST" }));
+    expect(result.status).toBe(200);
+    const initialTimeoutUpdates = state.container.timeouts.length;
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(state.container.timeouts.length).toBe(initialTimeoutUpdates + 2);
+    expect(submissions).toBe(1);
+    expect(vi.getTimerCount()).toBe(1);
+
+    if (!result.body) throw new Error("Expected a streaming response body");
+    const reader = result.body.getReader();
+    source?.enqueue(new TextEncoder().encode("data: token\n\n"));
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe("data: token\n\n");
+    source?.close();
+    expect((await reader.read()).done).toBe(true);
+    expect(state.container.timeouts.at(-1)).toBe(1000);
+    expect(submissions).toBe(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("releases the lease when wrapping a locked body fails", async () => {
     vi.useFakeTimers();
     const state = lifecycle();
