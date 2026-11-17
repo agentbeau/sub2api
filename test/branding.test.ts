@@ -104,3 +104,26 @@ describe("neutral public provider metadata", () => {
     expect(result.headers.has("x-cpa-version")).toBe(false);
   });
 });
+
+
+describe("public model API branding boundary", () => {
+  it("omits engine identity while preserving native provider headers and body", async () => {
+    const response = new Response('data: {"text":"CPA"}\n\n', { headers: {
+      "x-cpa-version": "v8", "x-sub2api-engine-commit": "sha", "x-engine-build-date": "today",
+      "access-control-expose-headers": "X-CPA-Version, X-Request-ID, X-Sub2api-Engine-Commit",
+      "x-request-id": "req-1", "openai-processing-ms": "5",
+      "x-ratelimit-remaining-requests": "10", "retry-after": "1",
+      "content-type": "text/event-stream",
+    } });
+    const result = publicProviderResponse(response, true);
+    expect(result.body).toBe(response.body);
+    expect(response.bodyUsed).toBe(false);
+    expect(Object.fromEntries(result.headers)).toEqual({
+      "access-control-expose-headers": "X-Request-ID",
+      "x-request-id": "req-1", "openai-processing-ms": "5",
+      "x-ratelimit-remaining-requests": "10", "retry-after": "1",
+      "content-type": "text/event-stream",
+    });
+    expect(await result.text()).toBe('data: {"text":"CPA"}\n\n');
+  });
+});

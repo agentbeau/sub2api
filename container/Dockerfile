@@ -1,10 +1,13 @@
+# syntax=docker/dockerfile:1.7
 FROM golang:1.26-bookworm AS builder
 # Keep the deployed, checked provider version unless an upgrade is explicitly selected.
 # Passing CPA_VERSION=latest still opts into testing the newest upstream release.
 ARG CPA_VERSION=v8.0.67
 ENV GOTOOLCHAIN=auto
 WORKDIR /src
-RUN set -eu; repo=https://github.com/router-for-me/CLIProxyAPI.git; tag="${CPA_VERSION}"; \
+RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false \
+  set -eu; if [ -s /run/secrets/build-ca ]; then export GIT_SSL_CAINFO=/run/secrets/build-ca CURL_CA_BUNDLE=/run/secrets/build-ca SSL_CERT_FILE=/run/secrets/build-ca; fi; \
+  repo=https://github.com/router-for-me/CLIProxyAPI.git; tag="${CPA_VERSION}"; \
   if [ "$tag" = latest ]; then \
     tag=$(git ls-remote --tags --refs "$repo" | awk -F/ '{print $3}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1); \
   fi; \
@@ -14,27 +17,49 @@ RUN set -eu; repo=https://github.com/router-for-me/CLIProxyAPI.git; tag="${CPA_V
   && printf '%s' "$tag" > /tmp/cpa-version
 COPY activity /src/internal/sub2apiactivity
 COPY patch-cpa /build/patch-cpa
+COPY readiness-test/service_readiness_window_repro_test.go /src/sdk/cliproxy/service_readiness_window_repro_test.go
 # Source drift fails the image build before any hook can be omitted. Tests exercise
 # the real internal HTTP protocol, parent/child handoff, and synchronous-save ordering.
-RUN go test /build/patch-cpa/main.go /build/patch-cpa/main_test.go \
+RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false \
+  set -eu; if [ -s /run/secrets/build-ca ]; then export GIT_SSL_CAINFO=/run/secrets/build-ca CURL_CA_BUNDLE=/run/secrets/build-ca SSL_CERT_FILE=/run/secrets/build-ca; fi; \
+  go test /build/patch-cpa/main.go /build/patch-cpa/main_test.go \
   && go run /build/patch-cpa/main.go /src \
-  && go test -race ./internal/sub2apiactivity
-RUN CGO_ENABLED=1 GOOS=linux go build -buildvcs=false \
+  && go test -race ./internal/sub2apiactivity \
+  && go test ./sdk/cliproxy -run '^(TestReadinessWindowHealthIsNotModelReady|TestInitializationReadinessEmptyAndFailedBootstrap)$' -count=1
+RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false \
+  set -eu; if [ -s /run/secrets/build-ca ]; then export GIT_SSL_CAINFO=/run/secrets/build-ca CURL_CA_BUNDLE=/run/secrets/build-ca SSL_CERT_FILE=/run/secrets/build-ca; fi; \
+  CGO_ENABLED=1 GOOS=linux go build -buildvcs=false \
   -ldflags="-s -w -X 'main.Version=$(cat /tmp/cpa-version)' -X 'main.Commit=$(git rev-parse HEAD)'" \
   -o /out/CLIProxyAPI ./cmd/server/
 
+FROM golang:1.26-bookworm AS panel-download
+ARG PANEL_VERSION=latest
+WORKDIR /panel-download
+RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false \
+  set -eu; if [ -s /run/secrets/build-ca ]; then export CURL_CA_BUNDLE=/run/secrets/build-ca SSL_CERT_FILE=/run/secrets/build-ca; fi; \
+  case "$PANEL_VERSION" in \
+    latest) url=https://github.com/router-for-me/Cli-Proxy-API-Management-Center/releases/latest/download/management.html ;; \
+    ''|*[!A-Za-z0-9._-]*) echo "PANEL_VERSION must be latest or a release tag" >&2; exit 2 ;; \
+    *) url="https://github.com/router-for-me/Cli-Proxy-API-Management-Center/releases/download/$PANEL_VERSION/management.html" ;; \
+  esac; \
+  curl --fail --location --retry 3 --output /panel-download/original.html "$url"
+
 FROM node:24-bookworm-slim AS panel
 # Branding is a build-time transform. Node/TypeScript are absent from the runtime image.
-ARG PANEL_VERSION=latest
 ARG PANEL_SHA256=""
 WORKDIR /branding
+COPY --from=panel-download /panel-download/original.html ./original.html
 COPY brand-panel/package.json brand-panel/package-lock.json ./
-RUN npm ci --ignore-scripts --no-audit --no-fund
+RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false \
+  set -eu; if [ -s /run/secrets/build-ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/build-ca npm_config_cafile=/run/secrets/build-ca CURL_CA_BUNDLE=/run/secrets/build-ca; fi; \
+  npm ci --ignore-scripts --no-audit --no-fund
 COPY brand-panel/brand.mjs brand-panel/brand.test.mjs brand-panel/UPSTREAM_LICENSE ./
-RUN node --test brand.test.mjs && node brand.mjs --fetch /out/management.html
+RUN node --test brand.test.mjs && node brand.mjs /branding/original.html /out/management.html
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tzdata \
+RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false \
+  set -eu; if [ -s /run/secrets/build-ca ]; then export CURL_CA_BUNDLE=/run/secrets/build-ca SSL_CERT_FILE=/run/secrets/build-ca; fi; \
+  apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tzdata \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=panel /out/management.html /panel/management.html
 COPY --from=builder /src/LICENSE /usr/share/licenses/sub2api/provider-LICENSE

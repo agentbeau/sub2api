@@ -2,15 +2,16 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, dagul/isolated-worker-preview, dagul/classifier-readiness-integration]
   pull_request:
   workflow_call:
 
 permissions:
   contents: read
 
-# A branch update is checked through its PR, not through both push and PR events.
-# Superseded PR checks can stop; main/reusable deployment checks are not interrupted.
+# Integration branch push CI is the publisher's exact-source artifact input; PR runs also test changes.
+# GitHub skips push workflows when a push changes no files; a no-op commit cannot retrigger CI.
+# Keep event-specific groups: superseded PR checks can stop, while push/reusable checks finish.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -40,6 +41,24 @@ jobs:
       - run: npm run verify
       - name: Verify deployment safeguards
         run: node --test scripts/deployment.test.mjs scripts/deploy-prepared.test.mjs scripts/cloudflare-builds.test.mjs scripts/consume-ci-artifacts.test.mjs scripts/publish-ci-artifacts.test.mjs container/brand-panel/brand.test.mjs
+      - name: Exercise the compiled isolated preview boundary
+        if: github.head_ref == 'dagul/isolated-worker-preview' || github.ref_name == 'dagul/isolated-worker-preview' || github.head_ref == 'dagul/classifier-readiness-integration' || github.ref_name == 'dagul/classifier-readiness-integration'
+        run: |
+          node --test scripts/preview-guard.test.mjs scripts/preview-builds.test.mjs scripts/consume-preview-artifacts.test.mjs scripts/publish-preview-artifacts.test.mjs
+          npx esbuild src/preview.ts --bundle --format=esm --platform=neutral --target=esnext '--conditions=workerd,worker,browser' '--external:cloudflare:*' --loader:.wasm=copy --outfile=.wrangler/preview-runtime/preview.js
+          node scripts/preview-runtime.mjs .wrangler/preview-runtime/preview.js
+      - name: Package tested isolated preview
+        if: github.head_ref == 'dagul/isolated-worker-preview' || github.ref_name == 'dagul/isolated-worker-preview' || github.head_ref == 'dagul/classifier-readiness-integration' || github.ref_name == 'dagul/classifier-readiness-integration'
+        run: node scripts/package-preview.mjs
+      - uses: actions/upload-artifact@v4
+        if: github.head_ref == 'dagul/isolated-worker-preview' || github.ref_name == 'dagul/isolated-worker-preview' || github.head_ref == 'dagul/classifier-readiness-integration' || github.ref_name == 'dagul/classifier-readiness-integration'
+        with:
+          name: isolated-preview
+          path: .wrangler/artifacts/isolated-preview
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
       - name: Package the compiled container gateway
         run: node scripts/prepare-deployment.mjs container .wrangler/artifacts/container-worker
       - name: Exercise source gateway streaming and WebSockets in workerd

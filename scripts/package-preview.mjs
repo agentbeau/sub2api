@@ -1,0 +1,15 @@
+import { cp, mkdir, rm, readFile, writeFile } from 'node:fs/promises';
+import { previewArtifactConfig } from './preview-builds.mjs';
+import { validatePreview } from './preview-guard.mjs';
+import { sourceIdentity, writeManifest } from './deployment-artifact.mjs';
+const branch = process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF_NAME || process.env.WORKERS_CI_BRANCH || '';
+const source = JSON.parse(await readFile('wrangler.preview.jsonc', 'utf8'));
+validatePreview(source, branch);
+const identity = sourceIdentity(process.cwd());
+if (identity.dirty) throw new Error('Dirty preview source');
+const target = '.wrangler/artifacts/isolated-preview';
+await rm(target, { recursive: true, force: true });
+await mkdir(target, { recursive: true });
+await cp('.wrangler/preview-runtime', `${target}/worker`, { recursive: true });
+await writeFile(`${target}/wrangler.json`, JSON.stringify(previewArtifactConfig(source, identity.revision)));
+await writeManifest(target, { ...identity, install: 'isolated-preview' });

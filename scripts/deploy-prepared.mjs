@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { checkCurrentMain } from "./current-main.mjs";
+import { verifyExistingDashboard } from "./dashboard-artifact.mjs";
 import { artifactConfig, DASHBOARD_OBJECT_KEY, DASHBOARD_PANEL_FILE, deploymentSecrets, imageDigest, verifyArtifact, verifyContainerImageArtifact } from "./deployment-artifact.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -52,11 +53,14 @@ export async function deployPrepared([install, artifactPath, imagePath], { root 
     const digests = JSON.parse(execute("docker", ["image", "inspect", "--format", "{{json .RepoDigests}}", remoteTag], { encoding: "utf8", env: childEnv }));
     const pinned = imageDigest(digests, account, manifest.image);
     config = artifactConfig(source, install, pinned);
-    // Publish the image's checksummed panel before the Worker switches to serving
-    // it from R2. Dashboard viewing then needs no provider/container request.
     await checkMain();
-    execute(wrangler, ["r2", "object", "put", `${bucket}/${DASHBOARD_OBJECT_KEY}`, "--file", join(images, DASHBOARD_PANEL_FILE), "--content-type", "text/html; charset=utf-8", "--cache-control", "no-cache", "--remote"], { cwd: root, stdio: "inherit", env: childEnv });
-    console.log(`Published ${DASHBOARD_OBJECT_KEY} from the tested image (${manifest.files[DASHBOARD_PANEL_FILE]})`);
+    if (live === "none") {
+      execute(wrangler, ["r2", "object", "put", `${bucket}/${DASHBOARD_OBJECT_KEY}`, "--file", join(images, DASHBOARD_PANEL_FILE), "--content-type", "text/html; charset=utf-8", "--cache-control", "no-cache", "--remote"], { cwd: root, stdio: "inherit", env: childEnv });
+      console.log(`Published first-install ${DASHBOARD_OBJECT_KEY} from the tested image (${manifest.files[DASHBOARD_PANEL_FILE]})`);
+    } else {
+      const dashboard = await verifyExistingDashboard({ account, bucket, token, fetcher });
+      console.log(`Preserved existing ${DASHBOARD_OBJECT_KEY} (${dashboard.byteLength} bytes; SHA-256 ${dashboard.sha256})`);
+    }
     console.log(`Deploying the smoke-tested image by digest: ${pinned}`);
   }
 

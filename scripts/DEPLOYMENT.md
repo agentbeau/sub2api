@@ -19,26 +19,24 @@ The manifest records the source revision, clean-source status, image identity,
 and separate checksums for both payload files. A container deployment refuses an
 artifact with a missing or changed dashboard, even if the image itself is valid.
 
-`deploy-prepared.mjs` verifies the complete artifact before account mutations,
-loads and pushes the tested image, and uploads the verified HTML to
-`sub2api/dashboard/management.html` using `wrangler r2 object put --remote`.
-The object uses `text/html; charset=utf-8` and `Cache-Control: no-cache`. The Worker
-is deployed only after that upload succeeds. This keeps the public dashboard
-available from the existing `STATE` bucket without starting the provider.
-
-The upload replaces only `dashboard/management.html`. It does not change the
-container image digest, provider configuration, stored credentials, or the
-Workers-only installation. A failed panel upload stops the Worker deployment.
+`deploy-prepared.mjs` verifies the complete artifact before account mutations
+and loads and pushes the tested image. For an existing container installation,
+it reads and hashes `sub2api/dashboard/management.html` and preserves those exact
+R2 bytes. If that object cannot be read or is empty, deployment stops before
+Worker activation instead of replacing the enhanced dashboard. On a first
+installation only, it uploads the checked HTML from the tested image with
+`text/html; charset=utf-8` and `Cache-Control: no-cache` before activating the Worker.
+The static dashboard remains available from the existing `STATE` bucket without
+starting the provider.
 
 Cloudflare's Builds wrapper opts into late public-main checks by setting
 `SUB2API_EXPECTED_MAIN_SHA` to the verified `CHECKED_SHA`. An explicit value must
 be a full commit SHA equal to `CHECKED_SHA`. The script checks it after the image
-push before the R2 panel write, then again immediately before Wrangler
-activation. Lookup failures and changed main both stop the remaining writes.
+push before verifying the existing R2 dashboard, then again immediately before
+Wrangler activation. Lookup failures and changed main both stop the remaining steps.
 With this variable absent, ordinary GitHub and manual prepared deployments keep
 their existing behavior without adding a GitHub network lookup. These checks
-are not an atomic lock: main may change after a check, and a panel already
-uploaded remains if the final check prevents Worker activation. See the
+are not an atomic lock: main may change after a check. See the
 [Workers Builds ordering limits](../docs/cloudflare-builds.md#build-configuration).
 
 For a connector deployment of an older, already tested artifact without the

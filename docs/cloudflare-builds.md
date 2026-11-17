@@ -11,8 +11,8 @@ workflows by adding their Cloudflare secrets while Workers Builds is active.
 
 This path updates the existing `sub2api` Worker and container application. It
 refuses a first installation or the Workers-only alternative, and preserves
-the existing dashboard password, management key, Durable Object identity and
-R2 state. It does not create tokens or rewrite runtime credentials.
+the existing dashboard password, management key, Durable Object identity,
+dashboard HTML and R2 state. It does not create tokens or rewrite runtime credentials.
 
 ## Build configuration
 
@@ -46,18 +46,19 @@ matches the supplied commit. It also checks the current public GitHub `main`
 ref before building and before entering the prepared deploy. The wrapper sets
 `SUB2API_EXPECTED_MAIN_SHA` to that verified revision; operators do not need to
 configure this variable. `deploy-prepared.mjs` uses the same public-main check
-after pushing the image, immediately before uploading the R2 panel, and again
-immediately before invoking Wrangler to activate the Worker. A changed main or
-failed lookup stops that phase. These Git reads receive no deployment token and
-require no additional Cloudflare API permissions.
+after pushing the image before reading the existing R2 dashboard, then again
+immediately before invoking Wrangler to activate the Worker. Existing dashboard
+bytes are hashed and preserved; a missing or unreadable object stops deployment.
+A changed main or failed lookup stops that phase. These Git reads receive no
+deployment token and require no additional Cloudflare API permissions.
 
 The checks narrow the interval in which an older build could deploy, but are
 not an atomic lock. Cloudflare documents skipping
 [superseded queued builds](https://developers.cloudflare.com/changelog/post/2026-07-24-skip-superseded-builds/),
 not cancellation or activation ordering for already-running builds. Main can
-still change after a successful check. The panel upload and Worker/container
-deployment are also separate writes: if main changes after the panel upload,
-the final check stops Worker activation but the uploaded panel remains. Keep
+still change after a successful check. The container image push and Worker
+deployment are separate writes: a failure after image push can leave an unused
+image in the registry, while the active app and Worker remain unchanged. Keep
 one automatic production deployer and do not describe these checks as providing
 GitHub's production concurrency lock.
 

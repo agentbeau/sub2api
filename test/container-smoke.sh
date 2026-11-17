@@ -119,7 +119,7 @@ activity_finished() {
 start_cpa
 expect 200 "$base/healthz"
 expect 200 "$base/__sub2api/lifecycle"
-curl --fail --silent "$base/__sub2api/lifecycle" | node -e 'const x=JSON.parse(require("node:fs").readFileSync(0,"utf8")); if(x.activity_protocol!==1 || x.frontend_auth_protocol!==1) process.exit(1)' || fail "provider does not advertise both required lifecycle/auth protocols"
+curl --fail --silent "$base/__sub2api/lifecycle" | node -e 'const x=JSON.parse(require("node:fs").readFileSync(0,"utf8")); if(x.activity_protocol!==1 || x.frontend_auth_protocol!==1 || x.initialization_protocol!==1 || x.initialization_ready!==true) process.exit(1)' || fail "provider does not advertise activity, frontend-auth and completed initialization protocols"
 expect 401 "$base/v1/models"
 expect 401 -H "authorization: Bearer unconfigured-key" "$base/v1/models"
 expect 401 "$base/v8/management/config"

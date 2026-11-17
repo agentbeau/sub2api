@@ -4,23 +4,26 @@ function publicHeaderName(name: string): string {
 }
 
 // Change only public engine metadata. Provider bodies, protocol values and the
-// original Response remain untouched unless a header actually needs renaming.
-export function publicProviderResponse(response: Response): Response {
+// original Response remain untouched unless a header actually needs changing.
+// Public model APIs omit private engine metadata; the console keeps neutral
+// names for its version/capability readers. Never rewrite provider payloads.
+export function publicProviderResponse(response: Response, publicApi = false): Response {
   let headers: Headers | undefined;
   for (const [name, value] of response.headers) {
     const renamed = publicHeaderName(name);
-    if (renamed === name) continue;
+    if (renamed === name && !(publicApi && /^x-engine-/i.test(name))) continue;
     headers ??= new Headers(response.headers);
     headers.delete(name);
-    headers.append(renamed, value);
+    if (!publicApi) headers.append(renamed, value);
   }
 
   const exposed = response.headers.get("access-control-expose-headers");
   if (exposed !== null) {
     const renamed = exposed.split(",").map((token) => {
       const name = token.trim();
-      return token.replace(name, publicHeaderName(name));
-    }).join(",");
+      const renamed = publicHeaderName(name);
+      return publicApi && (renamed !== name || /^x-engine-/i.test(name)) ? "" : token.replace(name, renamed);
+    }).filter(token => token.trim().length > 0).join(",");
     if (renamed !== exposed) {
       headers ??= new Headers(response.headers);
       headers.set("access-control-expose-headers", renamed);
