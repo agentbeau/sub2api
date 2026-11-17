@@ -9,8 +9,8 @@ on:
 permissions:
   contents: read
 
-# A branch update is checked through its PR, not through both push and PR events.
-# Superseded PR checks can stop; main/reusable deployment checks are not interrupted.
+# Integration branch push CI is the publisher's exact-source artifact input; PR runs also test changes.
+# Keep event-specific groups: superseded PR checks can stop, while push/reusable checks finish.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
