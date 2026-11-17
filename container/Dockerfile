@@ -32,19 +32,29 @@ RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false 
   -ldflags="-s -w -X 'main.Version=$(cat /tmp/cpa-version)' -X 'main.Commit=$(git rev-parse HEAD)'" \
   -o /out/CLIProxyAPI ./cmd/server/
 
+FROM golang:1.26-bookworm AS panel-download
+ARG PANEL_VERSION=latest
+WORKDIR /panel-download
+RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false \
+  set -eu; if [ -s /run/secrets/build-ca ]; then export CURL_CA_BUNDLE=/run/secrets/build-ca SSL_CERT_FILE=/run/secrets/build-ca; fi; \
+  case "$PANEL_VERSION" in \
+    latest) url=https://github.com/router-for-me/Cli-Proxy-API-Management-Center/releases/latest/download/management.html ;; \
+    ''|*[!A-Za-z0-9._-]*) echo "PANEL_VERSION must be latest or a release tag" >&2; exit 2 ;; \
+    *) url="https://github.com/router-for-me/Cli-Proxy-API-Management-Center/releases/download/$PANEL_VERSION/management.html" ;; \
+  esac; \
+  curl --fail --location --retry 3 --output /panel-download/original.html "$url"
+
 FROM node:24-bookworm-slim AS panel
 # Branding is a build-time transform. Node/TypeScript are absent from the runtime image.
-ARG PANEL_VERSION=latest
 ARG PANEL_SHA256=""
 WORKDIR /branding
+COPY --from=panel-download /panel-download/original.html ./original.html
 COPY brand-panel/package.json brand-panel/package-lock.json ./
 RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false \
   set -eu; if [ -s /run/secrets/build-ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/build-ca npm_config_cafile=/run/secrets/build-ca CURL_CA_BUNDLE=/run/secrets/build-ca; fi; \
   npm ci --ignore-scripts --no-audit --no-fund
 COPY brand-panel/brand.mjs brand-panel/brand.test.mjs brand-panel/UPSTREAM_LICENSE ./
-RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false \
-  set -eu; if [ -s /run/secrets/build-ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/build-ca CURL_CA_BUNDLE=/run/secrets/build-ca; fi; \
-  node --test brand.test.mjs && node brand.mjs --fetch /out/management.html
+RUN node --test brand.test.mjs && node brand.mjs /branding/original.html /out/management.html
 
 FROM debian:bookworm-slim
 RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false \
