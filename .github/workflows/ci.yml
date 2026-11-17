@@ -10,6 +10,7 @@ permissions:
   contents: read
 
 # Integration branch push CI is the publisher's exact-source artifact input; PR runs also test changes.
+# GitHub skips push workflows when a push changes no files; a no-op commit cannot retrigger CI.
 # Keep event-specific groups: superseded PR checks can stop, while push/reusable checks finish.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
