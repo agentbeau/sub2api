@@ -17,6 +17,8 @@ RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false 
   && printf '%s' "$tag" > /tmp/cpa-version
 COPY activity /src/internal/sub2apiactivity
 COPY patch-cpa /build/patch-cpa
+COPY patch-cpa/objectstore_fencing.go /src/internal/store/objectstore_fencing.go
+COPY patch-cpa/objectstore_fencing_test.go /src/internal/store/objectstore_fencing_sub2api_test.go
 COPY readiness-test/service_readiness_window_repro_test.go /src/sdk/cliproxy/service_readiness_window_repro_test.go
 # Source drift fails the image build before any hook can be omitted. Tests exercise
 # the real internal HTTP protocol, parent/child handoff, and synchronous-save ordering.
@@ -25,6 +27,7 @@ RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false 
   go test /build/patch-cpa/main.go /build/patch-cpa/main_test.go \
   && go run /build/patch-cpa/main.go /src \
   && go test -race ./internal/sub2apiactivity \
+  && go test -race ./internal/store -run '^(TestConditionalAuthAndConfigWritesRejectAStaleVersion|TestConditionalWritesRequireFenceAndKnownBaseVersion|TestFencedDeleteUsesConditionalEmptyTombstoneAndCanBeRecreated|TestConcurrentConditionalCredentialWritesHaveOneWinner|TestConcurrentConditionalWritesForDifferentKeysProtectVersionCache|TestUnknownConditionalWriteOutcomeIsNotReplayedOrRebased|TestCredentialWriteAcquiresAKeySpecificWorkerFence)$' -count=1 \
   && go test ./sdk/cliproxy -run '^(TestReadinessWindowHealthIsNotModelReady|TestInitializationReadinessEmptyAndFailedBootstrap)$' -count=1
 RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false \
   set -eu; if [ -s /run/secrets/build-ca ]; then export GIT_SSL_CAINFO=/run/secrets/build-ca CURL_CA_BUNDLE=/run/secrets/build-ca SSL_CERT_FILE=/run/secrets/build-ca; fi; \

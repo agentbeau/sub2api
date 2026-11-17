@@ -14,8 +14,31 @@ import { handleR2Bridge, STATE_BUCKET, STATE_HOST } from "./r2-bridge.ts";
 import { RealtimeLease } from "./realtime-lease.ts";
 import { classify } from "./routes.ts";
 import { InferenceClassifier } from "./inference-classifier.ts";
+import { PoolCoordinator, type FencedLease, type PoolStorage } from "./pool-coordination.ts";
+import type { ObjectStore } from "./s3.ts";
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
+const poolResourcePattern = /^[A-Za-z0-9_.:-]{1,160}$/;
+const poolOwnerPattern = /^[a-f0-9]{64}:[a-f0-9]{32}$/;
+
+interface PoolStoredObject {
+  readonly key: string;
+  readonly size: number;
+  readonly etag: string;
+  readonly uploadedAt: number;
+}
+
+type PoolObjectWriteResult =
+  | { readonly ok: true; readonly object: PoolStoredObject }
+  | { readonly ok: false; readonly reason: "stale_owner" | "precondition_failed" };
+
+interface PoolObjectFence {
+  readonly resource: string;
+  readonly owner: string;
+  readonly epoch: number;
+}
+
+class FencedWriteRejected extends Error {}
 
 function hasPanelReferer(request: Request, url: URL): boolean {
   const referer = request.headers.get("referer");
@@ -36,6 +59,7 @@ function hasManagementCredential(request: Request): boolean {
 // The native console is served at the edge. Its real management requests use
 // the verified browser identity and native management authentication, without a UI gate.
 export class Cpa extends DurableObject<Env> {
+  private readonly pool: PoolCoordinator;
   private readonly keyGuard: KeyGuard;
   private readonly lifecycle: ContainerLifecycle | undefined;
   private readonly background: BackgroundActivity;
@@ -44,7 +68,12 @@ export class Cpa extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    const lease = new OAuthLease(ctx.storage);
+    this.pool = new PoolCoordinator(ctx.storage as unknown as PoolStorage);
+    const lease = new OAuthLease(ctx.storage, Date.now, async state => {
+      const owner = this.ctx.id.toString();
+      const bound = await this.poolStub().bindPoolOAuthOwner(state, owner, 31 * 60_000);
+      if (!bound) throw new Error("OAuth callback ownership could not be persisted");
+    });
     const realtime = new RealtimeLease(ctx.storage);
     this.background = new BackgroundActivity(ctx.storage);
     // Retain old explicit control endpoints for compatibility with an already-open
@@ -87,6 +116,7 @@ export class Cpa extends DurableObject<Env> {
             OBJECTSTORE_ACCESS_KEY: "r2-binding",
             OBJECTSTORE_SECRET_KEY: "r2-binding",
             SUB2API_ACTIVITY_ENDPOINT: `http://${STATE_HOST}/__sub2api/activity`,
+            SUB2API_POOL_FENCING: this.env.POOL_FENCING_ENABLED === "true" ? "true" : "false",
             CPA_MANAGEMENT_KEY: env.MANAGEMENT_KEY ?? "",
             ...(imported === null ? {} : { CPA_IMPORT_CONFIG: imported }),
           };
@@ -135,6 +165,134 @@ export class Cpa extends DurableObject<Env> {
     }
   }
 
+  // RPC methods are called only on the named coordinator object. That object is
+  // in the existing CPA namespace and never starts its attached container.
+  async claimPoolRefresh(resource: string, owner: string, leaseMs: number): Promise<FencedLease | undefined> {
+    return this.pool.claimRefresh(resource, owner, leaseMs);
+  }
+
+  async renewPoolRefresh(lease: FencedLease, leaseMs: number): Promise<FencedLease | undefined> {
+    return this.pool.renewRefresh(lease, leaseMs);
+  }
+
+  async releasePoolRefresh(lease: FencedLease): Promise<boolean> {
+    return this.pool.release(lease);
+  }
+
+  async validatePoolFence(resource: string, owner: string, epoch: number): Promise<boolean> {
+    return this.pool.currentLease(resource, owner, epoch);
+  }
+
+  async writePoolObject(
+    resource: string,
+    owner: string,
+    epoch: number,
+    key: string,
+    value: ArrayBuffer,
+    contentType: string,
+    condition: { readonly ifMatch?: string; readonly ifNoneMatch?: string },
+  ): Promise<PoolObjectWriteResult> {
+    if (!poolResourcePattern.test(resource) || !poolOwnerPattern.test(owner) || !Number.isSafeInteger(epoch) || epoch < 1
+      || typeof key !== "string" || key.length < 1 || key.length > 1024 || !(value instanceof ArrayBuffer)
+      || typeof contentType !== "string" || contentType.length > 256) throw new RangeError("Invalid fenced object write");
+    const ifMatch = condition.ifMatch?.trim();
+    const ifNoneMatch = condition.ifNoneMatch?.trim();
+    // Auth/config writes must compare a known base version or create only if absent.
+    if ((ifMatch === undefined) === (ifNoneMatch === undefined)
+      || (ifMatch !== undefined && (ifMatch.length === 0 || ifMatch === "*" || ifMatch.length > 256))) {
+      return { ok: false, reason: "precondition_failed" };
+    }
+    if (ifNoneMatch !== undefined && ifNoneMatch !== "*") return { ok: false, reason: "precondition_failed" };
+    const onlyIf = new Headers();
+    if (ifMatch !== undefined) onlyIf.set("if-match", ifMatch);
+    if (ifNoneMatch !== undefined) onlyIf.set("if-none-match", ifNoneMatch);
+    const result = await this.pool.withCurrentLease(resource, owner, epoch, async () => {
+      const object = await this.env.STATE.put(key, value, {
+        onlyIf,
+        httpMetadata: { contentType: contentType || "application/octet-stream" },
+      });
+      if (object === null) return null;
+      return { key: object.key, size: object.size, etag: object.etag, uploadedAt: object.uploaded.getTime() };
+    });
+    if (!result.ok) return result;
+    return result.value === null ? { ok: false, reason: "precondition_failed" } : { ok: true, object: result.value };
+  }
+
+  async deletePoolObject(resource: string, owner: string, epoch: number, key: string): Promise<boolean> {
+    if (!poolResourcePattern.test(resource) || !poolOwnerPattern.test(owner) || !Number.isSafeInteger(epoch) || epoch < 1
+      || typeof key !== "string" || key.length < 1 || key.length > 1024) throw new RangeError("Invalid fenced object delete");
+    const result = await this.pool.withCurrentLease(resource, owner, epoch, async () => {
+      const current = await this.env.STATE.head(key);
+      if (current === null) return true;
+      // R2 does not support conditional DeleteObject. A zero-byte object is the
+      // existing CPA delete marker (ignored by auth loading, empty config on boot).
+      // Conditional PUT makes this safe if a coordinator restarts mid-request.
+      const tombstone = await this.env.STATE.put(key, new ArrayBuffer(0), {
+        onlyIf: new Headers({ "if-match": current.httpEtag }),
+        httpMetadata: { contentType: "application/octet-stream" },
+      });
+      return tombstone !== null;
+    });
+    return result.ok && result.value;
+  }
+
+  async bindPoolOAuthOwner(state: string, owner: string, ttlMs: number): Promise<boolean> {
+    return this.pool.bindOAuthOwner(state, owner, ttlMs);
+  }
+
+  async poolOAuthOwner(state: string): Promise<string | undefined> {
+    return this.pool.callbackOwner(state);
+  }
+
+  async fencedBackgroundActivity(action: BackgroundAction, id: string, resource: string): Promise<FencedLease | boolean | undefined> {
+    if (!this.ctx.container?.running) return undefined;
+    const coordinator = this.poolStub();
+    const owner = `${this.ctx.id.toString()}:${id}`;
+    const current = await this.background.leaseFor(id);
+    if (action === "begin") {
+      if (current !== undefined) return undefined;
+      const lease = await coordinator.claimPoolRefresh(resource, owner, 90_000);
+      if (lease === undefined) return undefined;
+      try {
+        if (!await this.background.update(action, id, lease)) {
+          await coordinator.releasePoolRefresh(lease);
+          return undefined;
+        }
+        await this.lifecycle?.refreshTimeout({ detectProtocol: true });
+        return lease;
+      } catch (error) {
+        await coordinator.releasePoolRefresh(lease);
+        throw error;
+      }
+    }
+    if (current === undefined || current.resource !== resource || current.owner !== owner) return undefined;
+    if (action === "renew") {
+      const renewed = await coordinator.renewPoolRefresh(current, 90_000);
+      if (renewed === undefined) {
+        await this.background.update("end", id);
+        await this.lifecycle?.refreshTimeout({ detectProtocol: true });
+        return undefined;
+      }
+      if (!await this.background.update("renew", id, renewed)) {
+        await coordinator.releasePoolRefresh(renewed);
+        return undefined;
+      }
+      await this.lifecycle?.refreshTimeout({ detectProtocol: true });
+      return renewed;
+    }
+    if (action === "end") {
+      await coordinator.releasePoolRefresh(current);
+      await this.background.update("end", id);
+      await this.lifecycle?.refreshTimeout({ detectProtocol: true });
+      return true;
+    }
+    return undefined;
+  }
+
+  private poolStub(): Cpa {
+    return this.env.CPA.getByName("cf-pool-coordinator-v1") as unknown as Cpa;
+  }
+
   override fetch(request: Request): Promise<Response> {
     // An ordinary fetch never inherits an Access identity from headers or cookies.
     return this.#dispatch(request, false);
@@ -163,6 +321,11 @@ export class Cpa extends DurableObject<Env> {
   }
 
   #dispatch(request: Request, accessAuthenticated: boolean): Promise<Response> {
+    // These headers are reserved for container-to-R2 fencing. Never accept a
+    // client-supplied fence as evidence of ownership.
+    const cleanHeaders = new Headers(request.headers);
+    for (const name of ["x-sub2api-resource", "x-sub2api-owner", "x-sub2api-epoch"]) cleanHeaders.delete(name);
+    request = new Request(request, { headers: cleanHeaders });
     const url = new URL(request.url);
     const path = url.pathname;
     const route = classify(path);
@@ -209,8 +372,32 @@ export class Cpa extends DurableObject<Env> {
           forwarded = await this.prepareAuthenticatedInference(forwarded);
         }
         const options = { requireFrontendAuth: route === "api" };
-        const response = await (((route === "api" && mayStart) || nativeManagement ? this.lifecycle?.forward(forwarded, options) : this.lifecycle?.forwardExisting(forwarded, options))
-          ?? containerUnavailable());
+        const upstreamPath = new URL(forwarded.url).pathname;
+        const providerCallback = route === "oauth-callback" || upstreamPath === "/v0/management/oauth-callback"
+          || upstreamPath === "/v8/management/oauth/callback";
+        const shouldFence = this.env.POOL_FENCING_ENABLED === "true"
+          && ((nativeManagement && ["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) || providerCallback);
+        let fencedRequest = forwarded;
+        let fence: FencedLease | undefined;
+        if (shouldFence) {
+          const operation = providerCallback ? "oauth-callback" : "management-write";
+          const activityId = crypto.randomUUID().replaceAll("-", "").toLowerCase();
+          const owner = `${this.ctx.id.toString()}:${activityId}`;
+          fence = await this.poolStub().claimPoolRefresh(operation, owner, 90_000);
+          if (fence === undefined) return new Response(null, { status: 409, headers: { "cache-control": "no-store" } });
+          const headers = new Headers(forwarded.headers);
+          headers.set("x-sub2api-resource", fence.resource);
+          headers.set("x-sub2api-owner", fence.owner);
+          headers.set("x-sub2api-epoch", String(fence.epoch));
+          fencedRequest = new Request(forwarded, { headers });
+        }
+        let response: Response;
+        try {
+          response = await (((route === "api" && mayStart) || nativeManagement ? this.lifecycle?.forward(fencedRequest, options) : this.lifecycle?.forwardExisting(fencedRequest, options))
+            ?? containerUnavailable());
+        } finally {
+          if (fence !== undefined) await this.poolStub().releasePoolRefresh(fence);
+        }
         return publicProviderResponse(response, route === "api");
       },
     );
@@ -256,7 +443,41 @@ export class Cpa extends DurableObject<Env> {
 // The only intercepted egress is CPA's internal HTTP object store. Provider HTTPS connections
 // leave the Linux container directly, preserving CPA's transport and TLS behavior.
 export class R2Bridge extends WorkerEntrypoint<Env, { containerId: string }> {
-  override fetch(request: Request): Promise<Response> {
+  private fencedStore(request: Request, fence: PoolObjectFence): ObjectStore {
+    const coordinator = this.env.CPA.getByName("cf-pool-coordinator-v1");
+    return {
+      head: key => this.env.STATE.head(key),
+      get: key => this.env.STATE.get(key),
+      list: options => this.env.STATE.list(options),
+      put: async (key, value, options) => {
+        const condition = {
+          ...(options?.onlyIf?.get("if-match") === null || options?.onlyIf?.get("if-match") === undefined
+            ? {} : { ifMatch: options.onlyIf.get("if-match") as string }),
+          ...(options?.onlyIf?.get("if-none-match") === null || options?.onlyIf?.get("if-none-match") === undefined
+            ? {} : { ifNoneMatch: options.onlyIf.get("if-none-match") as string }),
+        };
+        const result = await coordinator.writePoolObject(
+          fence.resource,
+          fence.owner,
+          fence.epoch,
+          key,
+          value,
+          request.headers.get("content-type") ?? "application/octet-stream",
+          condition,
+        );
+        if (!result.ok && result.reason === "stale_owner") throw new FencedWriteRejected("stale object-store write");
+        if (!result.ok) return null;
+        const stored = result.object;
+        return { key: stored.key, size: stored.size, etag: stored.etag, uploaded: new Date(stored.uploadedAt) };
+      },
+      delete: async key => {
+        const deleted = await coordinator.deletePoolObject(fence.resource, fence.owner, fence.epoch, key);
+        if (!deleted) throw new FencedWriteRejected("stale object-store delete");
+      },
+    };
+  }
+
+  override async fetch(request: Request): Promise<Response> {
     if (new URL(request.url).pathname === "/__sub2api/activity") {
       const containerId = this.ctx.props?.containerId;
       if (typeof containerId !== "string" || !/^[a-f0-9]{64}$/.test(containerId)) {
@@ -264,11 +485,45 @@ export class R2Bridge extends WorkerEntrypoint<Env, { containerId: string }> {
       }
       try {
         const owner = this.env.CPA.get(this.env.CPA.idFromString(containerId));
-        return handleBackgroundActivity(request, (action, id) => owner.backgroundActivity(action, id));
+        return handleBackgroundActivity(request, (action, id, resource) => resource === undefined
+          ? owner.backgroundActivity(action, id)
+          : owner.fencedBackgroundActivity(action, id, resource));
       } catch {
         return Promise.resolve(new Response(null, { status: 404, headers: { "cache-control": "no-store" } }));
       }
     }
-    return handleR2Bridge(request, this.env.STATE);
+    let store: ObjectStore = this.env.STATE;
+    let fence: PoolObjectFence | undefined;
+    if (this.env.POOL_FENCING_ENABLED === "true" && ["PUT", "DELETE"].includes(request.method)) {
+      const url = new URL(request.url);
+      if (url.pathname.split("/").filter(Boolean).length > 1) {
+        const resource = request.headers.get("x-sub2api-resource") ?? "";
+        const owner = request.headers.get("x-sub2api-owner") ?? "";
+        const epochText = request.headers.get("x-sub2api-epoch") ?? "";
+        const epoch = Number(epochText);
+        if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(resource) || !/^[a-f0-9]{64}:[a-f0-9]{32}$/.test(owner)
+          || !/^\d+$/.test(epochText) || !Number.isSafeInteger(epoch) || epoch < 1) {
+          return new Response(null, { status: 409, headers: { "cache-control": "no-store" } });
+        }
+        const containerId = this.ctx.props?.containerId;
+        if (typeof containerId !== "string" || !/^[a-f0-9]{64}$/.test(containerId) || !owner.startsWith(`${containerId}:`)) {
+          return new Response(null, { status: 409, headers: { "cache-control": "no-store" } });
+        }
+        const ifMatch = request.headers.get("if-match");
+        const ifNoneMatch = request.headers.get("if-none-match");
+        if (request.method === "PUT" && ((ifMatch === null) === (ifNoneMatch === null)
+          || (ifNoneMatch !== null && ifNoneMatch !== "*"))) {
+          return new Response(null, { status: 428, headers: { "cache-control": "no-store" } });
+        }
+        fence = { resource, owner, epoch };
+        store = this.fencedStore(request, fence);
+      }
+    }
+    try {
+      return await handleR2Bridge(request, store);
+    } catch (error) {
+      if (error instanceof FencedWriteRejected) return new Response(null, { status: 409, headers: { "cache-control": "no-store" } });
+      throw error;
+    }
   }
 }

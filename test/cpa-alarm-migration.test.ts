@@ -5,6 +5,8 @@ import { BackgroundActivity, type BackgroundAction } from "../src/background-act
 import { LeaseStorage } from "./lease-storage.ts";
 import { ManagementWindow } from "../src/management-window.ts";
 import { RealtimeLease } from "../src/realtime-lease.ts";
+import type { FencedLease } from "../src/pool-coordination.ts";
+import { MemoryStore } from "./memory-store.ts";
 import { issueSession, SESSION_COOKIE } from "../worker/src/session.ts";
 
 const DASHBOARD_PASSWORD = "native-wake-dashboard-0123456789abcdef";
@@ -24,7 +26,7 @@ vi.mock("cloudflare:workers", () => {
 });
 import { Cpa, R2Bridge } from "../src/cpa.ts";
 
-function platform(running: boolean | undefined, deletion: Promise<void> = Promise.resolve(), leaseStorage = new LeaseStorage(), allowRequests = false, configuration: string | null = null, provider?: (request: Request) => Promise<Response>, capability?: () => Response | Promise<Response>) {
+function platform(running: boolean | undefined, deletion: Promise<void> = Promise.resolve(), leaseStorage = new LeaseStorage(), allowRequests = false, configuration: string | null = null, provider?: (request: Request) => Promise<Response>, capability?: () => Response | Promise<Response>, cloudflareAccess = false, stateBinding?: R2Bucket) {
   const events: string[] = [];
   const requests: Request[] = [];
   const starts: ContainerStartupOptions[] = [];
@@ -63,6 +65,11 @@ function platform(running: boolean | undefined, deletion: Promise<void> = Promis
       get: <T>(key: string) => leaseStorage.get<T>(key),
       put: (key: string, value: unknown) => leaseStorage.put(key, value),
       delete: (key: string) => leaseStorage.delete(key),
+      transaction: <T>(callback: (txn: {
+        get<T>(key: string): Promise<T | undefined>;
+        put<T>(key: string, value: T): Promise<void>;
+        delete(key: string): Promise<boolean>;
+      }) => Promise<T>) => leaseStorage.transaction(callback),
       deleteAlarm: async () => {
         events.push("delete_alarm");
         await deletion;
@@ -84,20 +91,256 @@ function platform(running: boolean | undefined, deletion: Promise<void> = Promis
     head: async (key: string) => key === "config/config.yaml" && configuration !== null ? {} : null,
     get: async (key: string) => key === "config/config.yaml" && configuration !== null ? { text: async () => configuration } : null,
   };
+  const poolLeases = new Map<string, FencedLease>();
+  const oauthOwners = new Map<string, string>();
+  const coordinator = {
+    claimPoolRefresh: async (resource: string, owner: string, leaseMs: number) => {
+      const current = poolLeases.get(resource);
+      if (current !== undefined && current.expiresAt > Date.now()) return undefined;
+      const lease = { resource, owner, epoch: (current?.epoch ?? 0) + 1, expiresAt: Date.now() + leaseMs } satisfies FencedLease;
+      poolLeases.set(resource, lease);
+      return lease;
+    },
+    renewPoolRefresh: async (lease: FencedLease, leaseMs: number) => {
+      const current = poolLeases.get(lease.resource);
+      if (current?.owner !== lease.owner || current.epoch !== lease.epoch || current.expiresAt <= Date.now()) return undefined;
+      const renewed = { ...current, expiresAt: Date.now() + leaseMs };
+      poolLeases.set(lease.resource, renewed);
+      return renewed;
+    },
+    releasePoolRefresh: async (lease: FencedLease) => {
+      const current = poolLeases.get(lease.resource);
+      if (current?.owner !== lease.owner || current.epoch !== lease.epoch) return false;
+      poolLeases.set(lease.resource, { ...current, owner: "", expiresAt: Date.now() });
+      return true;
+    },
+    validatePoolFence: async (resource: string, owner: string, epoch: number) => {
+      const current = poolLeases.get(resource);
+      return current?.owner === owner && current.epoch === epoch && current.expiresAt > Date.now();
+    },
+    bindPoolOAuthOwner: async (state: string, owner: string) => {
+      const current = oauthOwners.get(state);
+      if (current !== undefined && current !== owner) return false;
+      oauthOwners.set(state, owner);
+      return true;
+    },
+    poolOAuthOwner: async (state: string) => oauthOwners.get(state),
+  };
   const cpa = new Cpa(context as unknown as DurableObjectState, {
-    CONTAINER_IDLE_TIMEOUT_MS: "1000", STATE: objectStore, DASHBOARD_PASSWORD,
+    CONTAINER_IDLE_TIMEOUT_MS: "1000", STATE: stateBinding ?? objectStore as unknown as R2Bucket, DASHBOARD_PASSWORD,
+    ...(cloudflareAccess ? { DASHBOARD_AUTH: "cloudflare", ACCESS_AUD: "a".repeat(64) } : {}),
     LOGIN_LIMIT: { limit: async () => ({ success: true }) },
+    CPA: { getByName: () => coordinator } as unknown as Env["CPA"],
   } as unknown as Env);
   return {
     cpa,
     events,
     starts,
     requests,
+    poolLeases,
+    oauthOwners,
     initialized: () => initialization,
     getAlarm: () => persistedAlarm,
     queueLegacyAlarm: () => { persistedAlarm = Date.now() + 1; },
   };
 }
+
+describe("integrated pool ownership hooks", () => {
+  it("leases an actual background refresh resource, rejects reentry, then releases it", async () => {
+    const state = platform(true, Promise.resolve(), new LeaseStorage(), true);
+    await state.initialized();
+    const activity = "e".repeat(32);
+    const first = await state.cpa.fencedBackgroundActivity("begin", activity, "refresh-credential-9");
+    expect(first).toMatchObject({ resource: "refresh-credential-9", owner: "a".repeat(64) + ":" + activity, epoch: 1 });
+    expect(await state.cpa.fencedBackgroundActivity("begin", "f".repeat(32), "refresh-credential-9")).toBeUndefined();
+    expect(await state.cpa.fencedBackgroundActivity("renew", activity, "refresh-credential-9")).toMatchObject({ epoch: 1 });
+    expect(await state.cpa.fencedBackgroundActivity("end", activity, "refresh-credential-9")).toBe(true);
+    expect(await state.cpa.fencedBackgroundActivity("begin", "f".repeat(32), "refresh-credential-9")).toMatchObject({ epoch: 2 });
+  });
+
+  it("rejects lease renewal after expiry and refuses an old owner's resumption", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(2_000_000);
+    const state = platform(true, Promise.resolve(), new LeaseStorage(), true);
+    await state.initialized();
+    const resource = "refresh-credential-expiry";
+    const oldId = "1".repeat(32);
+    const old = await state.cpa.fencedBackgroundActivity("begin", oldId, resource);
+    if (old === undefined || typeof old === "boolean") throw new Error("Expected initial lease");
+    vi.setSystemTime(2_091_000);
+    expect(await state.cpa.fencedBackgroundActivity("renew", oldId, resource)).toBeUndefined();
+    const replacement = await state.cpa.fencedBackgroundActivity("begin", "2".repeat(32), resource);
+    if (replacement === undefined || typeof replacement === "boolean") throw new Error("Expected takeover lease");
+    expect(replacement.epoch).toBe(old.epoch + 1);
+    expect(await state.cpa.fencedBackgroundActivity("renew", oldId, resource)).toBeUndefined();
+    vi.useRealTimers();
+  });
+
+  it("binds OAuth state to the Durable Object that starts the upstream session", async () => {
+    const state = platform(true, Promise.resolve(), new LeaseStorage(), true, null,
+      async () => Response.json({ status: "ok", state: "oauth-state-affinity", expires_in: 120 }), undefined, true);
+    await state.initialized();
+    const response = await state.cpa.fetchWithAccess(new Request("https://gateway.example/v8/management/oauth/auth-url?provider=codex", {
+      headers: { "x-management-key": "synthetic-management-key" },
+    }));
+    expect(response.status).toBe(200);
+    expect(state.oauthOwners.get("oauth-state-affinity")).toBe("a".repeat(64));
+  });
+});
+
+describe("R2 write fence at the persistence boundary", () => {
+  it("serializes the conditional R2 put with lease ownership and rejects a stale writer", async () => {
+    const bucketPut = vi.fn(async (key: string, value: ArrayBuffer) => ({
+      key, size: value.byteLength, etag: "stored-version-2", uploaded: new Date(),
+    }));
+    const bucket = {
+      head: async () => null,
+      get: async () => null,
+      put: bucketPut,
+      delete: async () => undefined,
+      list: async () => ({ objects: [], truncated: false }),
+    } as unknown as R2Bucket;
+    const state = platform(true, Promise.resolve(), new LeaseStorage(), true, null, undefined, undefined, false, bucket);
+    await state.initialized();
+    const owner = "a".repeat(64) + ":" + "b".repeat(32);
+    const lease = await state.cpa.claimPoolRefresh("resource-auth", owner, 90_000);
+    if (lease === undefined) throw new Error("Expected a refresh lease");
+    const body = new ArrayBuffer(4);
+    expect(await state.cpa.writePoolObject("resource-auth", owner, lease.epoch,
+      "auths/team/credential.json", body, "application/json", { ifMatch: "*" }))
+      .toEqual({ ok: false, reason: "precondition_failed" });
+    expect(bucketPut).not.toHaveBeenCalled();
+    const result = await state.cpa.writePoolObject("resource-auth", owner, lease.epoch,
+      "auths/team/credential.json", body, "application/json", { ifMatch: '"stored-version-1"' });
+    expect(result).toMatchObject({ ok: true, object: { etag: "stored-version-2" } });
+    expect(bucketPut).toHaveBeenCalledWith("auths/team/credential.json", body, expect.objectContaining({
+      onlyIf: expect.objectContaining({ get: expect.any(Function) }),
+      httpMetadata: { contentType: "application/json" },
+    }));
+    await state.cpa.releasePoolRefresh(lease);
+    const stale = await state.cpa.writePoolObject("resource-auth", owner, lease.epoch,
+      "auths/team/credential.json", body, "application/json", { ifMatch: '"stored-version-2"' });
+    expect(stale).toEqual({ ok: false, reason: "stale_owner" });
+    expect(bucketPut).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses a conditional empty tombstone for deletes and refuses an ETag race", async () => {
+    let etag = `"version-1"`;
+    let value = new Uint8Array([1, 2, 3]);
+    let raceOnce = true;
+    const bucketHead = vi.fn(async () => ({ httpEtag: etag } as R2Object));
+    const bucketPut = vi.fn(async (key: string, next: ArrayBuffer, options?: R2PutOptions) => {
+      const condition = options?.onlyIf;
+      if (!(condition instanceof Headers) || condition.get("if-match") !== etag) {
+        return null;
+      }
+      if (raceOnce) {
+        raceOnce = false;
+        value = new Uint8Array([9, 9, 9]);
+        etag = `"concurrent-version"`;
+        return null;
+      }
+      value = new Uint8Array(next);
+      etag = `"tombstone-version"`;
+      return { key, size: next.byteLength, etag: etag.slice(1, -1), uploaded: new Date(), httpEtag: etag } as R2Object;
+    });
+    const bucket = {
+      head: bucketHead,
+      get: async () => null,
+      put: bucketPut,
+      delete: vi.fn(async () => undefined),
+      list: async () => ({ objects: [], truncated: false }),
+    } as unknown as R2Bucket;
+    const state = platform(false, Promise.resolve(), new LeaseStorage(), false, null, undefined, undefined, false, bucket);
+    const owner = "a".repeat(64) + ":" + "b".repeat(32);
+    const lease = await state.cpa.claimPoolRefresh("auth-key", owner, 90_000);
+    if (lease === undefined) throw new Error("Expected a current object lease");
+    expect(await state.cpa.deletePoolObject(lease.resource, owner, lease.epoch, "auths/team/key.json")).toBe(false);
+    expect([...value]).toEqual([9, 9, 9]);
+    expect(await state.cpa.deletePoolObject(lease.resource, owner, lease.epoch, "auths/team/key.json")).toBe(true);
+    expect(value.byteLength).toBe(0);
+    expect(bucketPut).toHaveBeenCalledTimes(2);
+    expect(bucketHead).toHaveBeenCalledTimes(2);
+    await state.cpa.releasePoolRefresh(lease);
+    expect(await state.cpa.deletePoolObject(lease.resource, owner, lease.epoch, "auths/team/key.json")).toBe(false);
+    expect(bucketPut).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a stale owner before mutation and accepts only a current conditional write", async () => {
+    const store = new MemoryStore();
+    const owner = "c".repeat(64) + ":" + "b".repeat(32);
+    const valid = vi.fn(async (resource: string, candidate: string, epoch: number) => resource === "resource-a" && candidate === owner && epoch === 4);
+    const env = {
+      POOL_FENCING_ENABLED: "true", STATE: store,
+      CPA: { getByName: () => ({
+        writePoolObject: async (resource: string, candidate: string, epoch: number, key: string, value: ArrayBuffer, _type: string, condition: { ifMatch?: string; ifNoneMatch?: string }) => {
+          if (!await valid(resource, candidate, epoch)) return { ok: false, reason: "stale_owner" } as const;
+          const headers = new Headers();
+          if (condition.ifMatch !== undefined) headers.set("if-match", condition.ifMatch);
+          if (condition.ifNoneMatch !== undefined) headers.set("if-none-match", condition.ifNoneMatch);
+          const stored = await store.put(key, value, { onlyIf: headers });
+          return stored === null ? { ok: false, reason: "precondition_failed" } as const : { ok: true, object: {
+            key: stored.key, size: stored.size, etag: stored.etag, uploadedAt: stored.uploaded.getTime(),
+          } } as const;
+        },
+        deletePoolObject: async (resource: string, candidate: string, epoch: number, key: string) => {
+          if (!await valid(resource, candidate, epoch)) return false;
+          const current = await store.head(key);
+          if (current === null) return true;
+          return await store.put(key, new ArrayBuffer(0), {
+            onlyIf: new Headers({ "if-match": "\"" + current.etag + "\"" }),
+          }) !== null;
+        },
+      }) },
+    } as unknown as Env;
+    const bridge = new R2Bridge({ props: { containerId: "c".repeat(64) } } as unknown as ExecutionContext<{ containerId: string }>, env);
+    const request = (epoch: number, candidate = owner) => new Request("http://r2.internal/state/config/config.yaml", {
+      method: "PUT", headers: {
+        "x-sub2api-resource": "resource-a", "x-sub2api-owner": candidate,
+        "x-sub2api-epoch": String(epoch), "if-none-match": "*",
+      }, body: "models: [fenced]\n",
+    });
+    expect((await bridge.fetch(request(4, "d".repeat(64) + ":" + "b".repeat(32)))).status).toBe(409);
+    expect(valid).not.toHaveBeenCalled();
+    expect(store.entries.size).toBe(0);
+    expect((await bridge.fetch(request(3))).status).toBe(409);
+    expect(store.entries.size).toBe(0);
+    expect((await bridge.fetch(request(4))).status).toBe(200);
+    expect(store.text("config/config.yaml")).toBe("models: [fenced]\n");
+    const deleteRequest = (epoch: number) => new Request("http://r2.internal/state/config/config.yaml", {
+      method: "DELETE", headers: {
+        "x-sub2api-resource": "resource-a", "x-sub2api-owner": owner, "x-sub2api-epoch": String(epoch),
+      },
+    });
+    expect((await bridge.fetch(deleteRequest(4))).status).toBe(204);
+    expect(store.text("config/config.yaml")).toBe("");
+    expect((await bridge.fetch(deleteRequest(3))).status).toBe(409);
+    expect(store.text("config/config.yaml")).toBe("");
+    expect(valid).toHaveBeenCalledTimes(4);
+  });
+
+  it("returns the acquired distributed fence to the Go refresh runner", async () => {
+    const lease: FencedLease = {
+      resource: "r-" + "1".repeat(64), owner: "c".repeat(64) + ":" + "d".repeat(32), epoch: 9, expiresAt: Date.now() + 90_000,
+    };
+    const calls: Array<{ action: string; resource?: string }> = [];
+    const ownerStub = {
+      fencedBackgroundActivity: async (action: string, id: string, resource: string) => {
+        calls.push({ action, resource });
+        return lease;
+      },
+    };
+    const env = { CPA: { idFromString: (id: string) => ({ id }), get: () => ownerStub } } as unknown as Env;
+    const bridge = new R2Bridge({ props: { containerId: "c".repeat(64) } } as unknown as ExecutionContext<{ containerId: string }>, env);
+    const response = await bridge.fetch(new Request("http://r2.internal/__sub2api/activity", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "begin", id: "d".repeat(32), resource: lease.resource }),
+    }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject(lease);
+    expect(calls).toEqual([{ action: "begin", resource: lease.resource }]);
+  });
+});
 
 afterEach(() => { vi.useRealTimers(); });
 

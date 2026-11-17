@@ -1,6 +1,4 @@
-// Durable, fenced coordination primitives for a future container pool. These are
-// deliberately not wired into request routing or CPA refreshes yet; the live
-// deployment remains a singleton until the Go refresh and R2 write paths use them.
+// Durable, fenced coordination for OAuth ownership, refresh jobs, and shared writes.
 export interface PoolTransaction {
   get<T>(key: string): Promise<T | undefined>;
   put<T>(key: string, value: T): Promise<void>;
@@ -20,7 +18,7 @@ export interface FencedLease {
 
 interface SavedLease { readonly epoch: number; readonly owner: string; readonly expiresAt: number }
 interface SavedState { readonly resource: string; readonly fence: number; readonly version: number; readonly value: unknown }
-interface SavedOAuthOwner { readonly shard: number; readonly expiresAt: number }
+interface SavedOAuthOwner { readonly shard?: number; readonly owner?: string; readonly expiresAt: number }
 
 const LEASE_PREFIX = "pool:lease:v1:";
 const STATE_PREFIX = "pool:state:v1:";
@@ -54,11 +52,13 @@ export function sessionShard(sessionId: string, shardCount: number): number {
 }
 
 export class PoolCoordinator {
+  private readonly resourceTails = new Map<string, Promise<void>>();
+
   constructor(private readonly storage: PoolStorage, private readonly clock: () => number = Date.now) {}
 
   async claimRefresh(resource: string, owner: string, leaseMs: number): Promise<FencedLease | undefined> {
     this.validateLeaseInput(resource, owner, leaseMs);
-    return this.storage.transaction(async txn => {
+    return this.serializeResource(resource, () => this.storage.transaction(async txn => {
       const now = this.now();
       const key = LEASE_PREFIX + resource;
       const old = await txn.get<unknown>(key);
@@ -70,13 +70,13 @@ export class PoolCoordinator {
       const saved: SavedLease = { epoch, owner, expiresAt: now + leaseMs };
       await txn.put(key, saved);
       return { resource, ...saved };
-    });
+    }));
   }
 
   async renewRefresh(lease: FencedLease, leaseMs: number): Promise<FencedLease | undefined> {
     this.validateLease(lease);
     if (!Number.isSafeInteger(leaseMs) || leaseMs < 1000 || leaseMs > MAX_LEASE_MS) throw new RangeError("Invalid pool lease input");
-    return this.storage.transaction(async txn => {
+    return this.serializeResource(lease.resource, () => this.storage.transaction(async txn => {
       const now = this.now();
       const key = LEASE_PREFIX + lease.resource;
       const current = await txn.get<unknown>(key);
@@ -84,12 +84,40 @@ export class PoolCoordinator {
       const renewed: SavedLease = { epoch: current.epoch, owner: current.owner, expiresAt: now + leaseMs };
       await txn.put(key, renewed);
       return { resource: lease.resource, ...renewed };
+    }));
+  }
+
+  async currentLease(resource: string, owner: string, epoch: number): Promise<boolean> {
+    if (!safeId(resource) || !safeId(owner) || !Number.isSafeInteger(epoch) || epoch < 1) return false;
+    return this.serializeResource(resource, () => this.storage.transaction(async txn => {
+      const lease = await txn.get<unknown>(LEASE_PREFIX + resource);
+      return validLease(lease) && lease.owner === owner && lease.epoch === epoch && lease.expiresAt > this.now();
+    }));
+  }
+
+  // Run the actual shared-store mutation under the same per-resource queue as
+  // acquire/renew/release. A lease check followed by an unrelated R2 request has
+  // a race window; keeping the binding write inside this queue prevents takeover
+  // until that write has completed, while R2's ETag condition protects the object.
+  async withCurrentLease<T>(resource: string, owner: string, epoch: number, operation: () => Promise<T>): Promise<
+    { readonly ok: true; readonly value: T } | { readonly ok: false; readonly reason: "stale_owner" }
+  > {
+    if (!safeId(resource) || !safeId(owner) || !Number.isSafeInteger(epoch) || epoch < 1) {
+      throw new RangeError("Invalid fenced write input");
+    }
+    return this.serializeResource(resource, async () => {
+      const current = await this.storage.transaction(async txn => {
+        const saved = await txn.get<unknown>(LEASE_PREFIX + resource);
+        return validLease(saved) && saved.owner === owner && saved.epoch === epoch && saved.expiresAt > this.now();
+      });
+      if (!current) return { ok: false, reason: "stale_owner" } as const;
+      return { ok: true, value: await operation() } as const;
     });
   }
 
   async release(lease: FencedLease): Promise<boolean> {
     this.validateLease(lease);
-    return this.storage.transaction(async txn => {
+    return this.serializeResource(lease.resource, () => this.storage.transaction(async txn => {
       const now = this.now();
       const key = LEASE_PREFIX + lease.resource;
       const current = await txn.get<unknown>(key);
@@ -97,7 +125,7 @@ export class PoolCoordinator {
       // Retain the epoch as a tombstone so a later acquisition cannot reuse it.
       await txn.put(key, { epoch: current.epoch, owner: "", expiresAt: now } satisfies SavedLease);
       return true;
-    });
+    }));
   }
 
   async bindOAuthState(state: string, shard: number, ttlMs: number): Promise<boolean> {
@@ -135,6 +163,44 @@ export class PoolCoordinator {
         return undefined;
       }
       return owner.shard;
+    });
+  }
+
+  async bindOAuthOwner(state: string, owner: string, ttlMs: number): Promise<boolean> {
+    if (!safeId(state, 128) || !/^[a-f0-9]{64}$/.test(owner)
+      || !Number.isSafeInteger(ttlMs) || ttlMs < 1 || ttlMs > MAX_OAUTH_MS) {
+      throw new RangeError("Invalid OAuth ownership input");
+    }
+    return this.storage.transaction(async txn => {
+      const now = this.now();
+      const key = OAUTH_PREFIX + state;
+      const current = await txn.get<unknown>(key);
+      if (typeof current === "object" && current !== null) {
+        const old = current as Partial<SavedOAuthOwner>;
+        if (typeof old.expiresAt !== "number" || !Number.isSafeInteger(old.expiresAt)
+          || (old.owner !== undefined && typeof old.owner !== "string")) throw new Error("Invalid persisted OAuth owner");
+        if (old.expiresAt > now && old.owner !== undefined && old.owner !== owner) return false;
+      }
+      await txn.put(key, { owner, expiresAt: now + ttlMs } satisfies SavedOAuthOwner);
+      return true;
+    });
+  }
+
+  async callbackOwner(state: string): Promise<string | undefined> {
+    if (!safeId(state, 128)) return undefined;
+    return this.storage.transaction(async txn => {
+      const now = this.now();
+      const key = OAUTH_PREFIX + state;
+      const saved = await txn.get<unknown>(key);
+      if (typeof saved !== "object" || saved === null) return undefined;
+      const owner = saved as Partial<SavedOAuthOwner>;
+      if (typeof owner.owner !== "string" || !/^[a-f0-9]{64}$/.test(owner.owner)
+        || typeof owner.expiresAt !== "number" || !Number.isSafeInteger(owner.expiresAt)) throw new Error("Invalid persisted OAuth owner");
+      if (owner.expiresAt <= now) {
+        await txn.delete(key);
+        return undefined;
+      }
+      return owner.owner;
     });
   }
 
@@ -192,5 +258,19 @@ export class PoolCoordinator {
     const now = this.clock();
     if (!Number.isSafeInteger(now) || now < 0) throw new RangeError("Invalid pool clock");
     return now;
+  }
+
+  private async serializeResource<T>(resource: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.resourceTails.get(resource);
+    let release!: () => void;
+    const current = new Promise<void>(resolve => { release = resolve; });
+    this.resourceTails.set(resource, current);
+    if (previous !== undefined) await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.resourceTails.get(resource) === current) this.resourceTails.delete(resource);
+    }
   }
 }

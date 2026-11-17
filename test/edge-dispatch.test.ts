@@ -4,11 +4,12 @@ import { describe, expect, it, vi } from "vitest";
 // is the external boundary below; lifecycle behavior has its own controller/runtime coverage.
 vi.mock("../src/cpa.ts", () => ({ Cpa: Symbol("Cpa"), R2Bridge: Symbol("R2Bridge") }));
 import worker from "../src/index.ts";
+import type { Env } from "../src/env.ts";
 import { issueSession, SESSION_COOKIE } from "../worker/src/session.ts";
 
 const PASSWORD = "long-dashboard-password-0123456789";
 
-function binding() {
+function binding(poolOwner?: string, poolEnabled = poolOwner !== undefined) {
   const names: string[] = [];
   const requests: Request[] = [];
   const response = new Response("from the singleton");
@@ -23,19 +24,25 @@ function binding() {
     },
     connect: () => { throw new Error("HTTP routing must not open raw TCP"); },
   };
+  const ownerRequests: Request[] = [];
+  const ownerStub = {
+    fetchWithAccess: async (request: Request) => { ownerRequests.push(request); return new Response("callback owner"); },
+  };
+  const coordinator = { poolOAuthOwner: async () => poolOwner };
   const namespace: DurableObjectNamespace = {
     newUniqueId: () => { throw new Error("Must preserve the singleton"); },
     idFromName: () => { throw new Error("Use the existing named object"); },
-    idFromString: () => { throw new Error("Must preserve the singleton"); },
-    get: () => { throw new Error("Use getByName"); },
-    getByName: (name) => { names.push(name); return stub; },
+    idFromString: (value) => ({ toString: () => value, equals: () => true }),
+    get: () => ownerStub as never,
+    getByName: (name) => { names.push(name); return (name === "cf-pool-coordinator-v1" ? coordinator : stub) as never; },
     jurisdiction: () => { throw new Error("Must preserve existing placement"); },
   };
   return {
-    env: { CPA: namespace, DASHBOARD_PASSWORD: PASSWORD, LOGIN_LIMIT: { limit: async () => ({ success: true }) }, STATE: {
+    env: { CPA: namespace as unknown as Env["CPA"], DASHBOARD_PASSWORD: PASSWORD, LOGIN_LIMIT: { limit: async () => ({ success: true }) },
+      ...(poolEnabled ? { POOL_FENCING_ENABLED: "true", DASHBOARD_AUTH: "cloudflare", ACCESS_AUD: "a".repeat(64) } : {}), STATE: {
       get: async (key: string) => { reads.push(key); return { body: panel, httpEtag: JSON.stringify("tested-panel") }; },
     } as unknown as R2Bucket },
-    names, requests, response, reads,
+    names, requests, response, reads, ownerRequests,
   };
 }
 
@@ -56,6 +63,26 @@ describe("public gateway dispatch", () => {
     expect(await worker.fetch(request, state.env)).toBe(state.response);
     expect(state.names).toEqual(["cf-singleton-container"]);
     expect(state.requests).toEqual([request]);
+  });
+
+  it("routes an OAuth callback only to the Durable Object bound to its state", async () => {
+    const state = binding("b".repeat(64));
+    const request = new Request("https://gateway.example/callback?state=state-7&code=provider-code");
+    const response = await worker.fetch(request, state.env, { access: { aud: "a".repeat(64) } } as ExecutionContext & { access: { aud: string } });
+    expect(response.status).toBe(200);
+    expect(state.names).toEqual(["cf-pool-coordinator-v1"]);
+    expect(state.ownerRequests[0]?.url).toBe("https://gateway.example/callback?state=state-7&code=provider-code");
+    expect(state.requests).toEqual([]);
+  });
+
+  it("fails closed for a callback with no persisted owner instead of guessing the singleton", async () => {
+    const state = binding(undefined, true);
+    const response = await worker.fetch(new Request("https://gateway.example/callback?state=unknown&code=x"), state.env,
+      { access: { aud: "a".repeat(64) } } as ExecutionContext & { access: { aud: string } });
+    expect(response.status).toBe(409);
+    expect(state.names).toEqual(["cf-pool-coordinator-v1"]);
+    expect(state.requests).toEqual([]);
+    expect(state.ownerRequests).toEqual([]);
   });
 
   it.each(["/management.html", "/provider-panel.html"])("serves authenticated %s without touching the singleton", async (path) => {

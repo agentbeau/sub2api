@@ -143,4 +143,55 @@ describe("pool coordination preparation primitives", () => {
     expect(takeover?.epoch).toBe(current.epoch + 1);
     expect(await oldProcess.writeShared(current, "provider-token", 0, { tokenVersion: 1 })).toEqual({ ok: false, reason: "stale_owner" });
   });
+
+  it("validates a fence at write time and rejects an expired lease during an in-flight refresh", async () => {
+    let now = 70_000;
+    const storage = new AtomicStorage();
+    const coordinator = new PoolCoordinator(storage, () => now);
+    const old = await coordinator.claimRefresh("refresh-credential", "a".repeat(64) + ":" + "b".repeat(32), 1_000);
+    if (!old) throw new Error("Expected initial refresh lease");
+    expect(await coordinator.currentLease(old.resource, old.owner, old.epoch)).toBe(true);
+    now += 1_001;
+    const replacement = await coordinator.claimRefresh("refresh-credential", "c".repeat(64) + ":" + "d".repeat(32), 1_000);
+    if (!replacement) throw new Error("Expected lease takeover");
+    expect(await coordinator.currentLease(old.resource, old.owner, old.epoch)).toBe(false);
+    expect(await coordinator.currentLease(replacement.resource, replacement.owner, replacement.epoch)).toBe(true);
+  });
+
+  it("holds the ownership queue through the persistence commit before allowing takeover", async () => {
+    let now = 90_000;
+    const coordinator = new PoolCoordinator(new AtomicStorage(), () => now);
+    const old = await coordinator.claimRefresh("shared-config", "a".repeat(64) + ":" + "b".repeat(32), 1_000);
+    if (old === undefined) throw new Error("Expected initial lease");
+    let entered!: () => void;
+    let finish!: () => void;
+    const inside = new Promise<void>(resolve => { entered = resolve; });
+    const blocked = new Promise<void>(resolve => { finish = resolve; });
+    const commit = coordinator.withCurrentLease(old.resource, old.owner, old.epoch, async () => {
+      entered();
+      await blocked;
+      return "committed";
+    });
+    await inside;
+    now += 1_001;
+    const takeover = coordinator.claimRefresh(old.resource, "c".repeat(64) + ":" + "d".repeat(32), 1_000);
+    await expect(Promise.race([takeover.then(() => "takeover"), Promise.resolve("queued")])).resolves.toBe("queued");
+    finish();
+    await expect(commit).resolves.toEqual({ ok: true, value: "committed" });
+    const replacement = await takeover;
+    expect(replacement?.epoch).toBe(old.epoch + 1);
+    await expect(coordinator.withCurrentLease(old.resource, old.owner, old.epoch, async () => "stale"))
+      .resolves.toEqual({ ok: false, reason: "stale_owner" });
+  });
+
+  it("durably routes an OAuth callback to its initiating container and refuses rebinding", async () => {
+    let now = 80_000;
+    const coordinator = new PoolCoordinator(new AtomicStorage(), () => now);
+    const owner = "1".repeat(64);
+    expect(await coordinator.bindOAuthOwner("state-from-cpa", owner, 30_000)).toBe(true);
+    expect(await coordinator.callbackOwner("state-from-cpa")).toBe(owner);
+    expect(await coordinator.bindOAuthOwner("state-from-cpa", "2".repeat(64), 30_000)).toBe(false);
+    now += 30_001;
+    expect(await coordinator.callbackOwner("state-from-cpa")).toBeUndefined();
+  });
 });

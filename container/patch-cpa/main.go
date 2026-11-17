@@ -51,13 +51,11 @@ func plans() []filePatch {
 \t\t\t}
 \t\t\tl.manager.finishRefreshJob(job, time.Time{}, false)`, `\t\t\tretryAt := time.Time{}
 \t\t\tif l.manager.beginRefreshJob(ctx, job) {
-\t\t\t\terrActivity := sub2apiactivity.Run(ctx, func(activityCtx context.Context) error {
-\t\t\t\t\t// Upstream already handles and sanitizes provider refresh errors.
-\t\t\t\t\t_, _ = l.manager.refreshAuthForRequestAtEpoch(activityCtx, job.id, "", job.registrationEpoch)
-\t\t\t\t\treturn nil
+\t\t\t\terrActivity := sub2apiactivity.RunResource(ctx, "refresh:"+job.id, func(activityCtx context.Context) error {
+\t\t\t\t\t_, errRefresh := l.manager.refreshAuthForRequestAtEpoch(activityCtx, job.id, "", job.registrationEpoch)
+\t\t\t\t\treturn errRefresh
 \t\t\t\t})
 \t\t\t\tif errActivity != nil {
-\t\t\t\t\t// A rejected lease must retain the normal finish/retry bookkeeping.
 \t\t\t\t\tretryAt = time.Now().Add(l.interval)
 \t\t\t\t\tlog.WithError(errActivity).Warn("sub2api: background refresh did not complete")
 \t\t\t\t}
@@ -131,7 +129,7 @@ func (w *Watcher) reloadConfigIfChangedWithActivity(ctx context.Context) {
 \t\t\tlog.Errorf("failed to persist config change: %v", err)
 \t\t}
 \t}()`, `\t// Acquire before the reload callback releases its parent activity lease.
-\terrActivity := sub2apiactivity.Start(context.Background(), func(activityCtx context.Context) error {
+\terrActivity := sub2apiactivity.StartResource(context.Background(), "config", func(activityCtx context.Context) error {
 \t\tctx, cancel := context.WithTimeout(activityCtx, 30*time.Second)
 \t\tdefer cancel()
 \t\tif errPersist := w.storePersister.PersistConfig(ctx); errPersist != nil {
@@ -148,7 +146,7 @@ func (w *Watcher) reloadConfigIfChangedWithActivity(ctx context.Context) {
 \t\tif err := w.storePersister.PersistAuthFiles(ctx, message, filtered...); err != nil {
 \t\t\tlog.Errorf("failed to persist auth changes: %v", err)
 \t\t}
-\t}()`, `\terrActivity := sub2apiactivity.Start(context.Background(), func(activityCtx context.Context) error {
+\t}()`, `\terrActivity := sub2apiactivity.StartResource(context.Background(), "auth-store", func(activityCtx context.Context) error {
 \t\tctx, cancel := context.WithTimeout(activityCtx, 30*time.Second)
 \t\tdefer cancel()
 \t\tif errPersist := w.storePersister.PersistAuthFiles(ctx, message, filtered...); errPersist != nil {
@@ -216,6 +214,162 @@ func (w *Watcher) reloadConfigIfChangedWithActivity(ctx context.Context) {
 \tsub2apiactivity.MarkInitialized(initializationGeneration)
 
 \tselect {`},
+			},
+		},
+		{
+			path: "sdk/cliproxy/auth/conductor_refresh.go",
+			edits: []replacement{
+				{`cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"`, `cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"` + "\n\t" + helperImport},
+				{`func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessToken string) (*Auth, error) {
+	return m.refreshAuthForRequestAtEpoch(ctx, id, failedAccessToken, 0)
+}`, `func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessToken string) (*Auth, error) {
+	var refreshed *Auth
+	errActivity := sub2apiactivity.RunResource(ctx, "refresh:"+id, func(activityCtx context.Context) error {
+		var errRefresh error
+		refreshed, errRefresh = m.refreshAuthForRequestAtEpoch(activityCtx, id, failedAccessToken, 0)
+		return errRefresh
+	})
+	return refreshed, errActivity
+}`},
+			},
+		},
+		{
+			path: "cmd/server/main.go",
+			edits: []replacement{
+				{`"github.com/router-for-me/CLIProxyAPI/v8/internal/store"`, `"github.com/router-for-me/CLIProxyAPI/v8/internal/store"` + "\n\t" + helperImport},
+				{`\t\tctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+\t\tif errBootstrap := objectStoreInst.Bootstrap(ctx, examplePath); errBootstrap != nil {
+\t\t\tcancel()
+\t\t\tlog.Errorf("failed to bootstrap object-backed config: %v", errBootstrap)
+\t\t\treturn
+\t\t}
+\t\tcancel()`, `\t\tctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+\t\terrActivity := sub2apiactivity.RunResource(ctx, "bootstrap", func(activityCtx context.Context) error {
+\t\t\treturn objectStoreInst.Bootstrap(activityCtx, examplePath)
+\t\t})
+\t\tif errActivity != nil {
+\t\t\tcancel()
+\t\t\tlog.Errorf("failed to bootstrap object-backed config: %v", errActivity)
+\t\t\treturn
+\t\t}
+\t\tcancel()`},
+			},
+		},
+		{
+			path: "internal/api/server.go",
+			edits: []replacement{
+				{`"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"`, `"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"` + "\n\t" + helperImport},
+				{`engine.Use(logging.GinLogrusLogger())`, `engine.Use(logging.GinLogrusLogger())
+	engine.Use(sub2apiactivity.RequestContextMiddleware())`},
+			},
+		},
+		{
+			path: "internal/store/objectstore.go",
+			edits: []replacement{
+				{`\trefreshProbeMu    sync.Mutex`, `\tobjectVersionsMu sync.RWMutex
+\tobjectVersions    map[string]string
+	refreshProbeMu    sync.Mutex`},
+				{`\t\tspoolRoot:  absRoot,
+	\tconfigPath: filepath.Join(configDir, "config.yaml"),`, `\t\tspoolRoot:  absRoot,
+	\tconfigPath: filepath.Join(configDir, "config.yaml"),
+	\tobjectVersions: make(map[string]string),`},
+				{`\t_, err := s.client.StatObject(ctx, s.cfg.Bucket, key, minio.StatObjectOptions{})
+	switch {
+	case err == nil:`, `\tinfo, err := s.client.StatObject(ctx, s.cfg.Bucket, key, minio.StatObjectOptions{})
+	switch {
+	case err == nil:
+	\tif errRemember := s.rememberObjectVersion(key, info.ETag); errRemember != nil { return errRemember }`},
+				{`\t\tif errWrite := os.WriteFile(local, data, 0o600); errWrite != nil {
+	\t\treturn fmt.Errorf("object store: write auth %s: %w", local, errWrite)
+	\t}`, `\t\tif errWrite := os.WriteFile(local, data, 0o600); errWrite != nil {
+	\t\treturn fmt.Errorf("object store: write auth %s: %w", local, errWrite)
+	\t}
+	\tif errRemember := s.rememberObjectVersion(object.Key, object.ETag); errRemember != nil { return errRemember }`},
+				{`\tif len(data) == 0 {
+	\treturn s.deleteObject(ctx, key)
+	}
+	if s.client == nil {
+	\treturn fmt.Errorf("object store: client not configured")
+	}
+	fullKey := s.prefixedKey(key)
+	reader := bytes.NewReader(data)
+	_, err := s.client.PutObject(ctx, s.cfg.Bucket, fullKey, reader, int64(len(data)), minio.PutObjectOptions{
+	\tContentType: contentType,
+	})
+	if err != nil {
+	\treturn fmt.Errorf("object store: put object %s: %w", fullKey, err)
+	}
+	return nil`, `\tif s.client == nil {
+	\treturn fmt.Errorf("object store: client not configured")
+	}
+	fullKey := s.prefixedKey(key)
+	if os.Getenv("SUB2API_POOL_FENCING") != "true" && len(data) == 0 {
+		return s.deleteObject(ctx, key)
+	}
+	if os.Getenv("SUB2API_POOL_FENCING") == "true" {
+	\treturn s.putFencedObject(ctx, fullKey, data, contentType)
+	}
+	reader := bytes.NewReader(data)
+	_, err := s.client.PutObject(ctx, s.cfg.Bucket, fullKey, reader, int64(len(data)), minio.PutObjectOptions{
+	\tContentType: contentType,
+	})
+	if err != nil {
+	\treturn fmt.Errorf("object store: put object %s: %w", fullKey, err)
+	}
+	return nil`},
+				{`\tif err = os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+\t\treturn fmt.Errorf("object store: delete auth file: %w", err)
+\t}
+\tif err = s.deleteAuthObject(ctx, path); err != nil {
+\t\treturn err
+\t}`, `\tif os.Getenv("SUB2API_POOL_FENCING") == "true" {
+\t\tif err = s.deleteAuthObject(ctx, path); err != nil { return err }
+\t}
+\tif err = os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+\t\treturn fmt.Errorf("object store: delete auth file: %w", err)
+\t}
+\tif os.Getenv("SUB2API_POOL_FENCING") != "true" {
+\t\tif err = s.deleteAuthObject(ctx, path); err != nil { return err }
+\t}`},
+				{`func (s *ObjectTokenStore) deleteObject(ctx context.Context, key string) error {
+	fullKey := s.prefixedKey(key)
+	err := s.client.RemoveObject(ctx, s.cfg.Bucket, fullKey, minio.RemoveObjectOptions{})`, `func (s *ObjectTokenStore) deleteObject(ctx context.Context, key string) error {
+	fullKey := s.prefixedKey(key)
+	if os.Getenv("SUB2API_POOL_FENCING") == "true" {
+	\treturn s.putFencedObject(ctx, fullKey, []byte{}, "application/octet-stream")
+	}
+	err := s.client.RemoveObject(ctx, s.cfg.Bucket, fullKey, minio.RemoveObjectOptions{})`},
+			},
+		},
+		{
+			path: "internal/store/object_refresh_journal.go",
+			edits: []replacement{
+				{`"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"`, `"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"` + "\n\t" + helperImport},
+				{`func (s *ObjectTokenStore) createRefreshObject(ctx context.Context, key string, data []byte) (bool, error) {
+\theaders := http.Header{"If-None-Match": []string{"*"}}`, `func (s *ObjectTokenStore) createRefreshObject(ctx context.Context, key string, data []byte) (bool, error) {
+	var created bool
+	errActivity := sub2apiactivity.RunResource(ctx, "object-write:"+key, func(writeCtx context.Context) error {
+		var errCreate error
+		created, errCreate = s.createRefreshObjectWithFence(writeCtx, key, data)
+		return errCreate
+	})
+	return created, errActivity
+}
+
+func (s *ObjectTokenStore) createRefreshObjectWithFence(ctx context.Context, key string, data []byte) (bool, error) {
+	headers := http.Header{"If-None-Match": []string{"*"}}`},
+				{`headers := http.Header{"If-None-Match": []string{"*"}}`, `headers := sub2apiactivity.FenceHeaders(ctx)
+	if headers == nil { headers = make(http.Header) }
+	headers.Set("If-None-Match", "*")`},
+				{`if errRemove := s.client.RemoveObject(ctx, s.cfg.Bucket, key, minio.RemoveObjectOptions{}); errRemove != nil {
+		log.Warnf("remove refresh journal capability probe: %v", errRemove)
+	}`, `if sub2apiactivity.FencingEnabled() {
+	if errRemove := s.deleteFencedObject(ctx, key); errRemove != nil {
+		log.Warnf("remove refresh journal capability probe: %v", errRemove)
+	}
+} else if errRemove := s.client.RemoveObject(ctx, s.cfg.Bucket, key, minio.RemoveObjectOptions{}); errRemove != nil {
+	log.Warnf("remove refresh journal capability probe: %v", errRemove)
+}`},
 			},
 		},
 		{

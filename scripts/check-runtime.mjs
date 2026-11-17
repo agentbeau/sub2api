@@ -23,14 +23,14 @@ async function bundle(entry, output) {
 
 const artifact = process.argv[2] ? resolve(process.argv[2]) : resolve(temporary, "root/index.js");
 if (!process.argv[2]) await bundle(resolve(root, "src/index.ts"), artifact);
-const options = async (scriptPath) => ({
+const options = async (scriptPath, extraBindings = {}) => ({
   modules: [
     { type: "ESModule", path: scriptPath },
     ...(await readdir(dirname(scriptPath), { recursive: true })).filter(path => path.endsWith(".wasm")).map(path => ({ type: "CompiledWasm", path: resolve(dirname(scriptPath), path) })),
   ],
   modulesRoot: dirname(scriptPath),
   compatibilityDate: "2026-10-01", cf: false,
-  bindings: { DASHBOARD_PASSWORD: password, MANAGEMENT_KEY: "runtime-management-key-0123456789abcdef", CONTAINER_IDLE_TIMEOUT_MS: "1000" },
+  bindings: { DASHBOARD_PASSWORD: password, MANAGEMENT_KEY: "runtime-management-key-0123456789abcdef", CONTAINER_IDLE_TIMEOUT_MS: "1000", ...extraBindings },
 });
 
 const publicWorker = new Miniflare(convertV4MiniflareOptions({
@@ -108,15 +108,35 @@ export default { async fetch(request, env, ctx) {
     return Response.json({ status: response.status });
   }
   if (new URL(request.url).pathname === '/conditional-write') {
-    const bridge = bridgeFor(env.CPA.idFromName('r2-write-test').toString());
+    const bridgeContainerId = env.CPA.idFromName('r2-write-test').toString();
+    const bridge = bridgeFor(bridgeContainerId);
+    const coordinator = env.CPA.getByName('cf-pool-coordinator-v1');
+    const resource = 'runtime-conditional-write-test';
+    const owner = bridgeContainerId + ':' + 'b'.repeat(32);
+    const lease = await coordinator.claimPoolRefresh(resource, owner, 90000);
+    if (!lease) return Response.json({ error: 'lease unavailable' }, { status: 503 });
+    const fenceHeaders = (extra = {}) => ({
+      'x-sub2api-resource': resource, 'x-sub2api-owner': owner,
+      'x-sub2api-epoch': String(lease.epoch), ...extra
+    });
     const key = 'http://r2.internal/state/runtime-conditional-write-test';
-    const seed = await bridge.fetch(new Request(key, { method: 'PUT', headers: {'if-none-match':'*'}, body:'seed' }));
+    const seed = await bridge.fetch(new Request(key, { method: 'PUT', headers: fenceHeaders({'if-none-match':'*'}), body:'seed' }));
     const etag = seed.headers.get('etag');
     const results = await Promise.all(['writer-a', 'writer-b'].map(body => bridge.fetch(new Request(key, {
-      method:'PUT', headers:{'if-match':etag}, body
+      method:'PUT', headers:fenceHeaders({'if-match':etag}), body
     }))));
     const final = await bridge.fetch(new Request(key));
-    return Response.json({ seed: seed.status, etag, writers: results.map(response => response.status), final: await final.text() });
+    const removed = await bridge.fetch(new Request(key, { method:'DELETE', headers:fenceHeaders() }));
+    const tombstone = await bridge.fetch(new Request(key));
+    const staleAfterDelete = await bridge.fetch(new Request(key, {
+      method:'PUT', headers:fenceHeaders({'if-match':etag}), body:'stale-after-delete'
+    }));
+    await coordinator.releasePoolRefresh(lease);
+    return Response.json({
+      seed: seed.status, etag, writers: results.map(response => response.status), final: await final.text(),
+      deleteStatus: removed.status, tombstoneStatus: tombstone.status, tombstoneBody: await tombstone.text(),
+      staleAfterDelete: staleAfterDelete.status
+    });
   }
   return new Response(null, {status:404});
 } };
@@ -124,7 +144,7 @@ export default { async fetch(request, env, ctx) {
 const rpcOutput = resolve(temporary, "rpc/index.js");
 await bundle(rpcHarness, rpcOutput);
 const rpcWorker = new Miniflare(convertV4MiniflareOptions({
-  ...await options(rpcOutput),
+  ...await options(rpcOutput, { POOL_FENCING_ENABLED: "true" }),
   durableObjects: { CPA: { className: "Cpa", useSQLite: true } },
   r2Buckets: ["STATE"],
   ratelimits: { LOGIN_LIMIT: { namespace_id: "1001", simple: { limit: 20, period: 60 } } },
@@ -145,7 +165,11 @@ try {
   assert.match(writeResult.etag, /^".+"$/);
   assert.deepEqual(writeResult.writers.sort(), [200, 412], "R2 atomically rejects one competing stale If-Match writer");
   assert.ok(["writer-a", "writer-b"].includes(writeResult.final));
-  console.log("PASS: real workerd RPC routes activity to two explicit Cpa owner IDs; invalid owner IDs fail closed; concurrent conditional R2 writes yield one success and one 412.");
+  assert.equal(writeResult.deleteStatus, 204, "A fenced delete writes an R2 tombstone instead of using unsupported conditional DeleteObject");
+  assert.equal(writeResult.tombstoneStatus, 200);
+  assert.equal(writeResult.tombstoneBody, "");
+  assert.equal(writeResult.staleAfterDelete, 412, "An old conditional writer cannot resurrect a deleted object");
+  console.log("PASS: real workerd RPC routes activity to two explicit Cpa owner IDs; invalid owner IDs fail closed; fenced conditional writes and tombstones reject stale R2 writers.");
 } finally {
   await rpcWorker.dispose();
 }
