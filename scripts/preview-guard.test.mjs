@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { validatePreview } from "./preview-guard.mjs";
+import { PREVIEW_BRANCHES } from "./preview-branches.mjs";
 const source = JSON.parse(await readFile(new URL("../wrangler.preview.jsonc", import.meta.url), "utf8"));
 const branch = "dagul/isolated-worker-preview";
 const ready = () => { const c = JSON.parse(JSON.stringify(source)); c.vars.ACCESS_AUD = c.vars.PREVIEW_ACCESS_AUD = "b".repeat(64); return c; };
@@ -12,6 +13,7 @@ test("template isolated but not deployable before identity provisioning", () => 
   assert.throws(() => validatePreview(template, branch));
 });
 test("provisioned isolated identity passes", () => assert.equal(validatePreview(ready(), branch), true));
+test("reviewed integration branch passes the preview guard", () => assert.equal(validatePreview(ready(), PREVIEW_BRANCHES[1]), true));
 test("main and other branches cannot deploy", () => {
   for (const value of ["main", "", "feature/test"]) assert.throws(() => validatePreview(ready(), value));
 });

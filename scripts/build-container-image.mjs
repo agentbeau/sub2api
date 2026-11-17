@@ -1,6 +1,6 @@
 // Build once, smoke-test that exact image, and save it for the credential-bearing deploy job.
 import { execFileSync } from "node:child_process";
-import { lstat, mkdir, readdir } from "node:fs/promises";
+import { lstat, mkdir, readdir, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DASHBOARD_PANEL_FILE, sourceIdentity, writeManifest } from "./deployment-artifact.mjs";
@@ -22,6 +22,14 @@ if (network === "host") args.push("--network", "host");
 for (const name of ["CPA_VERSION", "PANEL_VERSION", "PANEL_SHA256"]) {
   const value = process.env[name];
   if (value) args.push("--build-arg", `${name}=${value}`);
+}
+const caBundle = process.env.SSL_CERT_FILE;
+if (caBundle) {
+  const ca = await stat(caBundle).catch(() => undefined);
+  if (!ca?.isFile() || ca.size === 0) throw new Error("SSL_CERT_FILE must point to a readable, non-empty trusted CA bundle");
+  // BuildKit exposes this only to RUN steps that explicitly mount the secret.
+  // The CA is neither copied into the image nor passed to runtime containers.
+  args.push("--secret", `id=build-ca,src=${caBundle}`);
 }
 // Dockerfile's latest releases are resolved only here; deployment never rebuilds this image.
 execFileSync("docker", [...args, "container"], { cwd: root, stdio: "inherit" });

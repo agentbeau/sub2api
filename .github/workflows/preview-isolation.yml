@@ -8,7 +8,7 @@ on:
       - 'wrangler.preview.jsonc'
       - '.github/workflows/preview-isolation.yml'
   push:
-    branches: ['dagul/isolated-worker-preview']
+    branches: ['dagul/isolated-worker-preview', 'dagul/classifier-readiness-integration']
 permissions:
   contents: read
 jobs:

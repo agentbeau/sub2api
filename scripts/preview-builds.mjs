@@ -7,20 +7,20 @@ import { buildEnvironment } from "./cloudflare-builds.mjs";
 import { consumeCiArtifacts, verifyCiProvenance } from "./consume-preview-artifacts.mjs";
 import { verifyExistingDashboard } from "./dashboard-artifact.mjs";
 import { validatePreview } from "./preview-guard.mjs";
+import { isPreviewBranch } from "./preview-branches.mjs";
 import { DASHBOARD_OBJECT_KEY, imageDigest, PREPARED_IMAGE, sha256, sourceIdentity, verifyArtifact, verifyContainerImageArtifact } from "./deployment-artifact.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const BRANCH = "dagul/isolated-worker-preview";
 const BUCKET = "gateway-preview-state";
 export function previewMetadata(env) {
-  if (env.WORKERS_CI !== "1" || env.WORKERS_CI_BRANCH !== BRANCH) throw new Error("Only the isolated preview branch can use this pipeline");
+  if (env.WORKERS_CI !== "1" || !isPreviewBranch(env.WORKERS_CI_BRANCH)) throw new Error("Only an explicitly reviewed preview branch can use this pipeline");
   if (!/^[a-f0-9]{40}$/.test(env.WORKERS_CI_COMMIT_SHA ?? "")) throw new Error("Exact source revision required");
   if (!/^[a-f0-9]{32}$/.test(env.CLOUDFLARE_ACCOUNT_ID ?? "")) throw new Error("Cloudflare account required");
   if (!/^[a-f0-9-]{36}$/.test(env.WORKERS_CI_BUILD_UUID ?? "")) throw new Error("Cloudflare build identity required");
   if (env.SKIP_DEPENDENCY_INSTALL !== "1") throw new Error("Dependency installation must run token-free inside the build phase");
   if (env.WRANGLER_CI_OVERRIDE_NAME && env.WRANGLER_CI_OVERRIDE_NAME !== "gateway-preview") throw new Error("Wrong preview Worker name");
   if (env.WRANGLER_CI_MATCH_TAG && env.WRANGLER_CI_MATCH_TAG !== "e938224d2f694fe5b6f92a60f4a332cd") throw new Error("Wrong preview Worker identity");
-  return { revision: env.WORKERS_CI_COMMIT_SHA, account: env.CLOUDFLARE_ACCOUNT_ID, buildId: env.WORKERS_CI_BUILD_UUID };
+  return { branch: env.WORKERS_CI_BRANCH, revision: env.WORKERS_CI_COMMIT_SHA, account: env.CLOUDFLARE_ACCOUNT_ID, buildId: env.WORKERS_CI_BUILD_UUID };
 }
 export function previewArtifactConfig(source, revision) {
   if (!/^[a-f0-9]{40}$/.test(revision ?? "")) throw new Error("Exact preview source revision required");
@@ -60,7 +60,7 @@ export async function runPreviewPhase(phase, { root = ROOT, env = process.env, e
     await mkdir(output, { recursive: true });
     run("npm", ["ci"]);
     run(process.execPath, ["--test", "scripts/preview-guard.test.mjs", "scripts/preview-builds.test.mjs"]);
-    const provenance = await consumeCiArtifacts({ root, revision: metadata.revision, worker, image, directory: output, env: clean,
+    const provenance = await consumeCiArtifacts({ root, branch: metadata.branch, revision: metadata.revision, worker, image, directory: output, env: clean,
       execute: (cmd, args, options) => execute(cmd, args, { ...options, stdio: "inherit" }) });
     run(process.execPath, ["scripts/preview-runtime.mjs", join(worker, "worker/preview.js")]);
     checkSource();
@@ -73,14 +73,14 @@ export async function runPreviewPhase(phase, { root = ROOT, env = process.env, e
   for (const key of Object.keys(metadata)) if (receipt[key] !== metadata[key]) throw new Error("Build receipt does not match this build");
   if (receipt.workerHash !== await sha256(join(worker, "manifest.json")) || receipt.imageHash !== await sha256(join(image, "manifest.json"))) throw new Error("Manifest changed after build");
   await verifyArtifact(worker, metadata.revision, "isolated-preview");
-  await verifyCiProvenance(receipt.provenance, metadata.revision);
+  await verifyCiProvenance(receipt.provenance, metadata.revision, { branch: metadata.branch });
   const manifest = await verifyContainerImageArtifact(image, metadata.revision);
   const config = JSON.parse(await readFile(join(worker, "wrangler.json"), "utf8"));
   if (JSON.stringify(config) !== JSON.stringify(previewArtifactConfig(source, metadata.revision))) throw new Error("Prepared preview bindings differ from reviewed source");
   if (!env.CLOUDFLARE_API_TOKEN) throw new Error("Preview deploy credential missing");
   const deployEnv = { ...clean, CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID: metadata.account };
   for (const name of ["WRANGLER_CI_MATCH_TAG", "WRANGLER_CI_OVERRIDE_NAME"]) if (env[name]) deployEnv[name] = env[name];
-  const current = run("git", ["ls-remote", "--exit-code", "origin", `refs/heads/${BRANCH}`], clean, true).split(/\s+/)[0];
+  const current = run("git", ["ls-remote", "--exit-code", "origin", `refs/heads/${metadata.branch}`], clean, true).split(/\s+/)[0];
   if (current !== metadata.revision) throw new Error("Preview branch advanced; refusing stale deployment");
   // Require an explicitly provisioned bucket. Never create, import or copy production state here.
   const bucketResponse = await fetcher(`https://api.cloudflare.com/client/v4/accounts/${metadata.account}/r2/buckets/${BUCKET}`, { headers: { authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}` }, signal: AbortSignal.timeout(30_000) });

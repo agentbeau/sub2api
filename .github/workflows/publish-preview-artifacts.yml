@@ -1,7 +1,7 @@
 name: publish tested preview artifacts
 on:
   push:
-    branches: [dagul/isolated-worker-preview]
+    branches: [dagul/isolated-worker-preview, dagul/classifier-readiness-integration]
 permissions: {}
 concurrency:
   group: sub2api-preview-artifacts-${{ github.sha }}
@@ -22,9 +22,11 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const owner = 'agentbeau', repo = 'sub2api', branch = 'dagul/isolated-worker-preview';
+            const owner = 'agentbeau', repo = 'sub2api';
+            const branch = context.ref.replace(/^refs\/heads\//, '');
+            const approvedBranches = ['dagul/isolated-worker-preview', 'dagul/classifier-readiness-integration'];
             const sha = context.sha;
-            if (context.repo.owner !== owner || context.repo.repo !== repo || context.ref !== `refs/heads/${branch}`) throw new Error('Unexpected publication source');
+            if (context.repo.owner !== owner || context.repo.repo !== repo || !approvedBranches.includes(branch) || context.ref !== `refs/heads/${branch}`) throw new Error('Unexpected publication source');
             const {data: workflow} = await github.rest.actions.getWorkflow({owner, repo, workflow_id:'ci.yml'});
             if (workflow.path !== '.github/workflows/ci.yml' || workflow.state !== 'active') throw new Error('Unexpected CI workflow');
             for (let n = 0; n < 32; n++) {

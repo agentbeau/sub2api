@@ -10,16 +10,17 @@ import test from "node:test";
 import { consumeCiArtifacts, verifyCiProvenance } from "./consume-preview-artifacts.mjs";
 import { ARTIFACT_NAMES, CI_WORKFLOW, REPOSITORY, REPOSITORY_ID, artifactReleaseTag, createReleaseReceipt } from "./preview-github-artifacts.mjs";
 import { writeManifest } from "./deployment-artifact.mjs";
+import { PREVIEW_BRANCHES } from "./preview-branches.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const revision = "a".repeat(40);
 const digest = bytes => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 const zipScript = "import pathlib,sys,zipfile; p=pathlib.Path(sys.argv[1]); z=zipfile.ZipFile(sys.argv[2],'w',zipfile.ZIP_DEFLATED); [z.write(f,str(f.relative_to(p))) for f in sorted(p.rglob('*')) if f.is_file()]; z.close()";
 
-async function fixture(t) {
+async function fixture(t, branch = PREVIEW_BRANCHES[0]) {
   const directory = await mkdtemp(join(tmpdir(), "sub2api-consume-test-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  const run = { id: 123, run_attempt: 1, workflow_id: 456, path: CI_WORKFLOW, head_sha: revision, head_branch: "dagul/isolated-worker-preview", event: "push", status: "completed", conclusion: "success", repository: { id: REPOSITORY_ID, full_name: REPOSITORY }, head_repository: { id: REPOSITORY_ID, full_name: REPOSITORY } };
+  const run = { id: 123, run_attempt: 1, workflow_id: 456, path: CI_WORKFLOW, head_sha: revision, head_branch: branch, event: "push", status: "completed", conclusion: "success", repository: { id: REPOSITORY_ID, full_name: REPOSITORY }, head_repository: { id: REPOSITORY_ID, full_name: REPOSITORY } };
   const artifacts = [];
   const assets = [];
   const bytes = new Map();
@@ -39,7 +40,7 @@ async function fixture(t) {
     const archive = join(directory, `${name}.zip`);
     execFileSync("python3", ["-c", zipScript, source, archive]);
     const payload = await readFile(archive);
-    artifacts.push({ id: 200 + index, name, digest: digest(payload), size_in_bytes: payload.length, expired: false, workflow_run: { id: run.id, repository_id: REPOSITORY_ID, head_repository_id: REPOSITORY_ID, head_branch: "dagul/isolated-worker-preview", head_sha: revision } });
+    artifacts.push({ id: 200 + index, name, digest: digest(payload), size_in_bytes: payload.length, expired: false, workflow_run: { id: run.id, repository_id: REPOSITORY_ID, head_repository_id: REPOSITORY_ID, head_branch: branch, head_sha: revision } });
     assets.push({ id: 300 + index, name: `${name}.zip`, size: payload.length, digest: digest(payload), state: "uploaded" });
     bytes.set(300 + index, payload);
   }
@@ -69,7 +70,7 @@ async function fixture(t) {
   };
   const output = join(directory, "received");
   const options = {
-    root, revision, directory: output, worker: join(output, "worker"), image: join(output, "image"), env: { PATH: process.env.PATH }, fetcher,
+    root, branch, revision, directory: output, worker: join(output, "worker"), image: join(output, "image"), env: { PATH: process.env.PATH }, fetcher,
     now: () => state.clock, sleep: async ms => { state.clock += ms; },
     execute: (command, args, settings) => { state.commands.push({ command, args }); return execFileSync(command, args, settings); },
   };
@@ -85,6 +86,13 @@ test("consumer verifies original ZIP digests, extracts real archives and never r
   assert.deepEqual(f.state.commands.map(call => call.command), ["python3", "python3"]);
   assert.equal(f.state.calls.some(path => path.includes("/latest")), false);
   assert.deepEqual(await verifyCiProvenance(source, revision, { fetcher: f.options.fetcher }), source);
+});
+
+test("consumer accepts the reviewed integration branch and rejects main provenance", async (t) => {
+  const f = await fixture(t, PREVIEW_BRANCHES[1]);
+  const source = await consumeCiArtifacts(f.options);
+  assert.equal(source.branch, PREVIEW_BRANCHES[1]);
+  await assert.rejects(verifyCiProvenance(source, revision, { ...f.options, branch: "main" }), /original GitHub CI provenance/);
 });
 
 test("wrong source workflow, repository, event, result or revision cannot reach extraction", async (t) => {

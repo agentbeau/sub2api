@@ -2,11 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { previewArtifactConfig, previewMetadata } from "./preview-builds.mjs";
+import { PREVIEW_BRANCHES } from "./preview-branches.mjs";
 const env = { WORKERS_CI: "1", WORKERS_CI_BRANCH: "dagul/isolated-worker-preview", WORKERS_CI_COMMIT_SHA: "a".repeat(40), WORKERS_CI_BUILD_UUID: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", CLOUDFLARE_ACCOUNT_ID: "b".repeat(32), SKIP_DEPENDENCY_INSTALL: "1" };
 test("preview metadata is pinned to branch and full build identity", () => {
   assert.equal(previewMetadata(env).revision, env.WORKERS_CI_COMMIT_SHA);
+  assert.equal(previewMetadata({ ...env, WORKERS_CI_BRANCH: PREVIEW_BRANCHES[1] }).branch, PREVIEW_BRANCHES[1]);
   for (const field of Object.keys(env)) assert.throws(() => previewMetadata({ ...env, [field]: "" }));
   assert.throws(() => previewMetadata({ ...env, WORKERS_CI_BRANCH: "main" }));
+  assert.throws(() => previewMetadata({ ...env, WORKERS_CI_BRANCH: "dagul/another-preview" }));
   assert.throws(() => previewMetadata({ ...env, WRANGLER_CI_OVERRIDE_NAME: "sub2api" }));
   assert.throws(() => previewMetadata({ ...env, WRANGLER_CI_MATCH_TAG: "51bbbb96341040459ebd0d4a4b3eb528" }));
 });

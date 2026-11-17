@@ -1,4 +1,5 @@
 // Public provenance shared by the GitHub publisher and Cloudflare consumer.
+import { DEFAULT_PREVIEW_BRANCH, isPreviewBranch } from "./preview-branches.mjs";
 export const REPOSITORY = "agentbeau/sub2api";
 export const REPOSITORY_ID = 1453664051;
 export const CI_WORKFLOW = ".github/workflows/ci.yml";
@@ -9,10 +10,10 @@ const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const id = value => Number.isSafeInteger(value) && value > 0;
 const repository = value => value?.id === REPOSITORY_ID && value?.full_name === REPOSITORY;
 
-export function validateRun(run, revision, workflowId) {
+export function validateRun(run, revision, workflowId, branch = run?.head_branch ?? DEFAULT_PREVIEW_BRANCH) {
   if (!SHA.test(revision ?? "") || !id(workflowId) || !id(run?.id) || !id(run.run_attempt)
     || !repository(run.repository) || !repository(run.head_repository)
-    || run.head_sha !== revision || run.head_branch !== "dagul/isolated-worker-preview" || run.event !== "push"
+    || !isPreviewBranch(branch) || run.head_sha !== revision || run.head_branch !== branch || run.event !== "push"
     || run.path !== CI_WORKFLOW || run.workflow_id !== workflowId
     || run.status !== "completed" || run.conclusion !== "success") {
     throw new Error("Expected a successful trusted-preview ci.yml push run for this exact revision");
@@ -26,7 +27,7 @@ export function validateArtifact(artifact, run, name) {
     || !Number.isSafeInteger(artifact.size_in_bytes) || artifact.size_in_bytes <= 0 || artifact.size_in_bytes > MAX_ARTIFACT_BYTES
     || !DIGEST.test(artifact.digest ?? "") || source?.id !== run.id
     || source.repository_id !== REPOSITORY_ID || source.head_repository_id !== REPOSITORY_ID
-    || source.head_branch !== "dagul/isolated-worker-preview" || source.head_sha !== run.head_sha) {
+    || !isPreviewBranch(source.head_branch) || source.head_branch !== run.head_branch || source.head_sha !== run.head_sha) {
     throw new Error(`Invalid original Actions provenance for ${name}`);
   }
   // Expiry removes the private download, not the integrity of public ID/digest metadata.
@@ -41,7 +42,7 @@ export function artifactReleaseTag(run) {
 
 export function createReleaseReceipt(run, artifacts) {
   return {
-    version: 1, repository: REPOSITORY, repositoryId: REPOSITORY_ID,
+    version: 1, repository: REPOSITORY, repositoryId: REPOSITORY_ID, branch: run.head_branch,
     revision: run.head_sha, runId: run.id, runAttempt: run.run_attempt, workflowId: run.workflow_id,
     artifacts: ARTIFACT_NAMES.map(name => {
       const matches = artifacts.filter(artifact => artifact.name === name);

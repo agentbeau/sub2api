@@ -2,8 +2,9 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
+import { isPreviewBranch } from "./preview-branches.mjs";
 export function validatePreview(config, branch, { ready = true } = {}) {
-  assert.equal(branch, "dagul/isolated-worker-preview", "Only the isolated preview branch is allowed");
+  assert.ok(isPreviewBranch(branch), "Only the explicitly reviewed preview branches are allowed");
   assert.equal(config.name, "gateway-preview");
   assert.equal(config.main, "src/preview.ts");
   assert.equal(config.workers_dev, true);

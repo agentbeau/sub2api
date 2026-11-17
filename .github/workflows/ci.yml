@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, dagul/isolated-worker-preview]
+    branches: [main, dagul/isolated-worker-preview, dagul/classifier-readiness-integration]
   pull_request:
   workflow_call:
 
@@ -41,16 +41,16 @@ jobs:
       - name: Verify deployment safeguards
         run: node --test scripts/deployment.test.mjs scripts/deploy-prepared.test.mjs scripts/cloudflare-builds.test.mjs scripts/consume-ci-artifacts.test.mjs scripts/publish-ci-artifacts.test.mjs container/brand-panel/brand.test.mjs
       - name: Exercise the compiled isolated preview boundary
-        if: github.head_ref == 'dagul/isolated-worker-preview' || github.ref_name == 'dagul/isolated-worker-preview'
+        if: github.head_ref == 'dagul/isolated-worker-preview' || github.ref_name == 'dagul/isolated-worker-preview' || github.head_ref == 'dagul/classifier-readiness-integration' || github.ref_name == 'dagul/classifier-readiness-integration'
         run: |
           node --test scripts/preview-guard.test.mjs scripts/preview-builds.test.mjs scripts/consume-preview-artifacts.test.mjs scripts/publish-preview-artifacts.test.mjs
           npx esbuild src/preview.ts --bundle --format=esm --platform=neutral --target=esnext '--conditions=workerd,worker,browser' '--external:cloudflare:*' --loader:.wasm=copy --outfile=.wrangler/preview-runtime/preview.js
           node scripts/preview-runtime.mjs .wrangler/preview-runtime/preview.js
       - name: Package tested isolated preview
-        if: github.head_ref == 'dagul/isolated-worker-preview' || github.ref_name == 'dagul/isolated-worker-preview'
+        if: github.head_ref == 'dagul/isolated-worker-preview' || github.ref_name == 'dagul/isolated-worker-preview' || github.head_ref == 'dagul/classifier-readiness-integration' || github.ref_name == 'dagul/classifier-readiness-integration'
         run: node scripts/package-preview.mjs
       - uses: actions/upload-artifact@v4
-        if: github.head_ref == 'dagul/isolated-worker-preview' || github.ref_name == 'dagul/isolated-worker-preview'
+        if: github.head_ref == 'dagul/isolated-worker-preview' || github.ref_name == 'dagul/isolated-worker-preview' || github.head_ref == 'dagul/classifier-readiness-integration' || github.ref_name == 'dagul/classifier-readiness-integration'
         with:
           name: isolated-preview
           path: .wrangler/artifacts/isolated-preview

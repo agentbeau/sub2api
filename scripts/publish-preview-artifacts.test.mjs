@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { parse } from "yaml";
 import { publishCiArtifacts } from "./publish-preview-artifacts.mjs";
+import { PREVIEW_BRANCHES } from "./preview-branches.mjs";
 
 const revision = "a".repeat(40);
 const repository = { id: 1453664051, full_name: "agentbeau/sub2api" };
@@ -12,16 +13,16 @@ const prefix = "/repos/agentbeau/sub2api";
 const sha256 = bytes => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 const clone = value => globalThis.structuredClone(value);
 
-function fixture() {
+function fixture(branch = PREVIEW_BRANCHES[0]) {
   const run = {
     id: 101, run_attempt: 2, workflow_id: 345, path: ".github/workflows/ci.yml",
-    event: "push", head_branch: "dagul/isolated-worker-preview", head_sha: revision,
+    event: "push", head_branch: branch, head_sha: revision,
     status: "completed", conclusion: "success", repository: clone(repository), head_repository: clone(repository),
   };
   const blobs = new Map([[501, Buffer.from("PK original tested Worker ZIP\n")], [502, Buffer.from("PK original tested image ZIP\n")]]);
   const artifacts = ["isolated-preview", "container-image"].map((name, i) => ({
     id: 501 + i, name, size_in_bytes: blobs.get(501 + i).length, digest: sha256(blobs.get(501 + i)), expired: false,
-    workflow_run: { id: 101, repository_id: 1453664051, head_repository_id: 1453664051, head_branch: "dagul/isolated-worker-preview", head_sha: revision },
+    workflow_run: { id: 101, repository_id: 1453664051, head_repository_id: 1453664051, head_branch: branch, head_sha: revision },
   }));
   const state = {
     run, artifacts, blobs, main: revision, workflow: { id: 345, path: ".github/workflows/ci.yml", state: "active" },
@@ -42,7 +43,7 @@ function fixture() {
     if (method === "GET") {
       if (path === `${prefix}/actions/workflows/ci.yml`) return Response.json(clone(state.workflow));
       if (path === `${prefix}/actions/runs/101`) return Response.json(clone(state.run));
-      if (path === `${prefix}/git/ref/heads/dagul/isolated-worker-preview`) return Response.json({ ref: "refs/heads/dagul/isolated-worker-preview", object: { type: "commit", sha: state.main } });
+      if (path === `${prefix}/git/ref/heads/${branch}`) return Response.json({ ref: `refs/heads/${branch}`, object: { type: "commit", sha: state.main } });
       if (path === `${prefix}/actions/runs/101/artifacts`) return Response.json({ total_count: state.artifacts.length, artifacts: clone(state.artifacts) });
       if (/\/actions\/artifacts\/\d+\/zip$/.test(path)) {
         const id = Number(path.split("/").at(-2));
@@ -86,8 +87,15 @@ function fixture() {
     }
     throw new Error(`Unexpected publication request: ${method} ${url}`);
   };
-  return { state, options: { runId: 101, runAttempt: 2, revision, token: "automatic-test-token", fetcher } };
+  return { state, options: { runId: 101, runAttempt: 2, revision, branch, token: "automatic-test-token", fetcher } };
 }
+
+test("the reviewed integration branch can publish while main remains outside the preview allowlist", async () => {
+  const f = fixture(PREVIEW_BRANCHES[1]);
+  await publishCiArtifacts(f.options);
+  assert.equal(f.state.run.head_branch, PREVIEW_BRANCHES[1]);
+  await assert.rejects(publishCiArtifacts({ ...f.options, branch: "main" }), /reviewed preview branch/);
+});
 
 test("publication distributes the original tested ZIP bytes and publishes only the complete draft", async () => {
   const f = fixture();

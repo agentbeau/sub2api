@@ -11,6 +11,7 @@ import {
   ARTIFACT_NAMES, CI_WORKFLOW, REPOSITORY, artifactReleaseTag,
   createReleaseReceipt, validateArtifact, validateRun,
 } from "./preview-github-artifacts.mjs";
+import { DEFAULT_PREVIEW_BRANCH, isPreviewBranch } from "./preview-branches.mjs";
 
 const PREFIX = `/repos/${REPOSITORY}`;
 const RECEIPT_ASSET = "receipt.json";
@@ -77,15 +78,15 @@ function githubClient(token, fetcher) {
   return { request, download, upload };
 }
 
-async function checkedSource(client, { runId, runAttempt, revision }) {
+async function checkedSource(client, { runId, runAttempt, revision, branch }) {
   const [workflow, run, main, listing] = await Promise.all([
     client.request("/actions/workflows/ci.yml"), client.request(`/actions/runs/${runId}`),
-    client.request("/git/ref/heads/dagul/isolated-worker-preview"), client.request(`/actions/runs/${runId}/artifacts?per_page=100`),
+    client.request(`/git/ref/heads/${branch}`), client.request(`/actions/runs/${runId}/artifacts?per_page=100`),
   ]);
   if (workflow.path !== CI_WORKFLOW || workflow.state !== "active" || !positiveInteger(workflow.id)) throw new Error("Unexpected source CI workflow");
-  validateRun(run, revision, workflow.id);
+  validateRun(run, revision, workflow.id, branch);
   if (run.id !== runId || run.run_attempt !== runAttempt) throw new Error("Source CI run or attempt changed");
-  if (main.ref !== "refs/heads/dagul/isolated-worker-preview" || main.object?.type !== "commit" || main.object.sha !== revision) throw new Error("Source revision is no longer current preview branch");
+  if (main.ref !== `refs/heads/${branch}` || main.object?.type !== "commit" || main.object.sha !== revision) throw new Error("Source revision is no longer current preview branch");
   if (!Array.isArray(listing.artifacts) || listing.total_count !== listing.artifacts.length || listing.artifacts.length > 100) throw new Error("Incomplete source artifact metadata");
   const artifacts = ARTIFACT_NAMES.map(name => {
     const matches = listing.artifacts.filter(artifact => artifact.name === name);
@@ -136,11 +137,12 @@ async function findRelease(client, tag) {
   throw new Error("Unable to establish whether this CI artifact release already exists");
 }
 
-export async function publishCiArtifacts({ runId, runAttempt, revision, token, fetcher = fetch }) {
+export async function publishCiArtifacts({ runId, runAttempt, revision, branch = DEFAULT_PREVIEW_BRANCH, token, fetcher = fetch }) {
   if (!positiveInteger(runId) || !positiveInteger(runAttempt) || !/^[a-f0-9]{40}$/.test(revision ?? "")) throw new Error("A validated CI run ID, attempt, and full revision are required");
+  if (!isPreviewBranch(branch)) throw new Error("Only an explicitly reviewed preview branch may publish artifacts");
   if (typeof token !== "string" || !token.trim()) throw new Error("The workflow's automatic GITHUB_TOKEN is required");
   const client = githubClient(token, fetcher);
-  const parameters = { runId, runAttempt, revision };
+  const parameters = { runId, runAttempt, revision, branch };
   const source = await checkedSource(client, parameters);
   const tag = artifactReleaseTag(source.run);
   const directory = await mkdtemp(join(tmpdir(), "sub2api-publish-"));
@@ -194,7 +196,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     }
     const result = await publishCiArtifacts({
       runId: Number(process.env.SUB2API_CI_RUN_ID), runAttempt: Number(process.env.SUB2API_CI_RUN_ATTEMPT),
-      revision: process.env.SUB2API_CI_REVISION, token: process.env.GITHUB_TOKEN,
+      revision: process.env.SUB2API_CI_REVISION, branch: process.env.GITHUB_REF_NAME, token: process.env.GITHUB_TOKEN,
     });
     console.log(`Verified CI artifact release: ${result.tag}${result.reused ? " (already published)" : ""}`);
   } catch (error) {

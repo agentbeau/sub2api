@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { ARTIFACT_NAMES, CI_WORKFLOW, REPOSITORY, REPOSITORY_ID, artifactReleaseTag, validateArtifact, validateReleaseReceipt, validateRun } from "./preview-github-artifacts.mjs";
+import { DEFAULT_PREVIEW_BRANCH, isPreviewBranch } from "./preview-branches.mjs";
 import { verifyArtifact, verifyContainerImageArtifact } from "./deployment-artifact.mjs";
 
 const API = `https://api.github.com/repos/${REPOSITORY}`;
@@ -38,15 +39,15 @@ function validateWorkflow(workflow) {
   return workflow.id;
 }
 
-async function waitForRun(revision, workflowId, context) {
-  const query = new URLSearchParams({ event: "push", branch: "dagul/isolated-worker-preview", head_sha: revision, per_page: "10" });
+async function waitForRun(revision, workflowId, branch, context) {
+  const query = new URLSearchParams({ event: "push", branch, head_sha: revision, per_page: "10" });
   while (true) {
     const result = await github(`/actions/workflows/ci.yml/runs?${query}`, context);
     if (!Array.isArray(result.workflow_runs)) throw new Error("GitHub returned no workflow run collection");
-    const candidates = result.workflow_runs.filter(run => run.head_sha === revision && run.event === "push" && run.head_branch === "dagul/isolated-worker-preview");
+    const candidates = result.workflow_runs.filter(run => run.head_sha === revision && run.event === "push" && run.head_branch === branch);
     candidates.sort((a, b) => b.id - a.id);
     const run = candidates[0];
-    if (run?.status === "completed") return validateRun(run, revision, workflowId);
+    if (run?.status === "completed") return validateRun(run, revision, workflowId, branch);
     if (run && (run.repository?.id !== REPOSITORY_ID || run.head_repository?.id !== REPOSITORY_ID || run.workflow_id !== workflowId || run.path !== CI_WORKFLOW)) throw new Error("Untrusted source workflow run");
     await pause(context, `Waiting for the trusted preview CI run for ${revision}.`);
   }
@@ -89,11 +90,11 @@ async function downloadAsset(asset, path, digest, size, context) {
   }
 }
 
-export async function verifyCiProvenance(source, revision, { fetcher = fetch, now = Date.now } = {}) {
+export async function verifyCiProvenance(source, revision, { branch = source?.branch ?? DEFAULT_PREVIEW_BRANCH, fetcher = fetch, now = Date.now } = {}) {
   const context = { fetcher, now, deadline: now() + 120_000 };
-  if (!source || source.revision !== revision || source.repository !== REPOSITORY || source.repositoryId !== REPOSITORY_ID || !Number.isSafeInteger(source.runId) || !Array.isArray(source.artifacts) || source.artifacts.length !== ARTIFACT_NAMES.length) throw new Error("Missing original GitHub CI provenance receipt");
+  if (!source || !isPreviewBranch(branch) || source.branch !== branch || source.revision !== revision || source.repository !== REPOSITORY || source.repositoryId !== REPOSITORY_ID || !Number.isSafeInteger(source.runId) || !Array.isArray(source.artifacts) || source.artifacts.length !== ARTIFACT_NAMES.length) throw new Error("Missing original GitHub CI provenance receipt");
   const [workflow, run] = await Promise.all([github("/actions/workflows/ci.yml", context), github(`/actions/runs/${source.runId}`, context)]);
-  validateRun(run, revision, validateWorkflow(workflow));
+  validateRun(run, revision, validateWorkflow(workflow), branch);
   if (run.run_attempt !== source.runAttempt) throw new Error("The source CI run attempt changed; rerun the Cloudflare build");
   const artifacts = await Promise.all(source.artifacts.map(artifact => {
     if (!Number.isSafeInteger(artifact?.id) || artifact.id <= 0) throw new Error("Invalid original artifact ID");
@@ -102,10 +103,11 @@ export async function verifyCiProvenance(source, revision, { fetcher = fetch, no
   return validateReleaseReceipt(source, run, artifacts);
 }
 
-export async function consumeCiArtifacts({ root, revision, worker, image, directory, env, execute, fetcher = fetch, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), timeoutMs = WAIT_LIMIT_MS, pollMs = POLL_INTERVAL_MS }) {
+export async function consumeCiArtifacts({ root, branch = DEFAULT_PREVIEW_BRANCH, revision, worker, image, directory, env, execute, fetcher = fetch, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), timeoutMs = WAIT_LIMIT_MS, pollMs = POLL_INTERVAL_MS }) {
+  if (!isPreviewBranch(branch)) throw new Error("Unreviewed preview source branch");
   const context = { fetcher, now, sleep, pollMs, deadline: now() + timeoutMs };
   const workflowId = validateWorkflow(await github("/actions/workflows/ci.yml", context));
-  const run = await waitForRun(revision, workflowId, context);
+  const run = await waitForRun(revision, workflowId, branch, context);
   const release = await waitForRelease(run, context);
   const tag = await github(`/git/ref/tags/${artifactReleaseTag(run)}`, context);
   if (tag.object?.type !== "commit" || tag.object.sha !== revision) throw new Error("CI artifact release tag does not resolve to the verified commit");
@@ -129,7 +131,7 @@ export async function consumeCiArtifacts({ root, revision, worker, image, direct
   }));
   // Check again after the downloads so a rerun cannot silently change provenance.
   const currentRun = await github(`/actions/runs/${run.id}`, context);
-  validateRun(currentRun, revision, workflowId);
+  validateRun(currentRun, revision, workflowId, branch);
   if (currentRun.run_attempt !== run.run_attempt) throw new Error("The source CI run attempt changed during download");
   for (const artifact of source.artifacts) {
     const destination = artifact.name === "isolated-preview" ? worker : image;
