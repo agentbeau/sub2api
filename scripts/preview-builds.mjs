@@ -5,8 +5,9 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildEnvironment } from "./cloudflare-builds.mjs";
 import { consumeCiArtifacts, verifyCiProvenance } from "./consume-preview-artifacts.mjs";
+import { verifyExistingDashboard } from "./dashboard-artifact.mjs";
 import { validatePreview } from "./preview-guard.mjs";
-import { DASHBOARD_OBJECT_KEY, DASHBOARD_PANEL_FILE, imageDigest, PREPARED_IMAGE, sha256, sourceIdentity, verifyArtifact, verifyContainerImageArtifact } from "./deployment-artifact.mjs";
+import { DASHBOARD_OBJECT_KEY, imageDigest, PREPARED_IMAGE, sha256, sourceIdentity, verifyArtifact, verifyContainerImageArtifact } from "./deployment-artifact.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BRANCH = "dagul/isolated-worker-preview";
@@ -96,7 +97,8 @@ export async function runPreviewPhase(phase, { root = ROOT, env = process.env, e
   const deployConfig = join(worker, "deploy.json");
   try {
     checkSource();
-    run(wrangler, ["r2", "object", "put", `${BUCKET}/${DASHBOARD_OBJECT_KEY}`, "--file", join(image, DASHBOARD_PANEL_FILE), "--content-type", "text/html; charset=utf-8", "--remote"], deployEnv);
+    const dashboard = await verifyExistingDashboard({ account: metadata.account, bucket: BUCKET, token: env.CLOUDFLARE_API_TOKEN, fetcher });
+    console.log(`Preserved existing ${DASHBOARD_OBJECT_KEY} (${dashboard.byteLength} bytes; SHA-256 ${dashboard.sha256})`);
     await writeFile(deployConfig, JSON.stringify(config), { flag: "wx" });
     run(wrangler, ["deploy", "--no-bundle", "--config", deployConfig], deployEnv);
   } finally { await rm(deployConfig, { force: true }); }

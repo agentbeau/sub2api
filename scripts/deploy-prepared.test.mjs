@@ -13,7 +13,7 @@ const image = `sub2api-cpa:${revision.slice(0, 12)}-1-1`;
 const imageId = `sha256:${"c".repeat(64)}`;
 const digest = `registry.cloudflare.com/${account}/sub2api-cpa@sha256:${"d".repeat(64)}`;
 
-async function fixture(t, install = "container") {
+async function fixture(t, install = "container", live = install) {
   const root = await mkdtemp(join(tmpdir(), "sub2api-prepared-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const worker = join(root, "artifact");
@@ -39,7 +39,11 @@ async function fixture(t, install = "container") {
     GITHUB_OUTPUT: join(root, "github-output"),
     PATH: "/usr/bin", HTTPS_PROXY: "http://proxy:8080", GITHUB_TOKEN: "github-secret",
   };
-  const state = { calls: [], main: revision, checks: 0, moveAfter: "", failCheck: 0 };
+  if (live === "none") {
+    environment.SUB2API_DASHBOARD_PASSWORD = "x".repeat(40);
+    environment.SUB2API_MANAGEMENT_KEY = "y".repeat(40);
+  }
+  const state = { calls: [], main: revision, checks: 0, moveAfter: "", failCheck: 0, dashboard: live !== "none", urls: [] };
   const execute = (command, args, options) => {
     state.calls.push({ command, args, ...options });
     if (command === "git" && args[0] === "rev-parse") return revision;
@@ -48,7 +52,7 @@ async function fixture(t, install = "container") {
       if (state.checks === state.failCheck) throw new Error("public main unavailable");
       return `${state.main}\trefs/heads/main\n`;
     }
-    if (args[0]?.endsWith("live-install.mjs")) return install;
+    if (args[0]?.endsWith("live-install.mjs")) return live;
     if (command === "docker" && args[1] === "load") return "";
     if (command === "docker" && args[1] === "inspect") return args[3] === "{{.Id}}" ? imageId : JSON.stringify([digest]);
     if (command.endsWith("/wrangler")) {
@@ -57,6 +61,7 @@ async function fixture(t, install = "container") {
         return "";
       }
       if (args[0] === "r2" && args[1] === "object" && args[2] === "put") {
+        state.dashboard = true;
         if (state.moveAfter === "panel") state.main = "e".repeat(40);
         return "";
       }
@@ -65,8 +70,13 @@ async function fixture(t, install = "container") {
     throw new Error(`Unexpected command in prepared deployment: ${command} ${args.join(" ")}`);
   };
   const fetcher = async (url) => {
-    assert.equal(url, `https://api.cloudflare.com/client/v4/accounts/${account}/r2/buckets/sub2api`);
-    return Response.json({ success: true });
+    state.urls.push(url);
+    if (url === `https://api.cloudflare.com/client/v4/accounts/${account}/r2/buckets/sub2api`) return Response.json({ success: true });
+    if (url === `https://api.cloudflare.com/client/v4/accounts/${account}/r2/buckets/sub2api/objects/dashboard/management.html`) {
+      if (state.moveAfter === "dashboard") state.main = "e".repeat(40);
+      return state.dashboard ? new Response("<html>preserved enhanced dashboard</html>", { headers: { "content-type": "text/html" } }) : new Response(null, { status: 404 });
+    }
+    throw new Error(`Unexpected fetch in prepared deployment: ${url}`);
   };
   return { args: [install, worker, images], options: { root, environment, execute, fetcher }, worker, state };
 }
@@ -75,11 +85,12 @@ function writes(state) {
   return state.calls.filter(call => call.command.endsWith("/wrangler")).map(call => call.args[0] === "r2" ? "panel" : call.args[0]);
 }
 
-test("opted-in deployment checks main after image push and immediately before activation", async (t) => {
+test("existing deployment preserves its R2 dashboard and checks main before activation", async (t) => {
   const f = await fixture(t);
   await deployPrepared(f.args, f.options);
   const operations = f.state.calls.filter(call => call.command.endsWith("/wrangler") || call.args[0] === "ls-remote").map(call => call.args[0] === "ls-remote" ? "main" : call.args[0] === "r2" ? "panel" : call.args[0]);
-  assert.deepEqual(operations, ["containers", "main", "panel", "main", "deploy"]);
+  assert.deepEqual(operations, ["containers", "main", "main", "deploy"]);
+  assert.ok(f.state.urls.includes(`https://api.cloudflare.com/client/v4/accounts/${account}/r2/buckets/sub2api/objects/dashboard/management.html`));
   for (const call of f.state.calls.filter(call => call.args[0] === "ls-remote")) {
     assert.deepEqual(call.args, ["ls-remote", "--exit-code", "https://github.com/agentbeau/sub2api.git", "refs/heads/main"]);
     assert.equal(call.env.HTTPS_PROXY, "http://proxy:8080");
@@ -89,19 +100,20 @@ test("opted-in deployment checks main after image push and immediately before ac
   await assert.rejects(readFile(join(f.worker, "deploy.json")), { code: "ENOENT" });
 });
 
-test("main advancing during image publication stops before the panel and Worker writes", async (t) => {
+test("main advancing during image publication stops before dashboard verification or Worker writes", async (t) => {
   const f = await fixture(t);
   f.state.moveAfter = "push";
   await assert.rejects(deployPrepared(f.args, f.options), /no longer current main/);
   assert.deepEqual(writes(f.state), ["containers"]);
+  assert.ok(!f.state.urls.some(url => url.endsWith("/objects/dashboard/management.html")));
   assert.equal(f.state.checks, 1);
 });
 
-test("main advancing after panel publication stops Worker activation and cleans its temporary config", async (t) => {
+test("main advancing after dashboard preservation stops Worker activation and cleans its temporary config", async (t) => {
   const f = await fixture(t);
-  f.state.moveAfter = "panel";
+  f.state.moveAfter = "dashboard";
   await assert.rejects(deployPrepared(f.args, f.options), /no longer current main/);
-  assert.deepEqual(writes(f.state), ["containers", "panel"]);
+  assert.deepEqual(writes(f.state), ["containers"]);
   assert.equal(f.state.checks, 2);
   await assert.rejects(readFile(join(f.worker, "deploy.json")), { code: "ENOENT" });
 });
@@ -111,9 +123,24 @@ test("a failed public main lookup fails closed at either late gate", async (t) =
     const f = await fixture(t);
     f.state.failCheck = gate;
     await assert.rejects(deployPrepared(f.args, f.options), /public main unavailable/);
-    assert.deepEqual(writes(f.state), gate === 1 ? ["containers"] : ["containers", "panel"]);
+    assert.deepEqual(writes(f.state), ["containers"]);
     await assert.rejects(readFile(join(f.worker, "deploy.json")), { code: "ENOENT" });
   }
+});
+
+test("an existing installation refuses to deploy if its dashboard object is missing", async (t) => {
+  const f = await fixture(t);
+  f.state.dashboard = false;
+  await assert.rejects(deployPrepared(f.args, f.options), /Could not verify the existing dashboard artifact/);
+  assert.deepEqual(writes(f.state), ["containers"]);
+  assert.ok(!f.state.calls.some(call => call.command.endsWith("/wrangler") && call.args[0] === "deploy"));
+});
+
+test("a first container install publishes only the checked panel from its tested image", async (t) => {
+  const f = await fixture(t, "container", "none");
+  await deployPrepared(f.args, f.options);
+  assert.deepEqual(writes(f.state), ["containers", "panel", "deploy"]);
+  assert.ok(!f.state.urls.some(url => url.endsWith("/objects/dashboard/management.html")));
 });
 
 test("ordinary prepared deployments keep their original behavior without opting in", async (t) => {
@@ -124,7 +151,7 @@ test("ordinary prepared deployments keep their original behavior without opting 
     f.state.failCheck = 1;
     await deployPrepared(f.args, f.options);
     assert.equal(f.state.checks, 0);
-    assert.deepEqual(writes(f.state), install === "container" ? ["containers", "panel", "deploy"] : ["deploy"]);
+    assert.deepEqual(writes(f.state), install === "container" ? ["containers", "deploy"] : ["deploy"]);
     assert.equal(await readFile(f.options.environment.GITHUB_OUTPUT, "utf8"), "url=https://sub2api.example.workers.dev\n");
   }
 });
