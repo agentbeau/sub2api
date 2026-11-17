@@ -12,6 +12,7 @@ const token=process.env.CLOUDFLARE_API_TOKEN;
 if(!token)throw Error('Existing Cloudflare build credential required');
 const prepared=await prepareSource();
 try {
+const baseImage=`registry.cloudflare.com/${account}/gateway-engine@sha256:6a8959018529d6d505278eae7e346d550fbd511da3ba069d7be11871a05a47f1`;
 const response=await globalThis.fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/containers/registries/registry.cloudflare.com/credentials`,{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({expiration_minutes:15,permissions:['pull','push']})});
 if(!response.ok)throw Error(`Registry authorization status ${response.status}`);
 const data=await response.json();const credentials=data.result||data;
@@ -22,11 +23,18 @@ const tag=`gateway-readiness:${revision.slice(0,12)}`;
  run('docker',['version']);
  run('docker',['build','--pull','--platform','linux/amd64','-f','ops/readiness/Dockerfile','--label',`org.opencontainers.image.revision=${revision}`,'--network=none','-t',tag,prepared.context]);
  const imageId=capture('docker',['image','inspect','--format','{{.Id}}',tag]);
+ const panelSha256=image=>{
+  const value=capture('docker',['run','--rm','--platform','linux/amd64','--entrypoint','sha256sum',image,'/panel/management.html']).split(/\s+/)[0];
+  if(!/^[a-f0-9]{64}$/.test(value))throw Error('Could not identify the image dashboard bytes');
+  return value;
+ };
+ const basePanelSha256=panelSha256(baseImage),builtPanelSha256=panelSha256(tag);
+ if(basePanelSha256!==builtPanelSha256)throw Error('Readiness image changed the pinned base dashboard artifact');
  run('sh',['test/container-smoke.sh','--prebuilt'],{env:{...process.env,IMAGE:tag}});
  run('node_modules/.bin/wrangler',['containers','push',tag]);
  const remote=`registry.cloudflare.com/${account}/${tag}`;
  const digests=JSON.parse(capture('docker',['image','inspect','--format','{{json .RepoDigests}}',remote]));
- console.log('VERIFIED_BUILD_RECEIPT '+JSON.stringify({revision,imageId,digests,providerCommit:'8bba7a77c6bcbfd993516d26606bfecaa4ff49d0',baseImage:'sha256:6a8959018529d6d505278eae7e346d550fbd511da3ba069d7be11871a05a47f1',tests:'container-smoke passed',deployed:false}));
+ console.log('VERIFIED_BUILD_RECEIPT '+JSON.stringify({revision,imageId,digests,providerCommit:'8bba7a77c6bcbfd993516d26606bfecaa4ff49d0',baseImage:'sha256:6a8959018529d6d505278eae7e346d550fbd511da3ba069d7be11871a05a47f1',panelSha256:builtPanelSha256,panelMatchesPinnedBase:true,tests:'container-smoke passed',deployed:false}));
 }finally{
  try { prepared.cleanup(); }
  finally { spawnSync('docker',['logout','registry.cloudflare.com'],{stdio:'ignore'}); }

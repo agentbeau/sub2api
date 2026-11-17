@@ -21,9 +21,11 @@ export function previewMetadata(env) {
   if (env.WRANGLER_CI_MATCH_TAG && env.WRANGLER_CI_MATCH_TAG !== "e938224d2f694fe5b6f92a60f4a332cd") throw new Error("Wrong preview Worker identity");
   return { revision: env.WORKERS_CI_COMMIT_SHA, account: env.CLOUDFLARE_ACCOUNT_ID, buildId: env.WORKERS_CI_BUILD_UUID };
 }
-export function previewArtifactConfig(source) {
+export function previewArtifactConfig(source, revision) {
+  if (!/^[a-f0-9]{40}$/.test(revision ?? "")) throw new Error("Exact preview source revision required");
   const config = JSON.parse(JSON.stringify(source));
   delete config.$schema;
+  config.vars = { ...config.vars, PREVIEW_SOURCE_REVISION: revision };
   config.main = "./worker/preview.js";
   config.no_bundle = true;
   config.find_additional_modules = true;
@@ -73,7 +75,7 @@ export async function runPreviewPhase(phase, { root = ROOT, env = process.env, e
   await verifyCiProvenance(receipt.provenance, metadata.revision);
   const manifest = await verifyContainerImageArtifact(image, metadata.revision);
   const config = JSON.parse(await readFile(join(worker, "wrangler.json"), "utf8"));
-  if (JSON.stringify(config) !== JSON.stringify(previewArtifactConfig(source))) throw new Error("Prepared preview bindings differ from reviewed source");
+  if (JSON.stringify(config) !== JSON.stringify(previewArtifactConfig(source, metadata.revision))) throw new Error("Prepared preview bindings differ from reviewed source");
   if (!env.CLOUDFLARE_API_TOKEN) throw new Error("Preview deploy credential missing");
   const deployEnv = { ...clean, CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID: metadata.account };
   for (const name of ["WRANGLER_CI_MATCH_TAG", "WRANGLER_CI_OVERRIDE_NAME"]) if (env[name]) deployEnv[name] = env[name];

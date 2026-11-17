@@ -8,7 +8,7 @@ import { Engine } from "../src/preview.ts";
 const KEY = "synthetic-preview-integration-0123456789";
 const configuration = `config-version: 8\naccess:\n  api-keys: [${KEY}]\n`;
 const low = { answers: { effort: { choice: "low", probabilities: { low: 0.95 } } } };
-function platform(decide: () => Promise<unknown>, withContainer = true) {
+function platform(decide: () => Promise<unknown>, withContainer = true, revision = "f".repeat(40)) {
   const events: string[] = [], forwarded: Request[] = [];
   let running = false, initialization: Promise<unknown> = Promise.resolve();
   const store = new LeaseStorage();
@@ -37,6 +37,7 @@ function platform(decide: () => Promise<unknown>, withContainer = true) {
   const ai = vi.fn(async () => { events.push("clef"); return decide(); });
   const env = {
     CLEF_ENABLED: "true", AI: { run: ai }, CONTAINER_IDLE_TIMEOUT_MS: "30000",
+    DASHBOARD_AUTH: "cloudflare", ACCESS_AUD: "synthetic-preview-audience", PREVIEW_SOURCE_REVISION: revision,
     STATE: {
       get: async (key: string) => {
         if (key !== "config/config.yaml") return null;
@@ -54,6 +55,14 @@ function request(effort?: string, key = KEY) {
   return new Request("https://preview.example/v1/chat/completions", { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify(body) });
 }
 describe("real enhanced Engine/Cpa classifier integration", () => {
+  it("reports the exact deployed source revision on private runtime status", async () => {
+    const revision = "a".repeat(40);
+    const p = platform(async () => low, true, revision); await p.initialized();
+    const response = await p.engine.fetchWithAccess(new Request("https://preview.example/runtime/status"));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-pmlabs-engine-revision")).toBe(revision);
+  });
+
   it("verifies key, classifies, then attaches/starts/forwards the original payload plus effort", async () => {
     const p = platform(async () => low); await p.initialized(); const input = request(); const original = await input.clone().json();
     expect((await p.engine.fetch(input)).status).toBe(200);

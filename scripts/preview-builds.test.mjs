@@ -12,13 +12,15 @@ test("preview metadata is pinned to branch and full build identity", () => {
 });
 test("prepared artifact keeps isolated bindings and prebuilt wrapper", async () => {
   const source = JSON.parse(await readFile(new URL("../wrangler.preview.jsonc", import.meta.url), "utf8"));
-  const config = previewArtifactConfig(source);
+  const config = previewArtifactConfig(source, env.WORKERS_CI_COMMIT_SHA);
   assert.equal(config.main, "./worker/preview.js");
   assert.equal(config.no_bundle, true);
   assert.equal(config.name, "gateway-preview");
   assert.equal(config.previews, undefined);
   assert.deepEqual(config.r2_buckets, source.r2_buckets);
+  assert.equal(config.vars.PREVIEW_SOURCE_REVISION, env.WORKERS_CI_COMMIT_SHA);
   assert.match(config.containers[0].image, /@sha256:/);
   assert.equal(config.containers[0].image_build_context, undefined);
   assert.equal(source.containers[0].image, "./container/Dockerfile");
+  assert.throws(() => previewArtifactConfig(source, "not-a-commit"));
 });

@@ -10,5 +10,5 @@ const target = '.wrangler/artifacts/isolated-preview';
 await rm(target, { recursive: true, force: true });
 await mkdir(target, { recursive: true });
 await cp('.wrangler/preview-runtime', `${target}/worker`, { recursive: true });
-await writeFile(`${target}/wrangler.json`, JSON.stringify(previewArtifactConfig(source)));
+await writeFile(`${target}/wrangler.json`, JSON.stringify(previewArtifactConfig(source, identity.revision)));
 await writeManifest(target, { ...identity, install: 'isolated-preview' });

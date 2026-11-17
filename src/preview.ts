@@ -11,7 +11,13 @@ const SUPPORTED: Readonly<Record<string, readonly Effort[]>> = Object.fromEntrie
   ["gpt-6-luna", "gpt-6-astra", "gpt-6.1-terra", "gpt-6.1-sol"].map(id => [id, ["low", "medium", "high"] as const]),
 );
 interface ClassifierAI { run(model: string, input: ReturnType<typeof clefInput>): Promise<unknown> }
-type PreviewEnv = Omit<Env, "CPA"> & { readonly ENGINE: Env["CPA"]; readonly PREVIEW_ACCESS_AUD?: string; readonly AI?: ClassifierAI; readonly CLEF_ENABLED?: string };
+type PreviewEnv = Omit<Env, "CPA"> & {
+  readonly ENGINE: Env["CPA"];
+  readonly PREVIEW_ACCESS_AUD?: string;
+  readonly PREVIEW_SOURCE_REVISION?: string;
+  readonly AI?: ClassifierAI;
+  readonly CLEF_ENABLED?: string;
+};
 // Every exported entrypoint receives the same preview binding adapter.
 function previewEnv(env: PreviewEnv): Env {
   return { ...env, CPA: env.ENGINE };
@@ -29,7 +35,8 @@ export class Engine extends Cpa {
     const response = await super.fetchWithAccess(request);
     if (new URL(request.url).pathname !== "/runtime/status" || response.status !== 200) return response;
     const headers = new Headers(response.headers);
-    headers.set("x-pmlabs-engine-revision", "clef-hardening-20261113");
+    const revision = this.classifierEnv.PREVIEW_SOURCE_REVISION;
+    headers.set("x-pmlabs-engine-revision", revision && /^[a-f0-9]{40}$/.test(revision) ? revision : "unversioned");
     headers.set("x-pmlabs-container-attached", String(this.ctx.container !== undefined));
     headers.set("x-pmlabs-clef-calls", String(this.classifierCalls));
     headers.set("x-pmlabs-clef-applied", String(this.classifierApplied));
