@@ -7,7 +7,7 @@ import { DASHBOARD_PANEL_FILE, pinnedPanel, sourceIdentity, writeManifest } from
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(process.argv[2] ?? join(root, ".wrangler/artifacts/container-image"));
-const panel = pinnedPanel(process.env.PANEL_VERSION, process.env.PANEL_SHA256);
+const panel = pinnedPanel(process.env.PANEL_VERSION?.trim() || undefined, process.env.PANEL_SHA256?.trim() || undefined);
 await mkdir(output, { recursive: true });
 if ((await readdir(output)).length !== 0) throw new Error("The image artifact output directory must be empty");
 const before = sourceIdentity(root);

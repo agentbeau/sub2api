@@ -48,11 +48,12 @@ test("prepared configuration preserves state identity and cannot rebuild code or
 });
 
 test("container dashboard builds require an immutable release tag and verified source hash", async () => {
-  assert.deepEqual(pinnedPanel("v2.4.1", "A".repeat(64)), { version: "v2.4.1", sha256: "a".repeat(64) });
+  assert.deepEqual(pinnedPanel(), { version: "v1.28.1", sha256: "c00ac5577db8feb12d37de6ecb783cf919bb81536902308079f754337d7a7bc5" });
   assert.throws(() => pinnedPanel("latest", "a".repeat(64)), /specific dashboard release tag/);
   assert.throws(() => pinnedPanel("..", "a".repeat(64)), /specific dashboard release tag/);
-  assert.throws(() => pinnedPanel("v2.4.1", ""), /source SHA-256/);
+  assert.throws(() => pinnedPanel("v1.28.1", ""), /source SHA-256/);
   assert.throws(() => pinnedPanel("../management.html", "a".repeat(64)), /release tag/);
+  assert.throws(() => pinnedPanel("v1.28.0", "a".repeat(64)), /match the reviewed source pin/);
   const dockerfile = await readFile(new URL("../container/Dockerfile", import.meta.url), "utf8");
   assert.doesNotMatch(dockerfile, /ARG PANEL_VERSION=latest|ARG PANEL_SHA256=""/);
 });
@@ -107,7 +108,7 @@ test("artifact verification does not follow symbolic links or manifest paths out
 
 test("container deployment requires the checksummed dashboard from its tested image artifact", async () => {
   const directory = await mkdtemp(join(tmpdir(), "sub2api-image-panel-"));
-  const metadata = { revision: REVISION, dirty: false, install: "container-image", image: `sub2api-cpa:${REVISION.slice(0, 12)}-123-1`, imageId: `sha256:${"c".repeat(64)}`, panelVersion: "v2.4.1", panelSha256: "a".repeat(64) };
+  const metadata = { revision: REVISION, dirty: false, install: "container-image", image: `sub2api-cpa:${REVISION.slice(0, 12)}-123-1`, imageId: `sha256:${"c".repeat(64)}`, panelVersion: "v1.28.1", panelSha256: "c00ac5577db8feb12d37de6ecb783cf919bb81536902308079f754337d7a7bc5" };
   const panel = Buffer.from("<!doctype html><html><body>Provider dashboard ✓</body></html>\n", "utf8");
   try {
     await writeFile(join(directory, "image.tar.gz"), "tested image archive");
@@ -131,7 +132,7 @@ test("container deployment requires the checksummed dashboard from its tested im
 
 test("dashboard provisioning cannot accept a panel without its tested image or image identity", async () => {
   const directory = await mkdtemp(join(tmpdir(), "sub2api-panel-only-"));
-  const metadata = { revision: REVISION, dirty: false, install: "container-image", image: `sub2api-cpa:${REVISION.slice(0, 12)}-123-1`, imageId: `sha256:${"c".repeat(64)}`, panelVersion: "v2.4.1", panelSha256: "a".repeat(64) };
+  const metadata = { revision: REVISION, dirty: false, install: "container-image", image: `sub2api-cpa:${REVISION.slice(0, 12)}-123-1`, imageId: `sha256:${"c".repeat(64)}`, panelVersion: "v1.28.1", panelSha256: "c00ac5577db8feb12d37de6ecb783cf919bb81536902308079f754337d7a7bc5" };
   try {
     await writeFile(join(directory, DASHBOARD_PANEL_FILE), "<!doctype html><html></html>");
     await writeManifest(directory, metadata);

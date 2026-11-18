@@ -149,7 +149,7 @@ export function brandPanel(html) {
 async function main() {
   const [input, target] = process.argv.slice(2);
   if (!input || !target) throw new Error("Usage: node brand.mjs --fetch|input.html output.html");
-  const pin = pinnedPanel(process.env.PANEL_VERSION, process.env.PANEL_SHA256);
+  const pin = pinnedPanel(process.env.PANEL_VERSION?.trim() || undefined, process.env.PANEL_SHA256?.trim() || undefined);
   let original;
   if (input === "--fetch") {
     const base = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center/releases";

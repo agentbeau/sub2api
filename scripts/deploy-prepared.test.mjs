@@ -32,7 +32,7 @@ async function fixture(t, install = "container", live = install) {
   await writeManifest(worker, { revision, dirty: false, install });
   await writeFile(join(images, "image.tar.gz"), "checked image fixture");
   await writeFile(join(images, "management.html"), "<title>sub2api Console</title>");
-  await writeManifest(images, { revision, dirty: false, install: "container-image", image, imageId, panelVersion: "v2.4.1", panelSha256: "a".repeat(64) });
+  await writeManifest(images, { revision, dirty: false, install: "container-image", image, imageId, panelVersion: "v1.28.1", panelSha256: "c00ac5577db8feb12d37de6ecb783cf919bb81536902308079f754337d7a7bc5" });
   const environment = {
     CHECKED_SHA: revision, SUB2API_EXPECTED_MAIN_SHA: revision,
     CLOUDFLARE_ACCOUNT_ID: account, CLOUDFLARE_API_TOKEN: "deploy-secret",
