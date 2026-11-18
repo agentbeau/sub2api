@@ -19,12 +19,22 @@ export interface FencedLease {
 interface SavedLease { readonly epoch: number; readonly owner: string; readonly expiresAt: number }
 interface SavedState { readonly resource: string; readonly fence: number; readonly version: number; readonly value: unknown }
 interface SavedOAuthOwner { readonly shard?: number; readonly owner?: string; readonly expiresAt: number }
+interface SavedSessionAffinity { readonly authId: string; readonly owner: string; readonly version: number; readonly expiresAt: number }
+
+export interface SessionAffinityRecord {
+  readonly authId: string;
+  readonly owner: string;
+  readonly version: number;
+  readonly expiresAt: number;
+}
 
 const LEASE_PREFIX = "pool:lease:v1:";
 const STATE_PREFIX = "pool:state:v1:";
 const OAUTH_PREFIX = "pool:oauth:v1:";
+const AFFINITY_PREFIX = "pool:affinity:v1:";
 const MAX_LEASE_MS = 5 * 60_000;
 const MAX_OAUTH_MS = 31 * 60_000;
+const MAX_AFFINITY_MS = 24 * 60 * 60_000;
 
 function safeId(value: string, max = 160): boolean {
   return value.length > 0 && value.length <= max && /^[A-Za-z0-9_.:-]+$/.test(value);
@@ -37,6 +47,14 @@ function validSessionId(value: string): boolean {
     if (code <= 0x1f || code === 0x7f) return false;
   }
   return true;
+}
+
+function containsControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
 }
 
 function validLease(value: unknown): value is SavedLease {
@@ -155,6 +173,83 @@ export class PoolCoordinator {
         if (old.expiresAt > now && old.shard !== shard) return false;
       }
       await txn.put(key, { shard, expiresAt: now + ttlMs } satisfies SavedOAuthOwner);
+      return true;
+    });
+  }
+
+  // Session affinity records contain credential identifiers, never credential
+  // material. CPA hashes provider + explicit session + model before crossing
+  // the internal bridge, so raw session identifiers stay inside the container.
+  async readSessionAffinity(key: string, ownerId: string): Promise<SessionAffinityRecord> {
+    this.validateAffinityKey(key);
+    this.validateAffinityOwner(ownerId);
+    return this.storage.transaction(async txn => {
+      const raw = await txn.get<unknown>(AFFINITY_PREFIX + key);
+      if (raw === undefined) return { authId: "", owner: "", version: 0, expiresAt: 0 };
+      if (!this.validSessionAffinity(raw)) throw new Error("Invalid persisted session affinity");
+      const record = raw as SavedSessionAffinity;
+      if (record.version > 0 && record.owner !== ownerId) throw new Error("Session affinity owner mismatch");
+      return record.expiresAt > this.now()
+        ? record
+        : { authId: "", owner: record.owner, version: record.version, expiresAt: record.expiresAt };
+    });
+  }
+
+  // Each selected request consumes a fencing version, even if it keeps the
+  // same credential. A different credential can replace a binding only at the
+  // version observed before selection; losing the CAS fails closed before the
+  // provider request is submitted.
+  async bindSessionAffinity(
+    key: string,
+    expectedVersion: number,
+    ownerId: string,
+    authId: string,
+    ttlMs: number,
+  ): Promise<{ readonly ok: true; readonly record: SessionAffinityRecord } | { readonly ok: false; readonly record: SessionAffinityRecord }> {
+    this.validateAffinityKey(key);
+    this.validateAffinityOwner(ownerId);
+    this.validateAffinityWrite(expectedVersion, authId, ttlMs);
+    return this.storage.transaction(async txn => {
+      const now = this.now();
+      const storageKey = AFFINITY_PREFIX + key;
+      const raw = await txn.get<unknown>(storageKey);
+      if (raw !== undefined && !this.validSessionAffinity(raw)) throw new Error("Invalid persisted session affinity");
+      const current = raw as SavedSessionAffinity | undefined;
+      const currentVersion = current?.version ?? 0;
+      const active = current !== undefined && current.expiresAt > now && current.authId !== "";
+      if (current !== undefined && current.owner !== ownerId) {
+        return { ok: false, record: { authId: "", owner: "", version: currentVersion, expiresAt: current.expiresAt } } as const;
+      }
+      if (currentVersion !== expectedVersion) {
+        return { ok: false, record: current === undefined
+          ? { authId: "", owner: "", version: 0, expiresAt: 0 }
+          : active ? current : { authId: "", owner: current.owner, version: current.version, expiresAt: current.expiresAt } } as const;
+      }
+      // Every selected request gets a distinct version, even when it keeps the
+      // same credential. The result callback carries this version so a late
+      // failure cannot erase a newer in-flight request's affinity.
+      if (currentVersion >= Number.MAX_SAFE_INTEGER) throw new Error("Session affinity version exhausted");
+      const next = { authId, owner: ownerId, version: currentVersion + 1, expiresAt: now + ttlMs };
+      await txn.put(storageKey, next);
+      return { ok: true, record: next } as const;
+    });
+  }
+
+  async deleteSessionAffinity(key: string, expectedVersion: number, ownerId: string, authId: string, ttlMs: number): Promise<boolean> {
+    this.validateAffinityKey(key);
+    this.validateAffinityOwner(ownerId);
+    this.validateAffinityWrite(expectedVersion, authId, ttlMs);
+    return this.storage.transaction(async txn => {
+      const storageKey = AFFINITY_PREFIX + key;
+      const raw = await txn.get<unknown>(storageKey);
+      if (raw === undefined) return true;
+      if (!this.validSessionAffinity(raw)) throw new Error("Invalid persisted session affinity");
+      const current = raw as SavedSessionAffinity;
+      if (current.owner !== ownerId || current.version !== expectedVersion || current.authId !== authId || current.expiresAt <= this.now()) return false;
+      if (current.version >= Number.MAX_SAFE_INTEGER) throw new Error("Session affinity version exhausted");
+      // Retain a versioned tombstone so a stale selection cannot resurrect an
+      // older credential after a result-driven rebind.
+      await txn.put(storageKey, { authId: "", owner: current.owner, version: current.version + 1, expiresAt: this.now() + ttlMs } satisfies SavedSessionAffinity);
       return true;
     });
   }
@@ -288,6 +383,33 @@ export class PoolCoordinator {
   private validateLease(lease: FencedLease): void {
     if (!safeId(lease.resource) || !safeId(lease.owner) || !Number.isSafeInteger(lease.epoch) || lease.epoch < 1
       || !Number.isSafeInteger(lease.expiresAt)) throw new RangeError("Invalid fenced lease");
+  }
+
+  private validateAffinityKey(key: string): void {
+    if (!/^[a-f0-9]{64}$/.test(key)) throw new RangeError("Invalid session affinity key");
+  }
+
+  private validateAffinityOwner(ownerId: string): void {
+    if (!/^[a-f0-9]{64}$/.test(ownerId)) throw new RangeError("Invalid session affinity owner");
+  }
+
+  private validateAffinityWrite(expectedVersion: number, authId: string, ttlMs: number): void {
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0
+      || typeof authId !== "string" || authId.length < 1 || authId.length > 256
+      || containsControlCharacter(authId)
+      || !Number.isSafeInteger(ttlMs) || ttlMs < 1 || ttlMs > MAX_AFFINITY_MS) {
+      throw new RangeError("Invalid session affinity write");
+    }
+  }
+
+  private validSessionAffinity(value: unknown): value is SavedSessionAffinity {
+    if (typeof value !== "object" || value === null) return false;
+    const record = value as Partial<SavedSessionAffinity>;
+    return typeof record.authId === "string" && record.authId.length <= 256
+      && (record.authId === "" || !containsControlCharacter(record.authId))
+      && typeof record.owner === "string" && /^[a-f0-9]{64}$/.test(record.owner)
+      && typeof record.version === "number" && Number.isSafeInteger(record.version) && record.version >= 1
+      && typeof record.expiresAt === "number" && Number.isSafeInteger(record.expiresAt) && record.expiresAt >= 0;
   }
 
   private now(): number {

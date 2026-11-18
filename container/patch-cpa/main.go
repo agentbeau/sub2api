@@ -393,6 +393,132 @@ func (s *ObjectTokenStore) createRefreshObjectWithFence(ctx context.Context, key
 \ts.engine.GET("/management.html", s.serveManagementControlPanel)`},
 			},
 		},
+		{
+			path: "sdk/cliproxy/auth/selector.go",
+			edits: []replacement{
+				{`cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"`, `cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"` + "\n\tsub2apiaffinity \"github.com/router-for-me/CLIProxyAPI/v8/internal/sub2apiaffinity\""},
+				{`rebindOnQuotaOnly bool
+	rebindOnNever     bool
+}`, `rebindOnQuotaOnly  bool
+	rebindOnNever      bool
+	durableAffinity    *sub2apiaffinity.Store
+	durableAffinityTTL time.Duration
+}`},
+				{`rebindOnQuotaOnly: rebindMode == SessionAffinityRebindOnQuota,
+		rebindOnNever:     rebindMode == SessionAffinityRebindOnNever,
+	}`, `rebindOnQuotaOnly:  rebindMode == SessionAffinityRebindOnQuota,
+		rebindOnNever:      rebindMode == SessionAffinityRebindOnNever,
+		durableAffinity:    sub2apiaffinity.NewFromEnv(),
+		durableAffinityTTL: cfg.TTL,
+	}`},
+				{`var reservation *weightedReservation
+	// Local bindings complete inside Pick; failed selections release speculative credit.
+	defer func() { reservation.finish(selected != nil && errPick == nil) }()`, `var reservation *weightedReservation
+	var durableBindErr error
+	// Local bindings complete inside Pick; failed selections release speculative credit.
+	defer func() {
+		reservation.finish(selected != nil && errPick == nil && durableBindErr == nil)
+		if durableBindErr != nil {
+			selected = nil
+			errPick = durableBindErr
+		}
+	}()`},
+				{`cacheKey := provider + "::" + primaryID + "::" + modelKey
+	isFork := false`, `cacheKey := provider + "::" + primaryID + "::" + modelKey
+	durableExplicitSession := explicitID != "" && s.durableAffinity != nil
+	durableExpectedVersion := uint64(0)
+	durablePrimaryFound := false
+	if durableExplicitSession {
+		record, found, errAffinity := s.durableAffinity.Lookup(ctx, cacheKey)
+		if errAffinity != nil {
+			return nil, errAffinity
+		}
+		durableExpectedVersion, durablePrimaryFound = record.Version, found
+		if found {
+			s.cache.Set(cacheKey, record.AuthID)
+		} else if cached, ok := s.cache.Get(cacheKey); ok {
+			s.cache.CompareAndDelete(cacheKey, cached)
+		}
+		if opts.Metadata != nil {
+			delete(opts.Metadata, "sub2api.session-affinity.version")
+		}
+	}
+	isFork := false`},
+				{`fallbackKey := ""
+	if fallbackID != "" && fallbackID != primaryID {
+		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
+	}
+	bind := func(authID string, recordSelection bool) {`, `fallbackKey := ""
+	if fallbackID != "" && fallbackID != primaryID {
+		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
+	}
+	if durableExplicitSession && !durablePrimaryFound && fallbackKey != "" {
+		record, found, errAffinity := s.durableAffinity.Lookup(ctx, fallbackKey)
+		if errAffinity != nil {
+			return nil, errAffinity
+		}
+		if found {
+			s.cache.Set(fallbackKey, record.AuthID)
+		} else if cached, ok := s.cache.Get(fallbackKey); ok {
+			s.cache.CompareAndDelete(fallbackKey, cached)
+		}
+	}
+	bind := func(authID string, recordSelection bool) {`},
+				{`bind := func(authID string, recordSelection bool) {
+		keys := []string{cacheKey}`, `bind := func(authID string, recordSelection bool) {
+		if durableExplicitSession && recordSelection {
+			record, errBind := s.durableAffinity.BindAtVersion(ctx, cacheKey, authID, durableExpectedVersion, s.durableAffinityTTL)
+			if errBind != nil {
+				durableBindErr = errBind
+				s.cache.CompareAndDelete(cacheKey, authID)
+				if fallbackKey != "" {
+					s.cache.CompareAndDelete(fallbackKey, authID)
+				}
+				return
+			}
+			if opts.Metadata != nil {
+				opts.Metadata["sub2api.session-affinity.version"] = record.Version
+			}
+		}
+		keys := []string{cacheKey}`},
+				{`if res.Success {
+		s.cache.Touch(cacheKey, res.AuthID)`, `if s.durableAffinity != nil && explicitID != "" && !res.Success {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			version, versionOK := res.Options.Metadata["sub2api.session-affinity.version"].(uint64)
+			if !versionOK {
+				log.Warn("session affinity: result has no request fencing version; durable mapping kept")
+			} else if errDelete := s.durableAffinity.DeleteAtVersion(ctx, cacheKey, res.AuthID, version, s.durableAffinityTTL); errDelete != nil {
+				log.WithError(errDelete).Warn("session affinity: durable result invalidation failed")
+			}
+			cancel()
+		}
+		if res.Success {
+			s.cache.Touch(cacheKey, res.AuthID)`},
+			},
+		},
+		{
+			path: "sdk/cliproxy/auth/conductor_home.go",
+			edits: []replacement{
+				{`internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"`, `internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	sub2apiaffinity "github.com/router-for-me/CLIProxyAPI/v8/internal/sub2apiaffinity"`},
+				{`func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
+	if m == nil {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}`, `func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
+	if m == nil {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if m.HomeEnabled() && sub2apiaffinity.Enabled() {
+		return nil, &Error{Code: "home_session_affinity_unsupported", Message: "durable session-to-credential affinity is not integrated with Home dispatch", HTTPStatus: http.StatusServiceUnavailable}
+	}`},
+			},
+		},
 	}
 }
 
@@ -456,7 +582,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, errPatch)
 		os.Exit(1)
 	}
-	fmt.Println("Verified public API compatibility and applied sub2api lifecycle/authentication hooks")
+	fmt.Println("Verified public API compatibility and applied sub2api lifecycle, authentication, and durable session-affinity hooks")
 }
 
 // This is the registration surface implemented by src/api-routes.ts for CPA

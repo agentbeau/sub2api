@@ -39,6 +39,14 @@ export function artifactConfig(source, install, image = PREPARED_IMAGE) {
     { type: "ESModule", globs: ["**/*.js"], fallthrough: false },
     { type: "CompiledWasm", globs: ["**/*.wasm"], fallthrough: false },
   ];
+  if (install === "container" && config.vars?.POOL_SESSION_ROUTING_ENABLED === "true"
+    && (config.vars?.POOL_SESSION_AFFINITY_ENABLED !== "true" || config.vars?.POOL_FENCING_ENABLED !== "true")) {
+    throw new Error("Session-owner routing requires durable session affinity and the reviewed multi-container ownership and restart gates before deployment");
+  }
+  if (install === "container" && config.vars?.POOL_SESSION_AFFINITY_ENABLED === "true"
+    && config.vars?.POOL_SESSION_ROUTING_ENABLED !== "true") {
+    throw new Error("Durable session affinity cannot be enabled without session-owner routing");
+  }
   if (install === "container" && config.vars?.POOL_SESSION_ROUTING_ENABLED === "true") {
     throw new Error("Session-owner routing requires the reviewed multi-container ownership and restart gates before deployment");
   }

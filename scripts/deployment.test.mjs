@@ -45,6 +45,8 @@ test("prepared configuration preserves state identity and cannot rebuild code or
   assert.throws(() => artifactConfig({ ...ROOT_CONFIG, containers: [{ ...ROOT_CONFIG.containers[0], max_instances: 3 }] }, "container", IMAGE), /single-instance/);
   assert.throws(() => artifactConfig({ ...ROOT_CONFIG, containers: [{ class_name: "Cpa", image: "./container/Dockerfile" }] }, "container", IMAGE), /single-instance/);
   assert.throws(() => artifactConfig({ ...ROOT_CONFIG, vars: { POOL_SESSION_ROUTING_ENABLED: "true" } }, "container", IMAGE), /ownership and restart gates/);
+  assert.throws(() => artifactConfig({ ...ROOT_CONFIG, vars: { POOL_SESSION_AFFINITY_ENABLED: "true" } }, "container", IMAGE), /cannot be enabled without session-owner routing/);
+  assert.throws(() => artifactConfig({ ...ROOT_CONFIG, vars: { POOL_SESSION_ROUTING_ENABLED: "true", POOL_SESSION_AFFINITY_ENABLED: "true" } }, "container", IMAGE), /ownership and restart gates/);
 });
 
 test("container dashboard builds require an immutable release tag and verified source hash", async () => {

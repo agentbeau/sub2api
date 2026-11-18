@@ -16,7 +16,9 @@ RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false 
   && git fetch -q --depth 1 origin tag "$tag" && git checkout -q "$tag" \
   && printf '%s' "$tag" > /tmp/cpa-version
 COPY activity /src/internal/sub2apiactivity
+COPY patch-cpa/sub2apiaffinity /src/internal/sub2apiaffinity
 COPY patch-cpa /build/patch-cpa
+COPY patch-cpa/session_affinity_sub2api_test.go /src/sdk/cliproxy/auth/session_affinity_sub2api_test.go
 COPY patch-cpa/objectstore_fencing.go /src/internal/store/objectstore_fencing.go
 COPY patch-cpa/objectstore_fencing_test.go /src/internal/store/objectstore_fencing_sub2api_test.go
 COPY readiness-test/service_readiness_window_repro_test.go /src/sdk/cliproxy/service_readiness_window_repro_test.go
@@ -27,6 +29,8 @@ RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false 
   go test /build/patch-cpa/main.go /build/patch-cpa/main_test.go \
   && go run /build/patch-cpa/main.go /src \
   && go test -race ./internal/sub2apiactivity \
+  && go test -race ./internal/sub2apiaffinity \
+  && go test ./sdk/cliproxy/auth -run '^(TestSub2APIDurableSessionAffinityRestoresAndFencesSelection|TestSub2APIDurableAffinityFailurePreventsSelectionReturn|TestSub2APIDurableAffinityFailsClosedInHomeDispatch)$' -count=1 \
   && go test -race ./internal/store -run '^(TestConditionalAuthAndConfigWritesRejectAStaleVersion|TestConditionalWritesRequireFenceAndKnownBaseVersion|TestFencedDeleteUsesConditionalEmptyTombstoneAndCanBeRecreated|TestConcurrentConditionalCredentialWritesHaveOneWinner|TestConcurrentConditionalWritesForDifferentKeysProtectVersionCache|TestUnknownConditionalWriteOutcomeIsNotReplayedOrRebased|TestCredentialWriteAcquiresAKeySpecificWorkerFence)$' -count=1 \
   && go test ./sdk/cliproxy -run '^(TestReadinessWindowHealthIsNotModelReady|TestInitializationReadinessEmptyAndFailedBootstrap)$' -count=1
 RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false \

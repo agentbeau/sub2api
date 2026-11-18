@@ -784,6 +784,59 @@ describe("actual background work and native inactivity", () => {
     expect(response.status).toBe(204);
     expect(calls).toEqual([{ name: ownerId, action: "begin", id: firstId }]);
   });
+
+  it("accepts bounded, hash-only durable affinity RPCs and returns CAS conflicts", async () => {
+    const ownerId = "c".repeat(64);
+    const calls: Array<{ op: string; key: string; ownerId: string; expectedVersion?: number; authId?: string }> = [];
+    const coordinator = {
+      readPoolSessionAffinity: async (key: string, calledOwnerId: string) => {
+        calls.push({ op: "read", key, ownerId: calledOwnerId });
+        return { authId: "", owner: "", version: 0, expiresAt: 0 };
+      },
+      bindPoolSessionAffinity: async (key: string, expectedVersion: number, calledOwnerId: string, authId: string) => {
+        calls.push({ op: "bind", key, ownerId: calledOwnerId, expectedVersion, authId });
+        return { ok: false as const, record: { authId: "credential-current", owner: calledOwnerId, version: 4, expiresAt: Date.now() + 60_000 } };
+      },
+      deletePoolSessionAffinity: async () => false,
+    };
+    const env = {
+      POOL_FENCING_ENABLED: "true", POOL_SESSION_ROUTING_ENABLED: "true", POOL_SESSION_AFFINITY_ENABLED: "true",
+      CPA: { getByName: (name: string) => {
+      expect(name).toBe("cf-pool-coordinator-v1");
+      return coordinator;
+    } } } as unknown as Env;
+    const bridge = new R2Bridge({ props: { containerId: ownerId } } as unknown as ExecutionContext<{ containerId: string }>, env);
+    const key = "d".repeat(64);
+    const read = await bridge.fetch(new Request("http://r2.internal/__sub2api/session-affinity", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ op: "read", key }),
+    }));
+    expect(read.status).toBe(200);
+    expect(await read.json()).toEqual({ authId: "", owner: "", version: 0, expiresAt: 0 });
+    const conflict = await bridge.fetch(new Request("http://r2.internal/__sub2api/session-affinity", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+        op: "bind", key, expectedVersion: 0, authId: "credential-stale", ttlMs: 60_000,
+      }),
+    }));
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toMatchObject({ ok: false, record: { authId: "credential-current", version: 4 } });
+    expect(calls).toEqual([
+      { op: "read", key, ownerId },
+      { op: "bind", key, ownerId, expectedVersion: 0, authId: "credential-stale" },
+    ]);
+    expect((await bridge.fetch(new Request("http://r2.internal/__sub2api/session-affinity", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ op: "read", key, owner: "d".repeat(64) }),
+    }))).status).toBe(400);
+    expect(calls).toHaveLength(2);
+    expect((await bridge.fetch(new Request("http://r2.internal/__sub2api/session-affinity", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+        op: "read", key: "raw-session-id",
+      }),
+    }))).status).toBe(400);
+    const orphan = new R2Bridge({ props: {} } as unknown as ExecutionContext<{ containerId: string }>, env);
+    expect((await orphan.fetch(new Request("http://r2.internal/__sub2api/session-affinity", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ op: "read", key }),
+    }))).status).toBe(404);
+  });
 });
 
 describe("native realtime credential lifetime", () => {

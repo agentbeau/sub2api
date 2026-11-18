@@ -8,7 +8,7 @@ import { accessRequired, crossOriginWrite, dashboardAccess, isBrowserRoute, with
 export { Cpa, R2Bridge } from "./cpa.ts";
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
-type EdgeEnv = Pick<Env, "DASHBOARD_PASSWORD" | "DASHBOARD_AUTH" | "ACCESS_AUD" | "LOGIN_LIMIT" | "STATE" | "POOL_FENCING_ENABLED" | "POOL_SESSION_ROUTING_ENABLED"> & {
+type EdgeEnv = Pick<Env, "DASHBOARD_PASSWORD" | "DASHBOARD_AUTH" | "ACCESS_AUD" | "LOGIN_LIMIT" | "STATE" | "POOL_FENCING_ENABLED" | "POOL_SESSION_ROUTING_ENABLED" | "POOL_SESSION_AFFINITY_ENABLED"> & {
   readonly CPA: Env["CPA"];
 };
 

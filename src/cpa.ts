@@ -14,7 +14,7 @@ import { handleR2Bridge, STATE_BUCKET, STATE_HOST } from "./r2-bridge.ts";
 import { RealtimeLease } from "./realtime-lease.ts";
 import { classify } from "./routes.ts";
 import { InferenceClassifier } from "./inference-classifier.ts";
-import { PoolCoordinator, type FencedLease, type PoolStorage } from "./pool-coordination.ts";
+import { PoolCoordinator, type FencedLease, type PoolStorage, type SessionAffinityRecord } from "./pool-coordination.ts";
 import type { ObjectStore } from "./s3.ts";
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
@@ -117,6 +117,9 @@ export class Cpa extends DurableObject<Env> {
             OBJECTSTORE_SECRET_KEY: "r2-binding",
             SUB2API_ACTIVITY_ENDPOINT: `http://${STATE_HOST}/__sub2api/activity`,
             SUB2API_POOL_FENCING: this.env.POOL_FENCING_ENABLED === "true" ? "true" : "false",
+            SUB2API_SESSION_AFFINITY: this.env.POOL_FENCING_ENABLED === "true"
+              && this.env.POOL_SESSION_ROUTING_ENABLED === "true"
+              && this.env.POOL_SESSION_AFFINITY_ENABLED === "true" ? "true" : "false",
             CPA_MANAGEMENT_KEY: env.MANAGEMENT_KEY ?? "",
             ...(imported === null ? {} : { CPA_IMPORT_CONFIG: imported }),
           };
@@ -246,6 +249,28 @@ export class Cpa extends DurableObject<Env> {
 
   async poolOAuthOwner(state: string): Promise<string | undefined> {
     return this.pool.callbackOwner(state);
+  }
+
+  async readPoolSessionAffinity(key: string, ownerId: string): Promise<SessionAffinityRecord> {
+    this.requireDurableSessionAffinity();
+    return this.pool.readSessionAffinity(key, ownerId);
+  }
+
+  async bindPoolSessionAffinity(key: string, expectedVersion: number, ownerId: string, authId: string, ttlMs: number): Promise<
+    { readonly ok: true; readonly record: SessionAffinityRecord } | { readonly ok: false; readonly record: SessionAffinityRecord }
+  > {
+    this.requireDurableSessionAffinity();
+    return this.pool.bindSessionAffinity(key, expectedVersion, ownerId, authId, ttlMs);
+  }
+
+  async deletePoolSessionAffinity(key: string, expectedVersion: number, ownerId: string, authId: string, ttlMs: number): Promise<boolean> {
+    this.requireDurableSessionAffinity();
+    return this.pool.deleteSessionAffinity(key, expectedVersion, ownerId, authId, ttlMs);
+  }
+
+  private requireDurableSessionAffinity(): void {
+    if (this.env.POOL_FENCING_ENABLED !== "true" || this.env.POOL_SESSION_ROUTING_ENABLED !== "true"
+      || this.env.POOL_SESSION_AFFINITY_ENABLED !== "true") throw new Error("Durable session affinity is disabled");
   }
 
   async fencedBackgroundActivity(action: BackgroundAction, id: string, resource: string): Promise<FencedLease | boolean | undefined> {
@@ -482,7 +507,9 @@ export class R2Bridge extends WorkerEntrypoint<Env, { containerId: string }> {
   }
 
   override async fetch(request: Request): Promise<Response> {
-    if (new URL(request.url).pathname === "/__sub2api/activity") {
+    const bridgePath = new URL(request.url).pathname;
+    if (bridgePath === "/__sub2api/session-affinity") return this.handleSessionAffinity(request);
+    if (bridgePath === "/__sub2api/activity") {
       const containerId = this.ctx.props?.containerId;
       if (typeof containerId !== "string" || !/^[a-f0-9]{64}$/.test(containerId)) {
         return Promise.resolve(new Response(null, { status: 404, headers: { "cache-control": "no-store" } }));
@@ -528,6 +555,74 @@ export class R2Bridge extends WorkerEntrypoint<Env, { containerId: string }> {
     } catch (error) {
       if (error instanceof FencedWriteRejected) return new Response(null, { status: 409, headers: { "cache-control": "no-store" } });
       throw error;
+    }
+  }
+
+  private async handleSessionAffinity(request: Request): Promise<Response> {
+    if (this.env.POOL_FENCING_ENABLED !== "true" || this.env.POOL_SESSION_ROUTING_ENABLED !== "true"
+      || this.env.POOL_SESSION_AFFINITY_ENABLED !== "true") {
+      return new Response(null, { status: 404, headers: { "cache-control": "no-store" } });
+    }
+    const containerId = this.ctx.props?.containerId;
+    if (typeof containerId !== "string" || !/^[a-f0-9]{64}$/.test(containerId)) {
+      return new Response(null, { status: 404, headers: { "cache-control": "no-store" } });
+    }
+    if (request.method !== "POST" || request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json") {
+      return new Response(null, { status: 405, headers: { allow: "POST", "cache-control": "no-store" } });
+    }
+    const length = request.headers.get("content-length");
+    if (length !== null && (!/^\d+$/.test(length) || Number(length) > 4096)) {
+      return new Response(null, { status: 413, headers: { "cache-control": "no-store" } });
+    }
+    let body: unknown;
+    const reader = request.body?.getReader();
+    if (reader === undefined) return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
+    try {
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value.byteLength > 4096 - size) {
+          void reader.cancel().catch(() => {});
+          return new Response(null, { status: 413, headers: { "cache-control": "no-store" } });
+        }
+        chunks.push(value);
+        size += value.byteLength;
+      }
+      const bytes = new Uint8Array(size);
+      let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+      const text = new TextDecoder().decode(bytes);
+      body = JSON.parse(text) as unknown;
+    } catch {
+      return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
+    } finally {
+      reader.releaseLock();
+    }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) return new Response(null, { status: 400 });
+    const payload = body as Record<string, unknown>;
+    if (typeof payload.key !== "string" || !/^[a-f0-9]{64}$/.test(payload.key)) return new Response(null, { status: 400 });
+    const coordinator = this.env.CPA.getByName("cf-pool-coordinator-v1");
+    const headers = { "cache-control": "no-store", "content-type": "application/json" };
+    try {
+      if (payload.op === "read" && Object.keys(payload).every(key => ["op", "key"].includes(key))) {
+        const record = await coordinator.readPoolSessionAffinity(payload.key, containerId);
+        return Response.json(record, { headers });
+      }
+      if (payload.op === "bind" && Number.isSafeInteger(payload.expectedVersion) && typeof payload.authId === "string"
+        && Number.isSafeInteger(payload.ttlMs) && Object.keys(payload).every(key => ["op", "key", "expectedVersion", "authId", "ttlMs"].includes(key))) {
+        const result = await coordinator.bindPoolSessionAffinity(payload.key, payload.expectedVersion as number, containerId, payload.authId, payload.ttlMs as number);
+        return Response.json(result, { status: result.ok ? 200 : 409, headers });
+      }
+      if (payload.op === "delete" && Number.isSafeInteger(payload.expectedVersion) && typeof payload.authId === "string"
+        && Number.isSafeInteger(payload.ttlMs) && Object.keys(payload).every(key => ["op", "key", "expectedVersion", "authId", "ttlMs"].includes(key))) {
+        const deleted = await coordinator.deletePoolSessionAffinity(payload.key, payload.expectedVersion as number, containerId, payload.authId, payload.ttlMs as number);
+        return Response.json({ deleted }, { status: deleted ? 200 : 409, headers });
+      }
+      return new Response(null, { status: 400, headers: { "cache-control": "no-store" } });
+    } catch {
+      return new Response(null, { status: 503, headers: { "cache-control": "no-store" } });
     }
   }
 }

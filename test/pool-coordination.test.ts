@@ -212,4 +212,106 @@ describe("pool coordination preparation primitives", () => {
     expect(await coordinator.unbindOAuthOwner("restart-state", newOwner)).toBe(true);
     expect(await coordinator.callbackOwner("restart-state")).toBeUndefined();
   });
+
+  it("restores credential affinity after a runtime restart without storing tokens", async () => {
+    const now = 120_000;
+    const storage = new AtomicStorage();
+    const key = "a".repeat(64);
+    const ownerId = "1".repeat(64);
+    const firstRuntime = new PoolCoordinator(storage, () => now);
+    const empty = await firstRuntime.readSessionAffinity(key, ownerId);
+    expect(empty).toEqual({ authId: "", owner: "", version: 0, expiresAt: 0 });
+    const first = await firstRuntime.bindSessionAffinity(key, empty.version, ownerId, "credential-17", 60_000);
+    expect(first).toEqual({ ok: true, record: { authId: "credential-17", owner: ownerId, version: 1, expiresAt: 180_000 } });
+
+    const restartedRuntime = new PoolCoordinator(storage, () => now + 1_000);
+    await expect(restartedRuntime.readSessionAffinity(key, ownerId)).resolves.toEqual(first.record);
+    await expect(restartedRuntime.bindSessionAffinity(key, 0, ownerId, "credential-other", 60_000))
+      .resolves.toEqual({ ok: false, record: first.record });
+    const nextRequest = await restartedRuntime.bindSessionAffinity(key, first.record.version, ownerId, "credential-17", 60_000);
+    expect(nextRequest).toEqual({ ok: true, record: { authId: "credential-17", owner: ownerId, version: 2, expiresAt: 181_000 } });
+    await expect(restartedRuntime.deleteSessionAffinity(key, first.record.version, ownerId, "credential-17", 60_000)).resolves.toBe(false);
+    await expect(restartedRuntime.readSessionAffinity(key, ownerId)).resolves.toEqual(nextRequest.record);
+  });
+
+  it("rejects a different shard owner from reading, rebinding, or deleting a session credential", async () => {
+    const storage = new AtomicStorage();
+    let now = 130_000;
+    const coordinator = new PoolCoordinator(storage, () => now);
+    const key = "f".repeat(64);
+    const ownerId = "2".repeat(64);
+    const wrongOwnerId = "3".repeat(64);
+    const first = await coordinator.bindSessionAffinity(key, 0, ownerId, "credential-private-id", 60_000);
+    if (!first.ok) throw new Error("Expected initial owner binding");
+    await expect(coordinator.readSessionAffinity(key, ownerId)).resolves.toEqual(first.record);
+    await expect(coordinator.readSessionAffinity(key, wrongOwnerId)).rejects.toThrow("owner mismatch");
+    await expect(coordinator.bindSessionAffinity(key, first.record.version, wrongOwnerId, "credential-new", 60_000))
+      .resolves.toEqual({ ok: false, record: { authId: "", owner: "", version: first.record.version, expiresAt: first.record.expiresAt } });
+    await expect(coordinator.deleteSessionAffinity(key, first.record.version, wrongOwnerId, first.record.authId, 60_000)).resolves.toBe(false);
+    now += 60_001;
+    await expect(coordinator.readSessionAffinity(key, wrongOwnerId)).rejects.toThrow("owner mismatch");
+    await expect(coordinator.bindSessionAffinity(key, first.record.version, wrongOwnerId, "credential-new", 60_000))
+      .resolves.toMatchObject({ ok: false, record: { authId: "", owner: "", version: first.record.version } });
+    await expect(coordinator.readSessionAffinity(key, ownerId)).resolves.toMatchObject({ authId: "", owner: ownerId, version: first.record.version });
+  });
+
+  it("arbitrates concurrent cold session selections and rejects a stale rebind", async () => {
+    const storage = new AtomicStorage();
+    const firstOwner = new PoolCoordinator(storage, () => 200_000);
+    const secondOwner = new PoolCoordinator(storage, () => 200_000);
+    const key = "b".repeat(64);
+    const ownerId = "4".repeat(64);
+    const [firstRead, secondRead] = await Promise.all([
+      firstOwner.readSessionAffinity(key, ownerId),
+      secondOwner.readSessionAffinity(key, ownerId),
+    ]);
+    const outcomes = await Promise.all([
+      firstOwner.bindSessionAffinity(key, firstRead.version, ownerId, "auth-a", 60_000),
+      secondOwner.bindSessionAffinity(key, secondRead.version, ownerId, "auth-b", 60_000),
+    ]);
+    expect(outcomes.filter(result => result.ok)).toHaveLength(1);
+    expect(outcomes.filter(result => !result.ok)).toHaveLength(1);
+    const winner = outcomes.find(result => result.ok);
+    if (!winner?.ok) throw new Error("Expected one affinity winner");
+
+    const winnerBinding = winner.record;
+    const nextVersion = await firstOwner.bindSessionAffinity(key, winnerBinding.version, ownerId, "auth-c", 60_000);
+    expect(nextVersion.ok).toBe(true);
+    if (!nextVersion.ok) throw new Error("Expected the current version to rebind");
+    await expect(secondOwner.bindSessionAffinity(key, winnerBinding.version, ownerId, "auth-stale", 60_000))
+      .resolves.toMatchObject({ ok: false, record: { authId: "auth-c", version: winnerBinding.version + 1 } });
+  });
+
+  it("uses compare-and-delete tombstones to stop a late result from reviving old affinity", async () => {
+    const storage = new AtomicStorage();
+    const current = new PoolCoordinator(storage, () => 300_000);
+    const restarted = new PoolCoordinator(storage, () => 300_000);
+    const key = "c".repeat(64);
+    const ownerId = "5".repeat(64);
+    const first = await current.bindSessionAffinity(key, 0, ownerId, "auth-old", 60_000);
+    if (!first.ok) throw new Error("Expected first binding");
+    const replacement = await current.bindSessionAffinity(key, first.record.version, ownerId, "auth-new", 60_000);
+    if (!replacement.ok) throw new Error("Expected rebind");
+    await expect(restarted.deleteSessionAffinity(key, first.record.version, ownerId, "auth-old", 60_000)).resolves.toBe(false);
+    await expect(restarted.readSessionAffinity(key, ownerId)).resolves.toMatchObject({ authId: "auth-new", version: first.record.version + 1 });
+  });
+
+  it("expires an affinity without reusing its fencing version and isolates provider/model keys", async () => {
+    let now = 400_000;
+    const storage = new AtomicStorage();
+    const oldRuntime = new PoolCoordinator(storage, () => now);
+    const newRuntime = new PoolCoordinator(storage, () => now);
+    const ownerId = "6".repeat(64);
+    const keyA = "d".repeat(64);
+    const keyB = "e".repeat(64);
+    const first = await oldRuntime.bindSessionAffinity(keyA, 0, ownerId, "provider-a-auth", 1_000);
+    if (!first.ok) throw new Error("Expected initial binding");
+    now += 1_001;
+    await expect(newRuntime.readSessionAffinity(keyA, ownerId)).resolves.toMatchObject({ authId: "", owner: ownerId, version: first.record.version });
+    const replacement = await newRuntime.bindSessionAffinity(keyA, first.record.version, ownerId, "provider-a-auth-2", 1_000);
+    expect(replacement.ok).toBe(true);
+    await expect(oldRuntime.bindSessionAffinity(keyA, first.record.version, ownerId, "stale-auth", 1_000))
+      .resolves.toMatchObject({ ok: false, record: { authId: "provider-a-auth-2" } });
+    await expect(newRuntime.readSessionAffinity(keyB, ownerId)).resolves.toEqual({ authId: "", owner: "", version: 0, expiresAt: 0 });
+  });
 });

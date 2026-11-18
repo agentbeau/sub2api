@@ -339,3 +339,66 @@ func TestInitializationReadinessAnchors(t *testing.T) {
 		t.Fatal("readiness marker missing")
 	}
 }
+
+func TestDurableSessionAffinityHooksRemainExplicitAndFailClosed(t *testing.T) {
+	root := fixtureTree(t)
+	var selectorPatch []filePatch
+	for _, patch := range plans() {
+		if patch.path == "sdk/cliproxy/auth/selector.go" {
+			selectorPatch = append(selectorPatch, patch)
+		}
+	}
+	if len(selectorPatch) != 1 {
+		t.Fatalf("selector patch count=%d, want 1", len(selectorPatch))
+	}
+	if err := applyPlan(root, selectorPatch); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(root, "sdk/cliproxy/auth/selector.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(body)
+	for _, required := range []string{
+		"sub2apiaffinity.NewFromEnv()",
+		"durableExplicitSession := explicitID != \"\" && s.durableAffinity != nil",
+		"s.durableAffinity.Lookup(ctx, cacheKey)",
+		"s.durableAffinity.BindAtVersion(ctx, cacheKey, authID, durableExpectedVersion, s.durableAffinityTTL)",
+		"durableExplicitSession && recordSelection",
+		"sub2api.session-affinity.version",
+		"selected = nil",
+		"s.durableAffinity.DeleteAtVersion(ctx, cacheKey, res.AuthID, version, s.durableAffinityTTL)",
+	} {
+		if !strings.Contains(source, required) {
+			t.Errorf("durable selector patch is missing %q", required)
+		}
+	}
+	if strings.Contains(source, "s.durableAffinity.Lookup(ctx, opts.OriginalRequest") {
+		t.Fatal("durable affinity must not store or transmit request bodies")
+	}
+}
+
+func TestDurableAffinityRejectsUnintegratedHomeSelection(t *testing.T) {
+	root := fixtureTree(t)
+	var homePatch []filePatch
+	for _, patch := range plans() {
+		if patch.path == "sdk/cliproxy/auth/conductor_home.go" {
+			homePatch = append(homePatch, patch)
+		}
+	}
+	if len(homePatch) != 1 {
+		t.Fatalf("Home patch count=%d, want 1", len(homePatch))
+	}
+	if err := applyPlan(root, homePatch); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(root, "sdk/cliproxy/auth/conductor_home.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "if m.HomeEnabled() && sub2apiaffinity.Enabled()") ||
+		!strings.Contains(string(body), `Code: "home_session_affinity_unsupported"`) ||
+		!strings.Contains(string(body), "func (m *Manager) pickHomeDispatchSelection") {
+		t.Fatal("Home path does not fail closed before external credential dispatch")
+	}
+}
