@@ -2,12 +2,13 @@ import type { Env } from "./env.ts";
 import { handle } from "./gateway.ts";
 import { serveDashboard } from "./dashboard.ts";
 import { classify } from "./routes.ts";
+import { ownerNameForRequest, SINGLETON_OWNER_NAME } from "./session-routing.ts";
 import { accessRequired, crossOriginWrite, dashboardAccess, isBrowserRoute, withoutAccessCredentials, type NativeAccessContext } from "./access.ts";
 
 export { Cpa, R2Bridge } from "./cpa.ts";
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
-type EdgeEnv = Pick<Env, "DASHBOARD_PASSWORD" | "DASHBOARD_AUTH" | "ACCESS_AUD" | "LOGIN_LIMIT" | "STATE" | "POOL_FENCING_ENABLED"> & {
+type EdgeEnv = Pick<Env, "DASHBOARD_PASSWORD" | "DASHBOARD_AUTH" | "ACCESS_AUD" | "LOGIN_LIMIT" | "STATE" | "POOL_FENCING_ENABLED" | "POOL_SESSION_ROUTING_ENABLED"> & {
   readonly CPA: Env["CPA"];
 };
 
@@ -21,7 +22,9 @@ export default {
         if (authenticated !== true) return accessRequired();
         const state = new URL(forwarded.url).searchParams.get("state") ?? "";
         const owner = await env.CPA.getByName("cf-pool-coordinator-v1").poolOAuthOwner(state);
-        if (owner === undefined) return Response.json({ error: { code: "oauth_owner_unknown" } }, {
+        if (owner === undefined) return Response.json({ error: {
+          code: "oauth_owner_unknown", message: "The OAuth state is expired or unavailable. Start a new login flow.",
+        } }, {
           status: 409, headers: { "cache-control": "no-store" },
         });
         try {
@@ -33,7 +36,10 @@ export default {
           });
         }
       }
-      return env.CPA.getByName("cf-singleton-container").fetch(forwarded);
+      const ownerName = route === "api"
+        ? await ownerNameForRequest(forwarded, env.POOL_SESSION_ROUTING_ENABLED === "true")
+        : SINGLETON_OWNER_NAME;
+      return env.CPA.getByName(ownerName).fetch(forwarded);
     };
     if (authenticated !== undefined && isBrowserRoute(route)) {
       if (!authenticated) return accessRequired();
@@ -67,7 +73,9 @@ export default {
           if (route === "oauth-callback" && env.POOL_FENCING_ENABLED === "true") {
             const state = new URL(request.url).searchParams.get("state") ?? "";
             const owner = await env.CPA.getByName("cf-pool-coordinator-v1").poolOAuthOwner(state);
-            if (owner === undefined) return Response.json({ error: { code: "oauth_owner_unknown" } }, {
+            if (owner === undefined) return Response.json({ error: {
+              code: "oauth_owner_unknown", message: "The OAuth state is expired or unavailable. Start a new login flow.",
+            } }, {
               status: 409, headers: { "cache-control": "no-store" },
             });
             try {
@@ -78,7 +86,7 @@ export default {
               });
             }
           }
-          return (env.CPA as Env["CPA"]).getByName("cf-singleton-container").fetchWithAccess(withoutAccessCredentials(request));
+          return (env.CPA as Env["CPA"]).getByName(SINGLETON_OWNER_NAME).fetchWithAccess(withoutAccessCredentials(request));
         }
         return forward(request);
     }

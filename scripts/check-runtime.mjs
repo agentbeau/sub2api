@@ -21,6 +21,18 @@ async function bundle(entry, output) {
   });
 }
 
+// Fixed v1 routing hash mirrored here only to identify which named workerd object
+// the production Worker actually activated. Unit tests pin the same vectors against
+// src/session-routing.ts so an algorithm change must update both gates deliberately.
+function sessionOwnerNameV1(sessionId) {
+  let hash = 0x811c9dc5;
+  for (const character of `sub2api-pool-session-v1\0${sessionId}`) {
+    hash = Math.imul(hash ^ character.charCodeAt(0), 0x01000193) >>> 0;
+  }
+  const shard = hash % 3;
+  return shard === 0 ? "cf-singleton-container" : `cf-session-owner-v1-${shard}`;
+}
+
 const artifact = process.argv[2] ? resolve(process.argv[2]) : resolve(temporary, "root/index.js");
 if (!process.argv[2]) await bundle(resolve(root, "src/index.ts"), artifact);
 const options = async (scriptPath, extraBindings = {}) => ({
@@ -82,6 +94,70 @@ try {
   assert.equal(refused.status, 401);
 } finally {
   await publicWorker.dispose();
+}
+
+// Exercise session selection through the real Worker and workerd Durable Object
+// namespace in an isolated runtime. The harness intentionally has no attached
+// container, so requests stop at the native 503 boundary without contacting a provider.
+const routingWorker = new Miniflare(convertV4MiniflareOptions({
+  ...await options(artifact, { POOL_SESSION_ROUTING_ENABLED: "true" }),
+  durableObjects: { CPA: { className: "Cpa", useSQLite: true } },
+  r2Buckets: ["STATE"],
+  ratelimits: { LOGIN_LIMIT: { namespace_id: "1001", simple: { limit: 20, period: 60 } } },
+}));
+try {
+  await (await routingWorker.getR2Bucket("STATE")).put("config/config.yaml", "config-version: 8\naccess:\n  api-keys:\n    - " + key + "\n");
+  const namespace = await routingWorker.getDurableObjectNamespace("CPA");
+  const ownerNames = ["cf-singleton-container", "cf-session-owner-v1-1", "cf-session-owner-v1-2"];
+  const ownerIds = new Set(ownerNames.map(name => namespace.idFromName(name).toString()));
+  async function routedSession(sessionId) {
+    const response = await routingWorker.dispatchFetch("https://gateway.example/v1/messages", {
+      method: "POST",
+      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "test-model", session_id: sessionId, messages: [{ role: "user", content: "test" }] }),
+    });
+    assert.equal(response.status, 503, "The actual Worker accepts the test key but no container/provider is attached");
+    const ids = await routingWorker.listDurableObjectIds("CPA");
+    const expectedOwner = namespace.idFromName(sessionOwnerNameV1(sessionId)).toString();
+    assert.ok(ownerIds.has(expectedOwner), "The selected Durable Object must be one of the fixed, reviewed owner names");
+    assert.ok(ids.includes(expectedOwner), `Explicit session ${sessionId} should activate ${sessionOwnerNameV1(sessionId)}`);
+    return expectedOwner;
+  }
+  const firstSessionOwner = await routedSession("runtime-session-repeat");
+  assert.equal(await routedSession("runtime-session-repeat"), firstSessionOwner, "The same session must resolve to the same owner");
+  const selectedOwners = new Set([firstSessionOwner]);
+  for (let index = 0; index < 100 && selectedOwners.size < 3; index++) {
+    selectedOwners.add(await routedSession(`runtime-session-shard-${index}`));
+  }
+  assert.equal(selectedOwners.size, 3, "Explicit sessions should exercise all three fixed shards");
+  console.log("PASS: actual workerd Worker routes authenticated explicit sessions to stable fixed DO IDs and covers all three shards; no provider was contacted.");
+} finally {
+  await routingWorker.dispose();
+}
+
+const continuationWorker = new Miniflare(convertV4MiniflareOptions({
+  ...await options(artifact, { POOL_SESSION_ROUTING_ENABLED: "true" }),
+  durableObjects: { CPA: { className: "Cpa", useSQLite: true } },
+  r2Buckets: ["STATE"],
+  ratelimits: { LOGIN_LIMIT: { namespace_id: "1001", simple: { limit: 20, period: 60 } } },
+}));
+try {
+  await (await continuationWorker.getR2Bucket("STATE")).put("config/config.yaml", "config-version: 8\naccess:\n  api-keys:\n    - " + key + "\n");
+  const namespace = await continuationWorker.getDurableObjectNamespace("CPA");
+  const ownerIds = new Set(["cf-singleton-container", "cf-session-owner-v1-1", "cf-session-owner-v1-2"]
+    .map(name => namespace.idFromName(name).toString()));
+  const continuation = await continuationWorker.dispatchFetch("https://gateway.example/v1/responses", {
+    method: "POST",
+    headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "test-model", previous_response_id: "resp_existing_7", input: "continue" }),
+  });
+  assert.equal(continuation.status, 503);
+  const continuationOwners = (await continuationWorker.listDurableObjectIds("CPA")).filter(id => ownerIds.has(id));
+  assert.deepEqual(continuationOwners, [namespace.idFromName("cf-singleton-container").toString()],
+    "A previous_response_id-only continuation must retain the legacy singleton");
+  console.log("PASS: actual workerd Worker keeps a Responses continuation with only previous_response_id on the legacy singleton.");
+} finally {
+  await continuationWorker.dispose();
 }
 
 // Exercise the actual WorkerEntrypoint -> existing Cpa namespace RPC wiring. This fixture

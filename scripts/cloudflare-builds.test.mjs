@@ -48,7 +48,7 @@ async function fixture(t) {
     await mkdir(image, { recursive: true });
     await writeFile(join(image, "image.tar.gz"), "checked image fixture");
     await writeFile(join(image, "management.html"), "<title>sub2api Console</title>");
-    await writeManifest(image, { revision, dirty: false, install: "container-image", image: `sub2api-cpa:${revision.slice(0, 12)}-1-1`, imageId: `sha256:${"d".repeat(64)}` });
+    await writeManifest(image, { revision, dirty: false, install: "container-image", image: `sub2api-cpa:${revision.slice(0, 12)}-1-1`, imageId: `sha256:${"d".repeat(64)}`, panelVersion: "v2.4.1", panelSha256: "a".repeat(64) });
     return source;
   };
   const verifySource = async receipt => {

@@ -30,6 +30,15 @@ function safeId(value: string, max = 160): boolean {
   return value.length > 0 && value.length <= max && /^[A-Za-z0-9_.:-]+$/.test(value);
 }
 
+function validSessionId(value: string): boolean {
+  if (value.length === 0 || value.length > 256) return false;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return false;
+  }
+  return true;
+}
+
 function validLease(value: unknown): value is SavedLease {
   if (typeof value !== "object" || value === null) return false;
   const lease = value as Partial<SavedLease>;
@@ -38,15 +47,17 @@ function validLease(value: unknown): value is SavedLease {
     && typeof lease.expiresAt === "number" && Number.isSafeInteger(lease.expiresAt) && lease.expiresAt >= 0;
 }
 
-// Non-cryptographic stable placement only. Never use this as an auth decision or
-// as proof that a request belongs to a provider credential.
+// Versioned, non-cryptographic stable placement only. Freeze this algorithm once
+// pool routing is enabled; changing it would move existing conversations. Never
+// use the result as an auth decision or proof that a request owns a credential.
 export function sessionShard(sessionId: string, shardCount: number): number {
-  if (!safeId(sessionId, 1024) || !Number.isSafeInteger(shardCount) || shardCount < 1 || shardCount > 16) {
+  if (!validSessionId(sessionId) || !Number.isSafeInteger(shardCount) || shardCount < 1 || shardCount > 16) {
     throw new RangeError("Invalid session shard input");
   }
   let hash = 0x811c9dc5;
-  for (let index = 0; index < sessionId.length; index++) {
-    hash = Math.imul(hash ^ sessionId.charCodeAt(index), 0x01000193) >>> 0;
+  const input = `sub2api-pool-session-v1\u0000${sessionId}`;
+  for (let index = 0; index < input.length; index++) {
+    hash = Math.imul(hash ^ input.charCodeAt(index), 0x01000193) >>> 0;
   }
   return hash % shardCount;
 }
@@ -182,6 +193,31 @@ export class PoolCoordinator {
         if (old.expiresAt > now && old.owner !== undefined && old.owner !== owner) return false;
       }
       await txn.put(key, { owner, expiresAt: now + ttlMs } satisfies SavedOAuthOwner);
+      return true;
+    });
+  }
+
+  // A callback is valid only for the live CPA process that created its PKCE
+  // verifier. When that process is confirmed lost, forget the opaque routing
+  // binding; never copy or persist the verifier to make the old code reusable.
+  async unbindOAuthOwner(state: string, owner: string): Promise<boolean> {
+    if (!safeId(state, 128) || !/^[a-f0-9]{64}$/.test(owner)) return false;
+    return this.storage.transaction(async txn => {
+      const now = this.now();
+      const key = OAUTH_PREFIX + state;
+      const current = await txn.get<unknown>(key);
+      if (current === undefined) return true;
+      if (typeof current !== "object" || current === null) throw new Error("Invalid persisted OAuth owner");
+      const saved = current as Partial<SavedOAuthOwner>;
+      if (typeof saved.expiresAt !== "number" || !Number.isSafeInteger(saved.expiresAt)) {
+        throw new Error("Invalid persisted OAuth owner");
+      }
+      if (saved.expiresAt <= now) {
+        await txn.delete(key);
+        return true;
+      }
+      if (saved.owner !== owner) return false;
+      await txn.delete(key);
       return true;
     });
   }

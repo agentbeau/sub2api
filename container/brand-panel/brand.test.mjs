@@ -2,6 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 import { brandPanel } from "./brand.mjs";
+import { pinnedPanel } from "./pinned-source.mjs";
+
+test("requires an immutable dashboard release and exact SHA-256 pin", () => {
+  assert.deepEqual(pinnedPanel("v2.4.1", "A".repeat(64)), { version: "v2.4.1", sha256: "a".repeat(64) });
+  for (const version of ["", "latest", "..", "../management.html", "tag/with/slash"]) {
+    assert.throws(() => pinnedPanel(version, "a".repeat(64)), /specific dashboard release tag/);
+  }
+  assert.throws(() => pinnedPanel("v2.4.1", ""), /source SHA-256/);
+});
 
 function fixture(extra = "") {
   return `<!doctype html><html><head><link rel="icon" href="old-logo.svg"><title>CLI Proxy API Management Center</title></head><body><script type="module">

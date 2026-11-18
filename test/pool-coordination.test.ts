@@ -194,4 +194,22 @@ describe("pool coordination preparation primitives", () => {
     now += 30_001;
     expect(await coordinator.callbackOwner("state-from-cpa")).toBeUndefined();
   });
+
+  it("invalidates only the old OAuth owner after process loss and preserves a newer binding", async () => {
+    let now = 90_000;
+    const coordinator = new PoolCoordinator(new AtomicStorage(), () => now);
+    const oldOwner = "a".repeat(64);
+    const newOwner = "b".repeat(64);
+    expect(await coordinator.bindOAuthOwner("restart-state", oldOwner, 30_000)).toBe(true);
+    expect(await coordinator.unbindOAuthOwner("restart-state", newOwner)).toBe(false);
+    expect(await coordinator.callbackOwner("restart-state")).toBe(oldOwner);
+    expect(await coordinator.unbindOAuthOwner("restart-state", oldOwner)).toBe(true);
+    expect(await coordinator.callbackOwner("restart-state")).toBeUndefined();
+    expect(await coordinator.bindOAuthOwner("restart-state", newOwner, 30_000)).toBe(true);
+    expect(await coordinator.unbindOAuthOwner("restart-state", oldOwner)).toBe(false);
+    expect(await coordinator.callbackOwner("restart-state")).toBe(newOwner);
+    now += 30_001;
+    expect(await coordinator.unbindOAuthOwner("restart-state", newOwner)).toBe(true);
+    expect(await coordinator.callbackOwner("restart-state")).toBeUndefined();
+  });
 });

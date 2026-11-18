@@ -124,6 +124,12 @@ function platform(running: boolean | undefined, deletion: Promise<void> = Promis
       oauthOwners.set(state, owner);
       return true;
     },
+    releasePoolOAuthOwner: async (state: string, owner: string) => {
+      events.push("release_oauth_owner");
+      if (oauthOwners.get(state) !== owner) return false;
+      oauthOwners.delete(state);
+      return true;
+    },
     poolOAuthOwner: async (state: string) => oauthOwners.get(state),
   };
   const cpa = new Cpa(context as unknown as DurableObjectState, {
@@ -142,6 +148,7 @@ function platform(running: boolean | undefined, deletion: Promise<void> = Promis
     initialized: () => initialization,
     getAlarm: () => persistedAlarm,
     queueLegacyAlarm: () => { persistedAlarm = Date.now() + 1; },
+    stop: () => { isRunning = false; },
   };
 }
 
@@ -185,6 +192,40 @@ describe("integrated pool ownership hooks", () => {
     }));
     expect(response.status).toBe(200);
     expect(state.oauthOwners.get("oauth-state-affinity")).toBe("a".repeat(64));
+  });
+
+  it("invalidates a process-local PKCE callback binding before cold restart", async () => {
+    const state = platform(false, Promise.resolve(), new LeaseStorage(), true, null,
+      async () => Response.json({ status: "ok", state: "restart-bound-state", expires_in: 120 }), undefined, true);
+    await state.initialized();
+    const start = await state.cpa.fetchWithAccess(new Request("https://gateway.example/v8/management/oauth/auth-url?provider=codex", {
+      headers: { origin: "https://gateway.example", "x-management-key": "synthetic-management-key" },
+    }));
+    expect(start.status).toBe(200);
+    expect(state.oauthOwners.get("restart-bound-state")).toBe("a".repeat(64));
+    expect(state.starts).toHaveLength(1);
+
+    // Simulate a process that exited while a browser still holds its callback URL.
+    // A stale edge lookup must not wake a fresh process that lacks the PKCE verifier.
+    state.stop();
+    const staleCallback = await state.cpa.fetchWithAccess(new Request("https://gateway.example/callback?state=restart-bound-state&code=synthetic-code", {
+      headers: { origin: "https://gateway.example" },
+    }));
+    expect(staleCallback.status).toBe(503);
+    expect(state.starts).toHaveLength(1);
+    expect(state.requests.some(request => new URL(request.url).pathname === "/callback")).toBe(false);
+
+    // The next admitted cold start clears callback routing before launching a fresh CPA.
+    const restart = await state.cpa.fetchWithAccess(new Request("https://gateway.example/runtime/start", {
+      method: "POST", headers: await signedHeaders(),
+    }));
+    expect(restart.status).toBe(200);
+    expect(state.starts).toHaveLength(2);
+    expect(state.oauthOwners.has("restart-bound-state")).toBe(false);
+    const releaseIndex = state.events.lastIndexOf("release_oauth_owner");
+    const secondStartIndex = state.events.lastIndexOf("start");
+    expect(releaseIndex).toBeGreaterThanOrEqual(0);
+    expect(releaseIndex).toBeLessThan(secondStartIndex);
   });
 });
 

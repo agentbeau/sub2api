@@ -113,6 +113,7 @@ export class OAuthLease {
     private readonly storage: OAuthLeaseStorage,
     private readonly nowMs = Date.now,
     private readonly bindOwner?: (state: string) => Promise<void>,
+    private readonly releaseOwner?: (state: string) => Promise<void>,
   ) {}
 
   restore(): Promise<void> {
@@ -147,6 +148,12 @@ export class OAuthLease {
   // local pending writes are gone. DO eviction with a running process must restore them.
   clear(): Promise<void> {
     return this.serialize(async () => {
+      // Remove callback routing before allowing a new CPA process to start. The
+      // PKCE verifier lives only in the old CPA process; an old callback must not
+      // be delivered to a fresh process that cannot validate it.
+      if (this.releaseOwner !== undefined) {
+        for (const state of this.states.keys()) await this.releaseOwner(state);
+      }
       await this.storage.delete(STORAGE_KEY);
       this.states.clear();
       this.mutationUntil = 0;
@@ -169,6 +176,7 @@ export class OAuthLease {
     return this.serialize(async () => {
       let changed = this.expire(observedAt);
       let stateToBind: string | undefined;
+      const statesToRelease: string[] = [];
       if (mutation) changed = this.reservePersistence(observedAt) || changed;
       if (kind === "start" && body?.status === "ok") {
         const state = stateId(body.state);
@@ -185,12 +193,16 @@ export class OAuthLease {
           // cancel (cancelled:false) can mean an exchange is still committing.
           this.reservePersistence(observedAt);
           changed = true;
+          statesToRelease.push(state);
         }
       }
       this.dirty ||= changed;
       // Update memory before awaiting storage so the lifecycle can retain the
       // hold even if durable persistence fails and this observation rejects.
       if (this.dirty) await this.save();
+      if (this.releaseOwner !== undefined) {
+        for (const state of statesToRelease) await this.releaseOwner(state);
+      }
       if (stateToBind !== undefined && this.bindOwner !== undefined) await this.bindOwner(stateToBind);
       return changed;
     });

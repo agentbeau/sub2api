@@ -3,6 +3,7 @@ import type { Cpa } from "./cpa.ts";
 export interface Env {
   readonly CPA: DurableObjectNamespace<Cpa>;
   readonly POOL_FENCING_ENABLED?: string;
+  readonly POOL_SESSION_ROUTING_ENABLED?: string;
   readonly STATE: R2Bucket;
   readonly LOGIN_LIMIT: RateLimit;
   readonly MANAGEMENT_KEY?: string;

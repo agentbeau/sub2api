@@ -6,6 +6,7 @@ import { dirname, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath, URL } from "node:url";
 import ts from "typescript";
+import { pinnedPanel } from "./pinned-source.mjs";
 
 const UPSTREAM_LICENSE = readFileSync(new URL("./UPSTREAM_LICENSE", import.meta.url), "utf8").trim();
 const HEADER_NAMES = new Set(["x-cpa-version", "x-cpa-build-date", "x-cpa-support-plugin"]);
@@ -148,18 +149,17 @@ export function brandPanel(html) {
 async function main() {
   const [input, target] = process.argv.slice(2);
   if (!input || !target) throw new Error("Usage: node brand.mjs --fetch|input.html output.html");
+  const pin = pinnedPanel(process.env.PANEL_VERSION, process.env.PANEL_SHA256);
   let original;
   if (input === "--fetch") {
-    const version = process.env.PANEL_VERSION || "latest";
     const base = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center/releases";
-    const url = version === "latest" ? `${base}/latest/download/management.html` : `${base}/download/${encodeURIComponent(version)}/management.html`;
+    const url = `${base}/download/${encodeURIComponent(pin.version)}/management.html`;
     const response = await globalThis.fetch(url, { signal: globalThis.AbortSignal.timeout(120_000) });
     if (!response.ok) throw new Error(`Dashboard download failed with HTTP ${response.status}`);
     original = Buffer.from(await response.arrayBuffer());
   } else original = await readFile(input);
   const sourceHash = createHash("sha256").update(original).digest("hex");
-  const expected = (process.env.PANEL_SHA256 ?? "").trim().toLowerCase();
-  if (expected && sourceHash !== expected) throw new Error("Upstream panel checksum differs from PANEL_SHA256");
+  if (sourceHash !== pin.sha256) throw new Error("Upstream panel checksum differs from PANEL_SHA256");
   const result = brandPanel(original.toString("utf8"));
   const bytes = Buffer.from(result.html, "utf8");
   await mkdir(dirname(resolve(target)), { recursive: true });

@@ -35,7 +35,7 @@ async function fixture(t, branch = PREVIEW_BRANCHES[0]) {
     } else {
       await writeFile(join(source, "image.tar.gz"), "exact tested image archive");
       await writeFile(join(source, "management.html"), "<title>sub2api Console</title>");
-      await writeManifest(source, { revision, dirty: false, install: "container-image", image: `sub2api-cpa:${revision.slice(0, 12)}-1-1`, imageId: `sha256:${"b".repeat(64)}` });
+      await writeManifest(source, { revision, dirty: false, install: "container-image", image: `sub2api-cpa:${revision.slice(0, 12)}-1-1`, imageId: `sha256:${"b".repeat(64)}`, panelVersion: "v2.4.1", panelSha256: "a".repeat(64) });
     }
     const archive = join(directory, `${name}.zip`);
     execFileSync("python3", ["-c", zipScript, source, archive]);

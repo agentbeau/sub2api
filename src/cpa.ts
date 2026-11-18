@@ -69,11 +69,11 @@ export class Cpa extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.pool = new PoolCoordinator(ctx.storage as unknown as PoolStorage);
+    const ownerId = this.ctx.id.toString();
     const lease = new OAuthLease(ctx.storage, Date.now, async state => {
-      const owner = this.ctx.id.toString();
-      const bound = await this.poolStub().bindPoolOAuthOwner(state, owner, 31 * 60_000);
+      const bound = await this.poolStub().bindPoolOAuthOwner(state, ownerId, 31 * 60_000);
       if (!bound) throw new Error("OAuth callback ownership could not be persisted");
-    });
+    }, async state => { await this.poolStub().releasePoolOAuthOwner(state, ownerId); });
     const realtime = new RealtimeLease(ctx.storage);
     this.background = new BackgroundActivity(ctx.storage);
     // Retain old explicit control endpoints for compatibility with an already-open
@@ -238,6 +238,10 @@ export class Cpa extends DurableObject<Env> {
 
   async bindPoolOAuthOwner(state: string, owner: string, ttlMs: number): Promise<boolean> {
     return this.pool.bindOAuthOwner(state, owner, ttlMs);
+  }
+
+  async releasePoolOAuthOwner(state: string, owner: string): Promise<boolean> {
+    return this.pool.unbindOAuthOwner(state, owner);
   }
 
   async poolOAuthOwner(state: string): Promise<string | undefined> {
