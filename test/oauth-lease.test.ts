@@ -170,6 +170,36 @@ describe("OAuth inactivity leases", () => {
     expect(restored.remainingMs()).toBe(0);
   });
 
+  it("removes callback ownership before discarding a process-local PKCE flow", async () => {
+    const storage = new MemoryStorage();
+    const owner = "a".repeat(64);
+    const bindings = new Map<string, string>();
+    const lease = new OAuthLease(storage, () => 1_800_000_000_000,
+      async state => { bindings.set(state, owner); },
+      async state => { if (bindings.get(state) === owner) bindings.delete(state); });
+    await lease.observe(at("/v8/management/oauth/auth-url?provider=codex"), start("restart-pkce-state", { expires_in: 120 }));
+    expect(bindings.get("restart-pkce-state")).toBe(owner);
+    const saved = await storage.get<unknown>("sub2api:oauth-idle-leases:v1");
+    expect(JSON.stringify(saved)).not.toMatch(/verifier|code|token|url/i);
+    await lease.clear();
+    expect(bindings.has("restart-pkce-state")).toBe(false);
+    expect(await storage.get("sub2api:oauth-idle-leases:v1")).toBeUndefined();
+  });
+
+  it("unbinds completed or cancelled states so a replayed callback cannot select an old owner", async () => {
+    const storage = new MemoryStorage();
+    const bindings = new Set<string>();
+    const lease = new OAuthLease(storage, () => 1_800_000_000_000,
+      async state => { bindings.add(state); },
+      async state => { bindings.delete(state); });
+    await lease.observe(at("/v8/management/oauth/auth-url?provider=codex"), start("completed-state"));
+    await lease.observe(at("/v8/management/oauth/status?state=completed-state"), Response.json({ status: "ok" }));
+    expect(bindings.has("completed-state")).toBe(false);
+    await lease.observe(at("/v8/management/oauth/auth-url?provider=codex"), start("cancelled-state"));
+    await lease.observe(at("/v8/management/oauth/session?state=cancelled-state", "DELETE"), Response.json({ status: "ok", cancelled: true }));
+    expect(bindings.has("cancelled-state")).toBe(false);
+  });
+
   it("keeps a pending lease after callback acceptance while token exchange continues", async () => {
     const state = fixture();
     await state.lease.observe(at("/v8/management/oauth/auth-url?provider=codex"), start("state-one"));

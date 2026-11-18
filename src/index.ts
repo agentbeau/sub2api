@@ -2,21 +2,45 @@ import type { Env } from "./env.ts";
 import { handle } from "./gateway.ts";
 import { serveDashboard } from "./dashboard.ts";
 import { classify } from "./routes.ts";
+import { ownerNameForRequest, SINGLETON_OWNER_NAME } from "./session-routing.ts";
 import { accessRequired, crossOriginWrite, dashboardAccess, isBrowserRoute, withoutAccessCredentials, type NativeAccessContext } from "./access.ts";
 
 export { Cpa, R2Bridge } from "./cpa.ts";
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
-type EdgeEnv = Pick<Env, "DASHBOARD_PASSWORD" | "DASHBOARD_AUTH" | "ACCESS_AUD" | "LOGIN_LIMIT" | "STATE"> & {
-  readonly CPA: DurableObjectNamespace;
+type EdgeEnv = Pick<Env, "DASHBOARD_PASSWORD" | "DASHBOARD_AUTH" | "ACCESS_AUD" | "LOGIN_LIMIT" | "STATE" | "POOL_FENCING_ENABLED" | "POOL_SESSION_ROUTING_ENABLED" | "POOL_SESSION_AFFINITY_ENABLED"> & {
+  readonly CPA: Env["CPA"];
 };
 
 export default {
-  fetch(request: Request, env: EdgeEnv, ctx?: ExecutionContext): Response | Promise<Response> {
-    const forward = (forwarded: Request) => env.CPA.getByName("cf-singleton-container").fetch(forwarded);
+  async fetch(request: Request, env: EdgeEnv, ctx?: ExecutionContext): Promise<Response> {
     const path = new URL(request.url).pathname;
     const route = classify(path);
     const authenticated = dashboardAccess(env, ctx as (ExecutionContext & NativeAccessContext) | undefined);
+    const forward = async (forwarded: Request): Promise<Response> => {
+      if (route === "oauth-callback" && env.POOL_FENCING_ENABLED === "true") {
+        if (authenticated !== true) return accessRequired();
+        const state = new URL(forwarded.url).searchParams.get("state") ?? "";
+        const owner = await env.CPA.getByName("cf-pool-coordinator-v1").poolOAuthOwner(state);
+        if (owner === undefined) return Response.json({ error: {
+          code: "oauth_owner_unknown", message: "The OAuth state is expired or unavailable. Start a new login flow.",
+        } }, {
+          status: 409, headers: { "cache-control": "no-store" },
+        });
+        try {
+          const stub = env.CPA.get(env.CPA.idFromString(owner));
+          return stub.fetchWithAccess(withoutAccessCredentials(forwarded));
+        } catch {
+          return Response.json({ error: { code: "oauth_owner_unavailable" } }, {
+            status: 503, headers: { "cache-control": "no-store" },
+          });
+        }
+      }
+      const ownerName = route === "api"
+        ? await ownerNameForRequest(forwarded, env.POOL_SESSION_ROUTING_ENABLED === "true")
+        : SINGLETON_OWNER_NAME;
+      return env.CPA.getByName(ownerName).fetch(forwarded);
+    };
     if (authenticated !== undefined && isBrowserRoute(route)) {
       if (!authenticated) return accessRequired();
       if (crossOriginWrite(request)) {
@@ -46,7 +70,23 @@ export default {
         // Carry the verified decision over a private, typed RPC, not a header.
         // Public API requests always retain their independent client-key checks.
         if (authenticated === true && isBrowserRoute(route)) {
-          return (env.CPA as Env["CPA"]).getByName("cf-singleton-container").fetchWithAccess(withoutAccessCredentials(request));
+          if (route === "oauth-callback" && env.POOL_FENCING_ENABLED === "true") {
+            const state = new URL(request.url).searchParams.get("state") ?? "";
+            const owner = await env.CPA.getByName("cf-pool-coordinator-v1").poolOAuthOwner(state);
+            if (owner === undefined) return Response.json({ error: {
+              code: "oauth_owner_unknown", message: "The OAuth state is expired or unavailable. Start a new login flow.",
+            } }, {
+              status: 409, headers: { "cache-control": "no-store" },
+            });
+            try {
+              return env.CPA.get(env.CPA.idFromString(owner)).fetchWithAccess(withoutAccessCredentials(request));
+            } catch {
+              return Response.json({ error: { code: "oauth_owner_unavailable" } }, {
+                status: 503, headers: { "cache-control": "no-store" },
+              });
+            }
+          }
+          return (env.CPA as Env["CPA"]).getByName(SINGLETON_OWNER_NAME).fetchWithAccess(withoutAccessCredentials(request));
         }
         return forward(request);
     }

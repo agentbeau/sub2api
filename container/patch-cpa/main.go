@@ -51,13 +51,11 @@ func plans() []filePatch {
 \t\t\t}
 \t\t\tl.manager.finishRefreshJob(job, time.Time{}, false)`, `\t\t\tretryAt := time.Time{}
 \t\t\tif l.manager.beginRefreshJob(ctx, job) {
-\t\t\t\terrActivity := sub2apiactivity.Run(ctx, func(activityCtx context.Context) error {
-\t\t\t\t\t// Upstream already handles and sanitizes provider refresh errors.
-\t\t\t\t\t_, _ = l.manager.refreshAuthForRequestAtEpoch(activityCtx, job.id, "", job.registrationEpoch)
-\t\t\t\t\treturn nil
+\t\t\t\terrActivity := sub2apiactivity.RunResource(ctx, "refresh:"+job.id, func(activityCtx context.Context) error {
+\t\t\t\t\t_, errRefresh := l.manager.refreshAuthForRequestAtEpoch(activityCtx, job.id, "", job.registrationEpoch)
+\t\t\t\t\treturn errRefresh
 \t\t\t\t})
 \t\t\t\tif errActivity != nil {
-\t\t\t\t\t// A rejected lease must retain the normal finish/retry bookkeeping.
 \t\t\t\t\tretryAt = time.Now().Add(l.interval)
 \t\t\t\t\tlog.WithError(errActivity).Warn("sub2api: background refresh did not complete")
 \t\t\t\t}
@@ -131,7 +129,7 @@ func (w *Watcher) reloadConfigIfChangedWithActivity(ctx context.Context) {
 \t\t\tlog.Errorf("failed to persist config change: %v", err)
 \t\t}
 \t}()`, `\t// Acquire before the reload callback releases its parent activity lease.
-\terrActivity := sub2apiactivity.Start(context.Background(), func(activityCtx context.Context) error {
+\terrActivity := sub2apiactivity.StartResource(context.Background(), "config", func(activityCtx context.Context) error {
 \t\tctx, cancel := context.WithTimeout(activityCtx, 30*time.Second)
 \t\tdefer cancel()
 \t\tif errPersist := w.storePersister.PersistConfig(ctx); errPersist != nil {
@@ -148,7 +146,7 @@ func (w *Watcher) reloadConfigIfChangedWithActivity(ctx context.Context) {
 \t\tif err := w.storePersister.PersistAuthFiles(ctx, message, filtered...); err != nil {
 \t\t\tlog.Errorf("failed to persist auth changes: %v", err)
 \t\t}
-\t}()`, `\terrActivity := sub2apiactivity.Start(context.Background(), func(activityCtx context.Context) error {
+\t}()`, `\terrActivity := sub2apiactivity.StartResource(context.Background(), "auth-store", func(activityCtx context.Context) error {
 \t\tctx, cancel := context.WithTimeout(activityCtx, 30*time.Second)
 \t\tdefer cancel()
 \t\tif errPersist := w.storePersister.PersistAuthFiles(ctx, message, filtered...); errPersist != nil {
@@ -219,6 +217,162 @@ func (w *Watcher) reloadConfigIfChangedWithActivity(ctx context.Context) {
 			},
 		},
 		{
+			path: "sdk/cliproxy/auth/conductor_refresh.go",
+			edits: []replacement{
+				{`cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"`, `cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"` + "\n\t" + helperImport},
+				{`func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessToken string) (*Auth, error) {
+	return m.refreshAuthForRequestAtEpoch(ctx, id, failedAccessToken, 0)
+}`, `func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessToken string) (*Auth, error) {
+	var refreshed *Auth
+	errActivity := sub2apiactivity.RunResource(ctx, "refresh:"+id, func(activityCtx context.Context) error {
+		var errRefresh error
+		refreshed, errRefresh = m.refreshAuthForRequestAtEpoch(activityCtx, id, failedAccessToken, 0)
+		return errRefresh
+	})
+	return refreshed, errActivity
+}`},
+			},
+		},
+		{
+			path: "cmd/server/main.go",
+			edits: []replacement{
+				{`"github.com/router-for-me/CLIProxyAPI/v8/internal/store"`, `"github.com/router-for-me/CLIProxyAPI/v8/internal/store"` + "\n\t" + helperImport},
+				{`\t\tctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+\t\tif errBootstrap := objectStoreInst.Bootstrap(ctx, examplePath); errBootstrap != nil {
+\t\t\tcancel()
+\t\t\tlog.Errorf("failed to bootstrap object-backed config: %v", errBootstrap)
+\t\t\treturn
+\t\t}
+\t\tcancel()`, `\t\tctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+\t\terrActivity := sub2apiactivity.RunResource(ctx, "bootstrap", func(activityCtx context.Context) error {
+\t\t\treturn objectStoreInst.Bootstrap(activityCtx, examplePath)
+\t\t})
+\t\tif errActivity != nil {
+\t\t\tcancel()
+\t\t\tlog.Errorf("failed to bootstrap object-backed config: %v", errActivity)
+\t\t\treturn
+\t\t}
+\t\tcancel()`},
+			},
+		},
+		{
+			path: "internal/api/server.go",
+			edits: []replacement{
+				{`"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"`, `"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"` + "\n\t" + helperImport},
+				{`engine.Use(logging.GinLogrusLogger())`, `engine.Use(logging.GinLogrusLogger())
+	engine.Use(sub2apiactivity.RequestContextMiddleware())`},
+			},
+		},
+		{
+			path: "internal/store/objectstore.go",
+			edits: []replacement{
+				{`\trefreshProbeMu    sync.Mutex`, `\tobjectVersionsMu sync.RWMutex
+\tobjectVersions    map[string]string
+	refreshProbeMu    sync.Mutex`},
+				{`\t\tspoolRoot:  absRoot,
+	\tconfigPath: filepath.Join(configDir, "config.yaml"),`, `\t\tspoolRoot:  absRoot,
+	\tconfigPath: filepath.Join(configDir, "config.yaml"),
+	\tobjectVersions: make(map[string]string),`},
+				{`\t_, err := s.client.StatObject(ctx, s.cfg.Bucket, key, minio.StatObjectOptions{})
+	switch {
+	case err == nil:`, `\tinfo, err := s.client.StatObject(ctx, s.cfg.Bucket, key, minio.StatObjectOptions{})
+	switch {
+	case err == nil:
+	\tif errRemember := s.rememberObjectVersion(key, info.ETag); errRemember != nil { return errRemember }`},
+				{`\t\tif errWrite := os.WriteFile(local, data, 0o600); errWrite != nil {
+	\t\treturn fmt.Errorf("object store: write auth %s: %w", local, errWrite)
+	\t}`, `\t\tif errWrite := os.WriteFile(local, data, 0o600); errWrite != nil {
+	\t\treturn fmt.Errorf("object store: write auth %s: %w", local, errWrite)
+	\t}
+	\tif errRemember := s.rememberObjectVersion(object.Key, object.ETag); errRemember != nil { return errRemember }`},
+				{`\tif len(data) == 0 {
+	\treturn s.deleteObject(ctx, key)
+	}
+	if s.client == nil {
+	\treturn fmt.Errorf("object store: client not configured")
+	}
+	fullKey := s.prefixedKey(key)
+	reader := bytes.NewReader(data)
+	_, err := s.client.PutObject(ctx, s.cfg.Bucket, fullKey, reader, int64(len(data)), minio.PutObjectOptions{
+	\tContentType: contentType,
+	})
+	if err != nil {
+	\treturn fmt.Errorf("object store: put object %s: %w", fullKey, err)
+	}
+	return nil`, `\tif s.client == nil {
+	\treturn fmt.Errorf("object store: client not configured")
+	}
+	fullKey := s.prefixedKey(key)
+	if os.Getenv("SUB2API_POOL_FENCING") != "true" && len(data) == 0 {
+		return s.deleteObject(ctx, key)
+	}
+	if os.Getenv("SUB2API_POOL_FENCING") == "true" {
+	\treturn s.putFencedObject(ctx, fullKey, data, contentType)
+	}
+	reader := bytes.NewReader(data)
+	_, err := s.client.PutObject(ctx, s.cfg.Bucket, fullKey, reader, int64(len(data)), minio.PutObjectOptions{
+	\tContentType: contentType,
+	})
+	if err != nil {
+	\treturn fmt.Errorf("object store: put object %s: %w", fullKey, err)
+	}
+	return nil`},
+				{`\tif err = os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+\t\treturn fmt.Errorf("object store: delete auth file: %w", err)
+\t}
+\tif err = s.deleteAuthObject(ctx, path); err != nil {
+\t\treturn err
+\t}`, `\tif os.Getenv("SUB2API_POOL_FENCING") == "true" {
+\t\tif err = s.deleteAuthObject(ctx, path); err != nil { return err }
+\t}
+\tif err = os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+\t\treturn fmt.Errorf("object store: delete auth file: %w", err)
+\t}
+\tif os.Getenv("SUB2API_POOL_FENCING") != "true" {
+\t\tif err = s.deleteAuthObject(ctx, path); err != nil { return err }
+\t}`},
+				{`func (s *ObjectTokenStore) deleteObject(ctx context.Context, key string) error {
+	fullKey := s.prefixedKey(key)
+	err := s.client.RemoveObject(ctx, s.cfg.Bucket, fullKey, minio.RemoveObjectOptions{})`, `func (s *ObjectTokenStore) deleteObject(ctx context.Context, key string) error {
+	fullKey := s.prefixedKey(key)
+	if os.Getenv("SUB2API_POOL_FENCING") == "true" {
+	\treturn s.putFencedObject(ctx, fullKey, []byte{}, "application/octet-stream")
+	}
+	err := s.client.RemoveObject(ctx, s.cfg.Bucket, fullKey, minio.RemoveObjectOptions{})`},
+			},
+		},
+		{
+			path: "internal/store/object_refresh_journal.go",
+			edits: []replacement{
+				{`"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"`, `"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"` + "\n\t" + helperImport},
+				{`func (s *ObjectTokenStore) createRefreshObject(ctx context.Context, key string, data []byte) (bool, error) {
+\theaders := http.Header{"If-None-Match": []string{"*"}}`, `func (s *ObjectTokenStore) createRefreshObject(ctx context.Context, key string, data []byte) (bool, error) {
+	var created bool
+	errActivity := sub2apiactivity.RunResource(ctx, "object-write:"+key, func(writeCtx context.Context) error {
+		var errCreate error
+		created, errCreate = s.createRefreshObjectWithFence(writeCtx, key, data)
+		return errCreate
+	})
+	return created, errActivity
+}
+
+func (s *ObjectTokenStore) createRefreshObjectWithFence(ctx context.Context, key string, data []byte) (bool, error) {
+	headers := http.Header{"If-None-Match": []string{"*"}}`},
+				{`headers := http.Header{"If-None-Match": []string{"*"}}`, `headers := sub2apiactivity.FenceHeaders(ctx)
+	if headers == nil { headers = make(http.Header) }
+	headers.Set("If-None-Match", "*")`},
+				{`if errRemove := s.client.RemoveObject(ctx, s.cfg.Bucket, key, minio.RemoveObjectOptions{}); errRemove != nil {
+		log.Warnf("remove refresh journal capability probe: %v", errRemove)
+	}`, `if sub2apiactivity.FencingEnabled() {
+	if errRemove := s.deleteFencedObject(ctx, key); errRemove != nil {
+		log.Warnf("remove refresh journal capability probe: %v", errRemove)
+	}
+} else if errRemove := s.client.RemoveObject(ctx, s.cfg.Bucket, key, minio.RemoveObjectOptions{}); errRemove != nil {
+	log.Warnf("remove refresh journal capability probe: %v", errRemove)
+}`},
+			},
+		},
+		{
 			path: "internal/api/server_routes.go",
 			edits: []replacement{
 				{`"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"`, `"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"` + "\n\t" + helperImport},
@@ -237,6 +391,132 @@ func (w *Watcher) reloadConfigIfChangedWithActivity(ctx context.Context) {
 \t})
 
 \ts.engine.GET("/management.html", s.serveManagementControlPanel)`},
+			},
+		},
+		{
+			path: "sdk/cliproxy/auth/selector.go",
+			edits: []replacement{
+				{`cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"`, `cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"` + "\n\tsub2apiaffinity \"github.com/router-for-me/CLIProxyAPI/v8/internal/sub2apiaffinity\""},
+				{`rebindOnQuotaOnly bool
+	rebindOnNever     bool
+}`, `rebindOnQuotaOnly  bool
+	rebindOnNever      bool
+	durableAffinity    *sub2apiaffinity.Store
+	durableAffinityTTL time.Duration
+}`},
+				{`rebindOnQuotaOnly: rebindMode == SessionAffinityRebindOnQuota,
+		rebindOnNever:     rebindMode == SessionAffinityRebindOnNever,
+	}`, `rebindOnQuotaOnly:  rebindMode == SessionAffinityRebindOnQuota,
+		rebindOnNever:      rebindMode == SessionAffinityRebindOnNever,
+		durableAffinity:    sub2apiaffinity.NewFromEnv(),
+		durableAffinityTTL: cfg.TTL,
+	}`},
+				{`var reservation *weightedReservation
+	// Local bindings complete inside Pick; failed selections release speculative credit.
+	defer func() { reservation.finish(selected != nil && errPick == nil) }()`, `var reservation *weightedReservation
+	var durableBindErr error
+	// Local bindings complete inside Pick; failed selections release speculative credit.
+	defer func() {
+		reservation.finish(selected != nil && errPick == nil && durableBindErr == nil)
+		if durableBindErr != nil {
+			selected = nil
+			errPick = durableBindErr
+		}
+	}()`},
+				{`cacheKey := provider + "::" + primaryID + "::" + modelKey
+	isFork := false`, `cacheKey := provider + "::" + primaryID + "::" + modelKey
+	durableExplicitSession := explicitID != "" && s.durableAffinity != nil
+	durableExpectedVersion := uint64(0)
+	durablePrimaryFound := false
+	if durableExplicitSession {
+		record, found, errAffinity := s.durableAffinity.Lookup(ctx, cacheKey)
+		if errAffinity != nil {
+			return nil, errAffinity
+		}
+		durableExpectedVersion, durablePrimaryFound = record.Version, found
+		if found {
+			s.cache.Set(cacheKey, record.AuthID)
+		} else if cached, ok := s.cache.Get(cacheKey); ok {
+			s.cache.CompareAndDelete(cacheKey, cached)
+		}
+		if opts.Metadata != nil {
+			delete(opts.Metadata, "sub2api.session-affinity.version")
+		}
+	}
+	isFork := false`},
+				{`fallbackKey := ""
+	if fallbackID != "" && fallbackID != primaryID {
+		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
+	}
+	bind := func(authID string, recordSelection bool) {`, `fallbackKey := ""
+	if fallbackID != "" && fallbackID != primaryID {
+		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
+	}
+	if durableExplicitSession && !durablePrimaryFound && fallbackKey != "" {
+		record, found, errAffinity := s.durableAffinity.Lookup(ctx, fallbackKey)
+		if errAffinity != nil {
+			return nil, errAffinity
+		}
+		if found {
+			s.cache.Set(fallbackKey, record.AuthID)
+		} else if cached, ok := s.cache.Get(fallbackKey); ok {
+			s.cache.CompareAndDelete(fallbackKey, cached)
+		}
+	}
+	bind := func(authID string, recordSelection bool) {`},
+				{`bind := func(authID string, recordSelection bool) {
+		keys := []string{cacheKey}`, `bind := func(authID string, recordSelection bool) {
+		if durableExplicitSession && recordSelection {
+			record, errBind := s.durableAffinity.BindAtVersion(ctx, cacheKey, authID, durableExpectedVersion, s.durableAffinityTTL)
+			if errBind != nil {
+				durableBindErr = errBind
+				s.cache.CompareAndDelete(cacheKey, authID)
+				if fallbackKey != "" {
+					s.cache.CompareAndDelete(fallbackKey, authID)
+				}
+				return
+			}
+			if opts.Metadata != nil {
+				opts.Metadata["sub2api.session-affinity.version"] = record.Version
+			}
+		}
+		keys := []string{cacheKey}`},
+				{`if res.Success {
+		s.cache.Touch(cacheKey, res.AuthID)`, `if s.durableAffinity != nil && explicitID != "" && !res.Success {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			version, versionOK := res.Options.Metadata["sub2api.session-affinity.version"].(uint64)
+			if !versionOK {
+				log.Warn("session affinity: result has no request fencing version; durable mapping kept")
+			} else if errDelete := s.durableAffinity.DeleteAtVersion(ctx, cacheKey, res.AuthID, version, s.durableAffinityTTL); errDelete != nil {
+				log.WithError(errDelete).Warn("session affinity: durable result invalidation failed")
+			}
+			cancel()
+		}
+		if res.Success {
+			s.cache.Touch(cacheKey, res.AuthID)`},
+			},
+		},
+		{
+			path: "sdk/cliproxy/auth/conductor_home.go",
+			edits: []replacement{
+				{`internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"`, `internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	sub2apiaffinity "github.com/router-for-me/CLIProxyAPI/v8/internal/sub2apiaffinity"`},
+				{`func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
+	if m == nil {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}`, `func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
+	if m == nil {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if m.HomeEnabled() && sub2apiaffinity.Enabled() {
+		return nil, &Error{Code: "home_session_affinity_unsupported", Message: "durable session-to-credential affinity is not integrated with Home dispatch", HTTPStatus: http.StatusServiceUnavailable}
+	}`},
 			},
 		},
 	}
@@ -302,7 +582,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, errPatch)
 		os.Exit(1)
 	}
-	fmt.Println("Verified public API compatibility and applied sub2api lifecycle/authentication hooks")
+	fmt.Println("Verified public API compatibility and applied sub2api lifecycle, authentication, and durable session-affinity hooks")
 }
 
 // This is the registration surface implemented by src/api-routes.ts for CPA

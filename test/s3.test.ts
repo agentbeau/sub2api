@@ -72,6 +72,25 @@ describe("handleS3", () => {
     expect(store.text("auths/a.json")).toBe("{}");
   });
 
+  it("applies atomic If-None-Match and If-Match conditions to writes", async () => {
+    const store = new MemoryStore();
+    const key = "/state/auths/owner.json";
+    const create = await handleS3(s3(key, { method: "PUT", headers: { "if-none-match": "*" }, body: "owner-a" }), store, BUCKET);
+    expect(create.status).toBe(200);
+    const etag = create.headers.get("etag");
+    expect(etag).toBe('"etag-1"');
+
+    const [first, stale] = await Promise.all([
+      handleS3(s3(key, { method: "PUT", headers: { "if-match": etag ?? "" }, body: "owner-b" }), store, BUCKET),
+      handleS3(s3(key, { method: "PUT", headers: { "if-match": etag ?? "" }, body: "owner-c" }), store, BUCKET),
+    ]);
+    expect([first.status, stale.status].sort()).toEqual([200, 412]);
+    expect(store.text("auths/owner.json")).toMatch(/^owner-[bc]$/);
+    const duplicate = await handleS3(s3(key, { method: "PUT", headers: { "if-none-match": "*" }, body: "owner-d" }), store, BUCKET);
+    expect(duplicate.status).toBe(412);
+    expect(store.text("auths/owner.json")).not.toBe("owner-d");
+  });
+
   it("refuses a streamed upload whose length does not match", async () => {
     const store = new MemoryStore();
     const request = streamingPut("/state/auths/a.json", ["abc"]);

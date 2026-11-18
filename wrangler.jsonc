@@ -10,7 +10,8 @@
   "vars": {
     "CONTAINER_IDLE_TIMEOUT_MS": "1000",
     "DASHBOARD_AUTH": "cloudflare",
-    "ACCESS_AUD": "a6acab2578806d53309922d135ad923c92c9071cbe22f34677ed763c09951170"
+    "ACCESS_AUD": "a6acab2578806d53309922d135ad923c92c9071cbe22f34677ed763c09951170",
+    "CLEF_ENABLED": "false"
   },
   "containers": [
     {
@@ -27,5 +28,6 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Cpa"] }],
   "r2_buckets": [{ "binding": "STATE", "bucket_name": "sub2api" }],
-  "ratelimits": [{ "name": "LOGIN_LIMIT", "namespace_id": "1001", "simple": { "limit": 5, "period": 60 } }]
+  "ratelimits": [{ "name": "LOGIN_LIMIT", "namespace_id": "1001", "simple": { "limit": 5, "period": 60 } }],
+  "ai": { "binding": "AI" }
 }
