@@ -12,7 +12,7 @@ export interface StoredBody extends StoredObject {
 export interface ObjectStore {
   head(key: string): Promise<StoredObject | null>;
   get(key: string): Promise<StoredBody | null>;
-  put(key: string, value: ArrayBuffer): Promise<unknown>;
+  put(key: string, value: ArrayBuffer, options?: { onlyIf?: Headers }): Promise<StoredObject | null>;
   delete(key: string): Promise<void>;
   list(options: { prefix: string; cursor?: string; limit: number }): Promise<{
     objects: StoredObject[];
@@ -132,7 +132,17 @@ async function objectRequest(request: Request, store: ObjectStore, key: string):
     case "PUT": {
       const body = await readBody(request);
       if (body === null) return s3Error(400, "IncompleteBody", "Malformed aws-chunked body");
-      const stored = await store.put(key, body);
+      const conditions = new Headers();
+      let hasConditions = false;
+      for (const name of ["if-match", "if-none-match"]) {
+        const value = request.headers.get(name);
+        if (value !== null) {
+          conditions.set(name, value);
+          hasConditions = true;
+        }
+      }
+      const stored = await store.put(key, body, hasConditions ? { onlyIf: conditions } : undefined);
+      if (stored === null) return s3Error(412, "PreconditionFailed", "The conditional request failed.");
       const etag = typeof stored === "object" && stored !== null && "etag" in stored ? String(stored.etag) : "";
       return new Response(null, { status: 200, headers: etag === "" ? {} : { etag: `"${etag}"` } });
     }

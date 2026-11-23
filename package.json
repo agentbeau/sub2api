@@ -36,7 +36,8 @@
     "build": "node scripts/build-rust.mjs",
     "test:rust": "cargo test --manifest-path gateway-rs/Cargo.toml --locked",
     "test:runtime": "node scripts/check-runtime.mjs",
-    "benchmark": "node scripts/benchmark-gateway.mjs"
+    "benchmark": "node scripts/benchmark-gateway.mjs",
+    "benchmark:frameworks": "node scripts/benchmark-frameworks.mjs"
   },
   "dependencies": {
     "yaml": "2.8.1"
@@ -46,6 +47,9 @@
     "@types/node": "22.20.5",
     "esbuild": "0.28.2",
     "eslint": "10.12.0",
+    "hono": "4.13.19",
+    "itty-fetcher": "1.0.10",
+    "itty-router": "5.0.24",
     "miniflare": "5.20261006.1-alpha",
     "typescript": "6.0.3",
     "typescript-eslint": "8.71.1",

@@ -1,3 +1,5 @@
+import type { FencedLease } from "./pool-coordination.ts";
+
 export type BackgroundAction = "begin" | "renew" | "end";
 
 export interface ActivityStorage {
@@ -15,6 +17,7 @@ const validId = (id: string): boolean => /^[a-f0-9]{32}$/.test(id);
 interface Job {
   readonly until: number;
   readonly maximum: number;
+  readonly fence?: FencedLease;
 }
 
 interface StoredActivity {
@@ -69,7 +72,11 @@ export class BackgroundActivity {
     return remaining;
   }
 
-  update(action: BackgroundAction, id: string): Promise<boolean> {
+  leaseFor(id: string): Promise<FencedLease | undefined> {
+    return this.serialize(async () => this.jobs.get(id)?.fence);
+  }
+
+  update(action: BackgroundAction, id: string, fence?: FencedLease): Promise<boolean> {
     return this.serialize(async () => {
       if (!validId(id)) return false;
       this.remainingMs();
@@ -77,10 +84,10 @@ export class BackgroundActivity {
       const job = this.jobs.get(id);
       if (action === "begin") {
         if (job !== undefined || this.jobs.size >= MAX_JOBS) return false;
-        this.jobs.set(id, { until: now + LEASE_MS, maximum: now + MAX_LIFETIME_MS });
+        this.jobs.set(id, { until: now + LEASE_MS, maximum: now + MAX_LIFETIME_MS, ...(fence === undefined ? {} : { fence }) });
       } else if (action === "renew") {
         if (job === undefined || job.maximum <= now) return false;
-        this.jobs.set(id, { until: Math.min(now + LEASE_MS, job.maximum), maximum: job.maximum });
+        this.jobs.set(id, { until: Math.min(now + LEASE_MS, job.maximum), maximum: job.maximum, ...(fence === undefined ? job.fence === undefined ? {} : { fence: job.fence } : { fence }) });
       } else if (action === "end") {
         this.jobs.delete(id);
       } else {
@@ -106,7 +113,7 @@ export class BackgroundActivity {
   }
 }
 
-export async function handleBackgroundActivity(request: Request, update: (action: BackgroundAction, id: string) => Promise<boolean>): Promise<Response> {
+export async function handleBackgroundActivity(request: Request, update: (action: BackgroundAction, id: string, resource?: string) => Promise<boolean | FencedLease | undefined>): Promise<Response> {
   const url = new URL(request.url);
   const reply = (status: number) => new Response(null, { status, headers: { "cache-control": "no-store" } });
   if (url.protocol !== "http:" || url.host !== "r2.internal" || url.username || url.password || url.pathname !== "/__sub2api/activity" || url.search) return reply(404);
@@ -140,9 +147,14 @@ export async function handleBackgroundActivity(request: Request, update: (action
   }
   if (body === null || typeof body !== "object" || !("action" in body) || !("id" in body)) return reply(400);
   const { action, id } = body;
+  const resource = "resource" in body ? body.resource : undefined;
   if ((action !== "begin" && action !== "renew" && action !== "end") || typeof id !== "string" || !validId(id)) return reply(400);
+  if (resource !== undefined && (typeof resource !== "string" || !/^[A-Za-z0-9_.:-]{1,160}$/.test(resource))) return reply(400);
   try {
-    return reply(await update(action, id) ? 204 : 409);
+    const result = await update(action, id, resource);
+    if (result === false || result === undefined) return reply(409);
+    if (result === true) return reply(204);
+    return Response.json(result, { status: 200, headers: { "cache-control": "no-store" } });
   } catch {
     return reply(503);
   }

@@ -3,10 +3,11 @@ import { execFileSync } from "node:child_process";
 import { lstat, mkdir, readdir, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DASHBOARD_PANEL_FILE, sourceIdentity, writeManifest } from "./deployment-artifact.mjs";
+import { DASHBOARD_PANEL_FILE, pinnedPanel, sourceIdentity, writeManifest } from "./deployment-artifact.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(process.argv[2] ?? join(root, ".wrangler/artifacts/container-image"));
+const panel = pinnedPanel(process.env.PANEL_VERSION?.trim() || undefined, process.env.PANEL_SHA256?.trim() || undefined);
 await mkdir(output, { recursive: true });
 if ((await readdir(output)).length !== 0) throw new Error("The image artifact output directory must be empty");
 const before = sourceIdentity(root);
@@ -19,10 +20,11 @@ const network = process.env.SUB2API_DOCKER_NETWORK ?? "bridge";
 if (!["bridge", "host"].includes(network)) throw new Error("SUB2API_DOCKER_NETWORK must be bridge or host");
 const args = ["build", "--load", "--pull", "--platform", "linux/amd64", "--tag", image, "--label", `org.opencontainers.image.revision=${revision}`];
 if (network === "host") args.push("--network", "host");
-for (const name of ["CPA_VERSION", "PANEL_VERSION", "PANEL_SHA256"]) {
+for (const name of ["CPA_VERSION"]) {
   const value = process.env[name];
   if (value) args.push("--build-arg", `${name}=${value}`);
 }
+args.push("--build-arg", `PANEL_VERSION=${panel.version}`, "--build-arg", `PANEL_SHA256=${panel.sha256}`);
 const caBundle = process.env.SSL_CERT_FILE;
 if (caBundle) {
   const ca = await stat(caBundle).catch(() => undefined);
@@ -52,5 +54,8 @@ execFileSync("docker", ["image", "save", "--output", join(output, "image.tar"), 
 execFileSync("gzip", ["-1", join(output, "image.tar")], { stdio: "inherit" });
 const after = sourceIdentity(root);
 const dirty = before.dirty || after.dirty || before.revision !== after.revision;
-await writeManifest(output, { revision, dirty, install: "container-image", image, imageId });
+await writeManifest(output, {
+  revision, dirty, install: "container-image", image, imageId,
+  panelVersion: panel.version, panelSha256: panel.sha256,
+});
 console.log(`Saved the tested image ${image} (${imageId}) and its exact provider dashboard`);

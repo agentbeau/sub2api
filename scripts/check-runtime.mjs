@@ -21,16 +21,28 @@ async function bundle(entry, output) {
   });
 }
 
+// Fixed v1 routing hash mirrored here only to identify which named workerd object
+// the production Worker actually activated. Unit tests pin the same vectors against
+// src/session-routing.ts so an algorithm change must update both gates deliberately.
+function sessionOwnerNameV1(sessionId) {
+  let hash = 0x811c9dc5;
+  for (const character of `sub2api-pool-session-v1\0${sessionId}`) {
+    hash = Math.imul(hash ^ character.charCodeAt(0), 0x01000193) >>> 0;
+  }
+  const shard = hash % 3;
+  return shard === 0 ? "cf-singleton-container" : `cf-session-owner-v1-${shard}`;
+}
+
 const artifact = process.argv[2] ? resolve(process.argv[2]) : resolve(temporary, "root/index.js");
 if (!process.argv[2]) await bundle(resolve(root, "src/index.ts"), artifact);
-const options = async (scriptPath) => ({
+const options = async (scriptPath, extraBindings = {}) => ({
   modules: [
     { type: "ESModule", path: scriptPath },
     ...(await readdir(dirname(scriptPath), { recursive: true })).filter(path => path.endsWith(".wasm")).map(path => ({ type: "CompiledWasm", path: resolve(dirname(scriptPath), path) })),
   ],
   modulesRoot: dirname(scriptPath),
   compatibilityDate: "2026-10-01", cf: false,
-  bindings: { DASHBOARD_PASSWORD: password, MANAGEMENT_KEY: "runtime-management-key-0123456789abcdef", CONTAINER_IDLE_TIMEOUT_MS: "1000" },
+  bindings: { DASHBOARD_PASSWORD: password, MANAGEMENT_KEY: "runtime-management-key-0123456789abcdef", CONTAINER_IDLE_TIMEOUT_MS: "1000", ...extraBindings },
 });
 
 const publicWorker = new Miniflare(convertV4MiniflareOptions({
@@ -84,31 +96,156 @@ try {
   await publicWorker.dispose();
 }
 
-// Exercise the actual WorkerEntrypoint -> existing Cpa namespace RPC wiring. This fixture
-// has no container binding, so a valid private notification must be refused without startup.
-const rpcHarness = resolve(temporary, "rpc-harness.ts");
-await writeFile(rpcHarness, `
-export { Cpa, R2Bridge } from ${JSON.stringify(process.argv[2] ? artifact : resolve(root, "src/cpa.ts"))};
-export default { fetch(request, env, ctx) {
-  return ctx.exports.R2Bridge.fetch(new Request('http://r2.internal/__sub2api/activity', {
-    method: 'POST', headers: {'content-type':'application/json'},
-    body: JSON.stringify({action:'begin', id:'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'})
-  }));
-} };
-`);
-const rpcOutput = resolve(temporary, "rpc/index.js");
-await bundle(rpcHarness, rpcOutput);
-const rpcWorker = new Miniflare(convertV4MiniflareOptions({
-  ...await options(rpcOutput),
+// Exercise session selection through the real Worker and workerd Durable Object
+// namespace in an isolated runtime. The harness intentionally has no attached
+// container, so requests stop at the native 503 boundary without contacting a provider.
+const routingWorker = new Miniflare(convertV4MiniflareOptions({
+  ...await options(artifact, { POOL_SESSION_ROUTING_ENABLED: "true" }),
   durableObjects: { CPA: { className: "Cpa", useSQLite: true } },
   r2Buckets: ["STATE"],
   ratelimits: { LOGIN_LIMIT: { namespace_id: "1001", simple: { limit: 20, period: 60 } } },
 }));
 try {
-  const refused = await rpcWorker.dispatchFetch("https://internal-test.example/notify");
-  assert.equal(refused.status, 409, "Real private RPC refuses work when no container is running");
-  assert.equal((await rpcWorker.listDurableObjectIds("CPA")).length, 1);
-  console.log("PASS: real workerd entrypoint/RPC wiring reaches the preserved Cpa namespace and refuses stopped-container activity.");
+  await (await routingWorker.getR2Bucket("STATE")).put("config/config.yaml", "config-version: 8\naccess:\n  api-keys:\n    - " + key + "\n");
+  const namespace = await routingWorker.getDurableObjectNamespace("CPA");
+  const ownerNames = ["cf-singleton-container", "cf-session-owner-v1-1", "cf-session-owner-v1-2"];
+  const ownerIds = new Set(ownerNames.map(name => namespace.idFromName(name).toString()));
+  async function routedSession(sessionId) {
+    const response = await routingWorker.dispatchFetch("https://gateway.example/v1/messages", {
+      method: "POST",
+      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "test-model", session_id: sessionId, messages: [{ role: "user", content: "test" }] }),
+    });
+    assert.equal(response.status, 503, "The actual Worker accepts the test key but no container/provider is attached");
+    const ids = await routingWorker.listDurableObjectIds("CPA");
+    const expectedOwner = namespace.idFromName(sessionOwnerNameV1(sessionId)).toString();
+    assert.ok(ownerIds.has(expectedOwner), "The selected Durable Object must be one of the fixed, reviewed owner names");
+    assert.ok(ids.includes(expectedOwner), `Explicit session ${sessionId} should activate ${sessionOwnerNameV1(sessionId)}`);
+    return expectedOwner;
+  }
+  const firstSessionOwner = await routedSession("runtime-session-repeat");
+  assert.equal(await routedSession("runtime-session-repeat"), firstSessionOwner, "The same session must resolve to the same owner");
+  const selectedOwners = new Set([firstSessionOwner]);
+  for (let index = 0; index < 100 && selectedOwners.size < 3; index++) {
+    selectedOwners.add(await routedSession(`runtime-session-shard-${index}`));
+  }
+  assert.equal(selectedOwners.size, 3, "Explicit sessions should exercise all three fixed shards");
+  console.log("PASS: actual workerd Worker routes authenticated explicit sessions to stable fixed DO IDs and covers all three shards; no provider was contacted.");
+} finally {
+  await routingWorker.dispose();
+}
+
+const continuationWorker = new Miniflare(convertV4MiniflareOptions({
+  ...await options(artifact, { POOL_SESSION_ROUTING_ENABLED: "true" }),
+  durableObjects: { CPA: { className: "Cpa", useSQLite: true } },
+  r2Buckets: ["STATE"],
+  ratelimits: { LOGIN_LIMIT: { namespace_id: "1001", simple: { limit: 20, period: 60 } } },
+}));
+try {
+  await (await continuationWorker.getR2Bucket("STATE")).put("config/config.yaml", "config-version: 8\naccess:\n  api-keys:\n    - " + key + "\n");
+  const namespace = await continuationWorker.getDurableObjectNamespace("CPA");
+  const ownerIds = new Set(["cf-singleton-container", "cf-session-owner-v1-1", "cf-session-owner-v1-2"]
+    .map(name => namespace.idFromName(name).toString()));
+  const continuation = await continuationWorker.dispatchFetch("https://gateway.example/v1/responses", {
+    method: "POST",
+    headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "test-model", previous_response_id: "resp_existing_7", input: "continue" }),
+  });
+  assert.equal(continuation.status, 503);
+  const continuationOwners = (await continuationWorker.listDurableObjectIds("CPA")).filter(id => ownerIds.has(id));
+  assert.deepEqual(continuationOwners, [namespace.idFromName("cf-singleton-container").toString()],
+    "A previous_response_id-only continuation must retain the legacy singleton");
+  console.log("PASS: actual workerd Worker keeps a Responses continuation with only previous_response_id on the legacy singleton.");
+} finally {
+  await continuationWorker.dispose();
+}
+
+// Exercise the actual WorkerEntrypoint -> existing Cpa namespace RPC wiring. This fixture
+// has no container binding, so a valid private notification must be refused without startup.
+const rpcHarness = resolve(temporary, "rpc-harness.ts");
+await writeFile(rpcHarness, `
+export { Cpa, R2Bridge } from ${JSON.stringify(process.argv[2] ? artifact : resolve(root, "src/cpa.ts"))};
+export default { async fetch(request, env, ctx) {
+  const activityRequest = () => new Request('http://r2.internal/__sub2api/activity', {
+    method: 'POST', headers: {'content-type':'application/json'},
+    body: JSON.stringify({action:'begin', id:'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'})
+  });
+  const bridgeFor = (containerId) => ctx.exports.R2Bridge({ props: { containerId } });
+  if (new URL(request.url).pathname === '/activity') {
+    const outcomes = await Promise.all(['owner-a', 'owner-b'].map(async name => {
+      const containerId = env.CPA.idFromName(name).toString();
+      const response = await bridgeFor(containerId).fetch(activityRequest());
+      return { containerId, status: response.status };
+    }));
+    return Response.json(outcomes);
+  }
+  if (new URL(request.url).pathname === '/bad-props') {
+    const response = await bridgeFor('not-an-id').fetch(activityRequest());
+    return Response.json({ status: response.status });
+  }
+  if (new URL(request.url).pathname === '/conditional-write') {
+    const bridgeContainerId = env.CPA.idFromName('r2-write-test').toString();
+    const bridge = bridgeFor(bridgeContainerId);
+    const coordinator = env.CPA.getByName('cf-pool-coordinator-v1');
+    const resource = 'runtime-conditional-write-test';
+    const owner = bridgeContainerId + ':' + 'b'.repeat(32);
+    const lease = await coordinator.claimPoolRefresh(resource, owner, 90000);
+    if (!lease) return Response.json({ error: 'lease unavailable' }, { status: 503 });
+    const fenceHeaders = (extra = {}) => ({
+      'x-sub2api-resource': resource, 'x-sub2api-owner': owner,
+      'x-sub2api-epoch': String(lease.epoch), ...extra
+    });
+    const key = 'http://r2.internal/state/runtime-conditional-write-test';
+    const seed = await bridge.fetch(new Request(key, { method: 'PUT', headers: fenceHeaders({'if-none-match':'*'}), body:'seed' }));
+    const etag = seed.headers.get('etag');
+    const results = await Promise.all(['writer-a', 'writer-b'].map(body => bridge.fetch(new Request(key, {
+      method:'PUT', headers:fenceHeaders({'if-match':etag}), body
+    }))));
+    const final = await bridge.fetch(new Request(key));
+    const removed = await bridge.fetch(new Request(key, { method:'DELETE', headers:fenceHeaders() }));
+    const tombstone = await bridge.fetch(new Request(key));
+    const staleAfterDelete = await bridge.fetch(new Request(key, {
+      method:'PUT', headers:fenceHeaders({'if-match':etag}), body:'stale-after-delete'
+    }));
+    await coordinator.releasePoolRefresh(lease);
+    return Response.json({
+      seed: seed.status, etag, writers: results.map(response => response.status), final: await final.text(),
+      deleteStatus: removed.status, tombstoneStatus: tombstone.status, tombstoneBody: await tombstone.text(),
+      staleAfterDelete: staleAfterDelete.status
+    });
+  }
+  return new Response(null, {status:404});
+} };
+`);
+const rpcOutput = resolve(temporary, "rpc/index.js");
+await bundle(rpcHarness, rpcOutput);
+const rpcWorker = new Miniflare(convertV4MiniflareOptions({
+  ...await options(rpcOutput, { POOL_FENCING_ENABLED: "true" }),
+  durableObjects: { CPA: { className: "Cpa", useSQLite: true } },
+  r2Buckets: ["STATE"],
+  ratelimits: { LOGIN_LIMIT: { namespace_id: "1001", simple: { limit: 20, period: 60 } } },
+}));
+try {
+  const routed = await rpcWorker.dispatchFetch("https://internal-test.example/activity");
+  const outcomes = await routed.json();
+  assert.equal(outcomes.length, 2);
+  assert.equal(new Set(outcomes.map(outcome => outcome.containerId)).size, 2);
+  assert.deepEqual(outcomes.map(outcome => outcome.status), [409, 409], "Each owner-local RPC refuses stopped-container activity");
+  assert.equal((await rpcWorker.listDurableObjectIds("CPA")).length, 2, "Activity callbacks address each requested owner DO");
+  const badProps = await rpcWorker.dispatchFetch("https://internal-test.example/bad-props");
+  assert.deepEqual(await badProps.json(), { status: 404 }, "Missing or malformed owner identity fails closed");
+  assert.equal((await rpcWorker.listDurableObjectIds("CPA")).length, 2, "Invalid owner identity must not create or route to a DO");
+  const conditional = await rpcWorker.dispatchFetch("https://internal-test.example/conditional-write");
+  const writeResult = await conditional.json();
+  assert.equal(writeResult.seed, 200, "Create-only put is supported by the actual workerd R2 binding");
+  assert.match(writeResult.etag, /^".+"$/);
+  assert.deepEqual(writeResult.writers.sort(), [200, 412], "R2 atomically rejects one competing stale If-Match writer");
+  assert.ok(["writer-a", "writer-b"].includes(writeResult.final));
+  assert.equal(writeResult.deleteStatus, 204, "A fenced delete writes an R2 tombstone instead of using unsupported conditional DeleteObject");
+  assert.equal(writeResult.tombstoneStatus, 200);
+  assert.equal(writeResult.tombstoneBody, "");
+  assert.equal(writeResult.staleAfterDelete, 412, "An old conditional writer cannot resurrect a deleted object");
+  console.log("PASS: real workerd RPC routes activity to two explicit Cpa owner IDs; invalid owner IDs fail closed; fenced conditional writes and tombstones reject stale R2 writers.");
 } finally {
   await rpcWorker.dispose();
 }

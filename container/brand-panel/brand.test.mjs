@@ -2,6 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 import { brandPanel } from "./brand.mjs";
+import { PANEL_SOURCE_PIN, pinnedPanel } from "./pinned-source.mjs";
+
+test("requires an immutable dashboard release and exact SHA-256 pin", () => {
+  assert.deepEqual(pinnedPanel(), PANEL_SOURCE_PIN);
+  assert.deepEqual(pinnedPanel(PANEL_SOURCE_PIN.version, PANEL_SOURCE_PIN.sha256.toUpperCase()), PANEL_SOURCE_PIN);
+  for (const version of ["", "latest", "..", "../management.html", "tag/with/slash"]) {
+    assert.throws(() => pinnedPanel(version, PANEL_SOURCE_PIN.sha256), /specific dashboard release tag/);
+  }
+  assert.throws(() => pinnedPanel(PANEL_SOURCE_PIN.version, ""), /source SHA-256/);
+  assert.throws(() => pinnedPanel("v1.28.0", PANEL_SOURCE_PIN.sha256), /match the reviewed source pin/);
+  assert.throws(() => pinnedPanel(PANEL_SOURCE_PIN.version, "a".repeat(64)), /match the reviewed source pin/);
+});
 
 function fixture(extra = "") {
   return `<!doctype html><html><head><link rel="icon" href="old-logo.svg"><title>CLI Proxy API Management Center</title></head><body><script type="module">

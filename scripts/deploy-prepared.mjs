@@ -22,7 +22,9 @@ export async function deployPrepared([install, artifactPath, imagePath], { root 
   await verifyArtifact(directory, revision, install);
   const source = JSON.parse(await readFile(join(directory, "wrangler.json"), "utf8"));
   if (source.name !== "sub2api" || source.build) throw new Error("Unexpected prepared Worker configuration");
-  let config = source;
+  // Validate the immutable container-count gate before image pushes or any R2
+  // operation. The final digest-specific call below repeats the same check.
+  let config = artifactConfig(source, install);
   const wrangler = join(root, "node_modules/.bin/wrangler");
   const childEnv = { ...environment };
   delete childEnv.SUB2API_DASHBOARD_PASSWORD;

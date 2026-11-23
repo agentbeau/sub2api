@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { pinnedPanel } from "../container/brand-panel/pinned-source.mjs";
 
 export const PREPARED_IMAGE = `registry.cloudflare.com/${"0".repeat(32)}/sub2api-cpa@sha256:${"0".repeat(64)}`;
 export const DASHBOARD_PANEL_FILE = "management.html";
@@ -23,6 +24,8 @@ export function deploymentSecrets(install, isNew, password = "", management = ""
   return { DASHBOARD_PASSWORD: password, MANAGEMENT_KEY: management };
 }
 
+export { pinnedPanel };
+
 export function artifactConfig(source, install, image = PREPARED_IMAGE) {
   const config = JSON.parse(JSON.stringify(source));
   if (!["container", "worker"].includes(install)) throw new Error("Unknown install");
@@ -36,9 +39,22 @@ export function artifactConfig(source, install, image = PREPARED_IMAGE) {
     { type: "ESModule", globs: ["**/*.js"], fallthrough: false },
     { type: "CompiledWasm", globs: ["**/*.wasm"], fallthrough: false },
   ];
+  if (install === "container" && config.vars?.POOL_SESSION_ROUTING_ENABLED === "true"
+    && (config.vars?.POOL_SESSION_AFFINITY_ENABLED !== "true" || config.vars?.POOL_FENCING_ENABLED !== "true")) {
+    throw new Error("Session-owner routing requires durable session affinity and the reviewed multi-container ownership and restart gates before deployment");
+  }
+  if (install === "container" && config.vars?.POOL_SESSION_AFFINITY_ENABLED === "true"
+    && config.vars?.POOL_SESSION_ROUTING_ENABLED !== "true") {
+    throw new Error("Durable session affinity cannot be enabled without session-owner routing");
+  }
+  if (install === "container" && config.vars?.POOL_SESSION_ROUTING_ENABLED === "true") {
+    throw new Error("Session-owner routing requires the reviewed multi-container ownership and restart gates before deployment");
+  }
   if (install === "container") {
     if (!DIGEST_IMAGE.test(image)) throw new Error("A Cloudflare registry image pinned by digest is required");
-    if (config.containers?.length !== 1 || config.containers[0].class_name !== "Cpa") throw new Error("Expected the existing Cpa container");
+    if (config.containers?.length !== 1 || config.containers[0].class_name !== "Cpa" || config.containers[0].max_instances !== 1) {
+      throw new Error("Expected the existing single-instance Cpa container");
+    }
     config.containers[0].image = image;
     delete config.containers[0].image_build_context;
     delete config.containers[0].image_vars;
@@ -92,6 +108,7 @@ export async function verifyArtifact(directory, revision, install) {
 export async function verifyContainerImageArtifact(directory, revision) {
   const manifest = await verifyArtifact(directory, revision, "container-image");
   if (!/^sub2api-cpa:[a-f0-9]{12}-\d+-\d+$/.test(manifest.image ?? "") || !/^sha256:[a-f0-9]{64}$/.test(manifest.imageId ?? "")) throw new Error("Invalid tested image identity");
+  pinnedPanel(manifest.panelVersion, manifest.panelSha256);
   if (!/^[a-f0-9]{64}$/.test(manifest.files["image.tar.gz"] ?? "")) throw new Error("The tested image archive is required");
   if (!/^[a-f0-9]{64}$/.test(manifest.files[DASHBOARD_PANEL_FILE] ?? "")) throw new Error("The checksummed provider dashboard is required");
   return manifest;

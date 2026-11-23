@@ -25,17 +25,26 @@ function userText(body: Record<string, unknown>, path: string): string | undefin
   if (!last.content.every(p => record(p) && (p.type === "text" || p.type === "input_text") && typeof p.text === "string")) return;
   return last.content.map(p => (p as {text: string}).text).join("\n");
 }
+const ABORTED = Symbol("aborted");
 async function boundedBody(request: Request): Promise<{body: Record<string, unknown>; text: string} | undefined> {
   const reader = request.clone().body?.getReader();
   if (!reader) return;
   const chunks: Uint8Array[] = []; let size = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<typeof ABORTED>(resolve => {
+    onAbort = () => resolve(ABORTED);
+    request.signal.addEventListener("abort", onAbort, { once: true });
+    if (request.signal.aborted) resolve(ABORTED);
+  });
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error("Body read deadline")), 150);
   });
   try {
     for (;;) {
-      const {done, value} = await Promise.race([reader.read(), deadline]); if (done) break;
+      const chunk = await Promise.race([reader.read(), deadline, aborted]);
+      if (chunk === ABORTED) return;
+      const {done, value} = chunk; if (done) break;
       size += value.byteLength; if (size > MAX_BODY) return;
       chunks.push(value);
     }
@@ -44,7 +53,12 @@ async function boundedBody(request: Request): Promise<{body: Record<string, unkn
     const text = new TextDecoder("utf-8", {fatal: true, ignoreBOM: true}).decode(bytes);
     const body: unknown = JSON.parse(text);
     return record(body) ? {body, text} : undefined;
-  } finally { clearTimeout(timer); void reader.cancel().catch(() => {}); reader.releaseLock(); }
+  } finally {
+    clearTimeout(timer);
+    if (onAbort) request.signal.removeEventListener("abort", onAbort);
+    void reader.cancel().catch(() => {});
+    try { reader.releaseLock(); } catch { /* Cancellation may still be settling a pending read. */ }
+  }
 }
 function duplicateRootKeys(text: string): boolean {
   let depth = 0;
@@ -120,7 +134,7 @@ export async function classifyEffort(request: Request, options: ClassifierOption
     || request.headers.has("content-encoding") || request.signal.aborted) return request;
   try {
     const parsed = await boundedBody(request);
-    if (!parsed) return request;
+    if (!parsed || request.signal.aborted) return request;
     const {body, text: original} = parsed;
     if (duplicateRootKeys(original)) return request;
     if (!body || typeof body.model !== "string" || own(body, "reasoning_effort")
@@ -131,13 +145,22 @@ export async function classifyEffort(request: Request, options: ClassifierOption
     if (!supported?.length) return request; // aliases/suffixes require explicit capability entries
     const text = userText(body, path);
     if (!text?.trim() || text.length > MAX_TEXT || /^(yes|no|ok(?:ay)?|sure|continue|go ahead|do it|same|again|thanks|thank you)[.!?\s]*$/i.test(text.trim())) return request; // never truncate away meaning
-    if (!await options.reserve()) return request;
+    if (!await options.reserve() || request.signal.aborted) return request;
     const pending = options.decide(text).catch(() => undefined);
     options.waitUntil(pending); // timeout limits waiting, not promised inference cancellation
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const result = await Promise.race([pending, new Promise<undefined>(resolve => {
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<undefined>(resolve => {
+      onAbort = () => resolve(undefined);
+      request.signal.addEventListener("abort", onAbort, { once: true });
+      if (request.signal.aborted) resolve(undefined);
+    });
+    const result = await Promise.race([pending, aborted, new Promise<undefined>(resolve => {
       timer = setTimeout(() => resolve(undefined), options.timeoutMs ?? 600);
-    })]).finally(() => clearTimeout(timer));
+    })]).finally(() => {
+      clearTimeout(timer);
+      if (onAbort) request.signal.removeEventListener("abort", onAbort);
+    });
     if (request.signal.aborted) return request;
     const effort = chooseEffort(result, supported);
     if (!effort) return request;

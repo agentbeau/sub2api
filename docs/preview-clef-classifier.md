@@ -1,6 +1,6 @@
 # Enhanced Worker: bounded effort classifier
 
-Status: implemented locally; not deployed or live-acceptance-tested. Production is unchanged.
+Status: shared production/preview source integration is implemented on the draft branch; not deployed or live-acceptance-tested. Production remains unchanged and `CLEF_ENABLED=false`.
 
 ## Single destination
 
@@ -29,9 +29,9 @@ An inference timeout stops waiting, not necessarily remote execution/billing. Th
 
 ## Activation and rollback
 
-Preview only needs an `AI` Workers AI binding and `CLEF_ENABLED=true`. Neither has been added to the deployed Worker. Missing binding/flag is a no-op. Main `Cpa` implementation keeps an identity hook; only preview `Engine` implements classification. No stored model/account settings are modified. Rollback: disable the flag or restore the previous enhanced Worker version, retaining all credentials and storage.
+Both the production `Cpa` and preview `Engine` use the same `InferenceClassifier` implementation. The root production Wrangler configuration binds Workers AI directly as `AI` but keeps `CLEF_ENABLED=false`; the isolated preview sets `CLEF_ENABLED=true`. The live production Worker is unchanged, and its current classifier behavior is disabled. No stored model/account settings are modified. Rollback: disable the flag or restore the previous enhanced Worker version, retaining all credentials and storage.
 
-Before activation: finish pinned Rust/Wasm build, integration tests including rejected keys before AI and AI before native start, exact bundle review, authenticated synthetic live acceptance, and comparison with current version. Do not weaken Access or rotate credentials merely to gain test access.
+Before activation: finish pinned Rust/Wasm build, integration tests including rejected keys before AI, explicit-effort bypass, implicit classification, fail-open, cancellation and request privacy, exact bundle review, authenticated live acceptance, and comparison with current version. Cancellation stops the Worker from waiting and avoids starting CPA; Cloudflare's documented Workers AI binding does not expose an `AbortSignal` input, so a classifier request already sent may continue and consume neurons. Do not weaken Access to gain test access.
 
 ## Evidence
 

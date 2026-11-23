@@ -30,6 +30,33 @@ and exercise empty-provider rejection, final-provider removal, and real provider
 success. Source fixtures contain the relevant v8.0.67 excerpts, not a substitute
 upstream implementation.
 
+When all three opt-in Worker flags for fencing, session-owner routing, and durable
+session affinity are enabled, the pinned selector restores explicit
+provider/model/session bindings from the existing coordinator Durable Object.
+The affinity RPC body carries a SHA-256 digest of the affinity key and the CPA
+credential ID plus version metadata; credentials, request bodies, conversation
+history, and tool payloads do not. The Worker supplies the stable owning
+Durable Object ID from RPC props; the coordinator stores it and rejects reads
+or writes from a different session shard. Binding commits use version compare-and-swap before
+returning a selected credential to the request executor. Each selected request
+advances the version, so a late result callback cannot invalidate a newer
+request. A conflict or unknown write outcome fails selection, and the request is
+not replayed. Result invalidation is also version checked. The Go HTTP client
+performs no retry. A shard mapping change therefore needs an explicit affinity
+migration; this patch fails closed when the current DO is not the recorded
+owner. This hook intentionally
+does not persist LCP fingerprints or provider protocol state and remains disabled
+by default; alias/fallback grouping, coordinator load, and expired-record cleanup
+still require pool acceptance before raising `max_instances`.
+
+The pinned Home dispatch path asks its external Home control plane to select a
+credential and bypasses the local CPA selector. Durable per-session credential
+affinity is therefore not established in Home mode. If both Home and the
+durable-affinity runtime flag are enabled, the patched selector path returns a
+503 before dispatch; it does not guess that Home's session behavior is
+equivalent. Home mode remains outside the multi-container readiness claim until
+its dispatch contract can enforce and test the same owner and credential fence.
+
 Run from the repository root with a Go compiler:
 
 ```sh

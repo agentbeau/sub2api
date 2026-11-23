@@ -35,9 +35,15 @@ existing appropriate **build token**, and disable previews. Use these settings:
 dependencies before our entrypoint can sanitize the child environment. The
 wrapper runs `npm ci` itself after applying that allowlist. Do not add dashboard
 passwords, management keys, provider credentials or gateway client keys to the
-build environment. Set optional `CPA_VERSION`, `PANEL_VERSION` and `PANEL_SHA256`
-inputs as GitHub repository variables for CI; the Cloudflare consumer does not
-rebuild upstream inputs or override the tested image.
+build environment. `CPA_VERSION` is optional because the builder defaults to its
+reviewed pinned release. The branded dashboard source is committed as release
+`v1.28.1` with SHA-256
+`c00ac5577db8feb12d37de6ecb783cf919bb81536902308079f754337d7a7bc5` in
+`container/brand-panel/pinned-source.mjs`. The pin matches the dashboard bytes
+and branded output from the last successful checked image. CI does not need
+repository variables for it; any supplied `PANEL_VERSION` or `PANEL_SHA256`
+must match the committed values. The Cloudflare consumer does not rebuild
+upstream inputs or override the tested image.
 
 Cloudflare supplies `WORKERS_CI`, `WORKERS_CI_BUILD_UUID`,
 `WORKERS_CI_COMMIT_SHA` and `WORKERS_CI_BRANCH`. Do not override them. The wrapper
