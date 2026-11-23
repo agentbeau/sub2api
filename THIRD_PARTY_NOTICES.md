@@ -5,6 +5,7 @@ copyright, license or source attribution.
 
 - The original gateway is from [PlaygrndLabs/sub2api](https://github.com/PlaygrndLabs/sub2api), under the [MIT license](LICENSE).
 - The retained Go provider engine is [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). Its original package names, protocol identifiers and stored-data formats remain where required for compatibility. The image build copies its license from the exact checked-out source into `/usr/share/licenses/sub2api/provider-LICENSE`.
+- The Kiro provider is [xiaokui-dev/cliproxyapi-kiro-plugin](https://github.com/xiaokui-dev/cliproxyapi-kiro-plugin), under the MIT license. The image build copies the license from the pinned source into `/usr/share/licenses/sub2api/kiro-LICENSE`.
 - The provider dashboard derives from [Cli-Proxy-API-Management-Center](https://github.com/router-for-me/Cli-Proxy-API-Management-Center), copyright 2026 Router-For.ME, under the MIT license in [container/brand-panel/UPSTREAM_LICENSE](container/brand-panel/UPSTREAM_LICENSE). The build changes product display strings, product artwork and metadata readers. Bundled dependency license comments are preserved.
 - Rust crates and the build-time TypeScript compiler retain their respective licenses. The compiler is used only in the dashboard build stage.
 

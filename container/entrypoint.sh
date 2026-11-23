@@ -36,6 +36,12 @@ else
   cat >> /CLIProxyAPI/config.example.yaml <<'EOF'
 access:
   api-keys: []
+plugins:
+  enabled: true
+  dir: /CLIProxyAPI/plugins
+  configs:
+    kiro:
+      enabled: true
 routing:
   retry:
     request-retry: 1

@@ -32,6 +32,17 @@ RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false 
   -ldflags="-s -w -X 'main.Version=$(cat /tmp/cpa-version)' -X 'main.Commit=$(git rev-parse HEAD)'" \
   -o /out/CLIProxyAPI ./cmd/server/
 
+FROM golang:1.26-bookworm AS kiro
+WORKDIR /src
+# Kiro v0.1.1, compiled against the same Linux distribution as the provider.
+RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false \
+  set -eu; if [ -s /run/secrets/build-ca ]; then export CURL_CA_BUNDLE=/run/secrets/build-ca SSL_CERT_FILE=/run/secrets/build-ca; fi; \
+  curl --fail --location --retry 3 --output /tmp/kiro.tar.gz https://codeload.github.com/xiaokui-dev/cliproxyapi-kiro-plugin/tar.gz/f7b60a605c3613c18e4011b922f93b5bad70522c; \
+  printf '%s\n' 'e7c533cb5412939af3f63ee461f2d93750934c238d956b1d696e6f356d049832  /tmp/kiro.tar.gz' | sha256sum --check; \
+  tar -xzf /tmp/kiro.tar.gz --strip-components=1; \
+  go test -mod=readonly ./...; \
+  CGO_ENABLED=1 go build -mod=readonly -buildmode=c-shared -o /out/plugins/linux/$(go env GOARCH)/kiro.so .
+
 FROM golang:1.26-bookworm AS panel-download
 ARG PANEL_VERSION=latest
 WORKDIR /panel-download
@@ -63,9 +74,11 @@ RUN --mount=type=secret,id=build-ca,target=/run/secrets/build-ca,required=false 
   && rm -rf /var/lib/apt/lists/*
 COPY --from=panel /out/management.html /panel/management.html
 COPY --from=builder /src/LICENSE /usr/share/licenses/sub2api/provider-LICENSE
+COPY --from=kiro /src/LICENSE /usr/share/licenses/sub2api/kiro-LICENSE
 COPY brand-panel/UPSTREAM_LICENSE /usr/share/licenses/sub2api/dashboard-LICENSE
 WORKDIR /CLIProxyAPI
 COPY --from=builder /out/CLIProxyAPI ./CLIProxyAPI
+COPY --from=kiro /out/plugins/ ./plugins/
 COPY entrypoint.sh /entrypoint.sh
 ENV MANAGEMENT_STATIC_PATH=/panel/management.html
 # Defaults also cover a new image replacing an old container whose stored startup
